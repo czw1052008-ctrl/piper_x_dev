@@ -20,9 +20,6 @@ dist/
 .DS_Store
 Thumbs.db
 
-# Local real-robot machine config (copy from config/real_robot.env.example)
-config/real_robot.env
-
 # Local dependency symlink (created by scripts/setup_agx_arm.sh)
 src/agx_arm_description
 src/external/

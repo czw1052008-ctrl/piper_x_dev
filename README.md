@@ -40,16 +40,18 @@ bash scripts/run_real_suction_pick.sh --move --once
 
 ## FoundationPose 权重
 
-GitHub 单文件限制 100MB，以下权重需本地单独下载后放入 `FoundationPose/weights/`：
+大文件（>100MB）通过 **Git LFS** 托管，克隆后需拉取 LFS 对象：
 
-- `2024-01-11-20-02-45/model_best.pth`
-- `2024-01-11-20-02-45-20260623T132207Z-3-001.zip`
+```bash
+git lfs install
+git lfs pull
+```
 
-参见 [FoundationPose 官方说明](https://github.com/NVlabs/FoundationPose)。
+若未安装 LFS，可从 [FoundationPose 官方](https://github.com/NVlabs/FoundationPose) 手动下载权重到 `FoundationPose/weights/`。
 
-## 环境变量
+## 真机配置
 
-`PIPER_X_DEV` 默认指向 `~/piper_x_dev`，各脚本通过 `config/real_robot.env` 引用子目录路径。
+`blueberry_picking_ws/config/real_robot.env` 已纳入仓库（含 CAN/USB 总线号等参考值）。新机器请按实际硬件修改 `USBIP_CAN_BUSID`、`ORBBEC_USB_PORT` 等字段。
 
 ## 许可证
 

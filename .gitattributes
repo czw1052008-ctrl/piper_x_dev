@@ -1,0 +1,2 @@
+FoundationPose/weights/**/model_best.pth filter=lfs diff=lfs merge=lfs -text
+FoundationPose/weights/**/*.zip filter=lfs diff=lfs merge=lfs -text
