@@ -1,0 +1,42 @@
+# ROS 2 / colcon build artifacts (all workspaces)
+**/build/
+**/install/
+**/log/
+
+# Python
+**/__pycache__/
+*.py[cod]
+**/.pytest_cache/
+*.egg-info/
+.eggs/
+dist/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local machine secrets / config
+blueberry_picking_ws/config/real_robot.env
+
+# Orbbec SDK runtime logs
+Log/
+**/Log/
+
+# Editor / debug artifacts
+cursor_*.md
+*.gv
+frames_*.pdf
+selector.log
+
+# FoundationPose weights > GitHub 100MB file limit (download separately; see README)
+FoundationPose/weights/2024-01-11-20-02-45/model_best.pth
+FoundationPose/weights/2024-01-11-20-02-45-20260623T132207Z-3-001.zip
+
+# Local scan recording scratch (poses live in pick_scan_poses.env)
+blueberry_picking_ws/config/pick_scan_recorded.txt

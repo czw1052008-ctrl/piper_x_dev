@@ -1,0 +1,48 @@
+<?xml version="1.0" ?>
+<sdf version="1.6">
+  <world name="blueberry_picking_world">
+    <include>
+      <uri>model://sun</uri>
+    </include>
+    <include>
+      <uri>model://ground_plane</uri>
+    </include>
+
+    <!-- Work table -->
+    <model name="work_table">
+      <static>true</static>
+      <pose>0.5 0 0.4 0 0 0</pose>
+      <link name="table_link">
+        <collision name="collision">
+          <geometry><box><size>0.8 0.6 0.02</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>0.8 0.6 0.02</size></box></geometry>
+          <material><ambient>0.6 0.4 0.2 1</ambient></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Fixed global camera pole -->
+    <model name="fixed_camera_pole">
+      <static>true</static>
+      <pose>0.0 -0.5 0.0 0 0 0</pose>
+      <link name="pole_link">
+        <visual name="visual">
+          <geometry><cylinder><radius>0.02</radius><length>0.5</length></cylinder></geometry>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Blueberry cluster: branch + berries (spawned via model://) -->
+    <include>
+      <uri>model://blueberry_branch</uri>
+      <pose>0.55 0.05 0.42 0 0 0.3</pose>
+    </include>
+
+    <physics type="ode">
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>1</real_time_factor>
+    </physics>
+  </world>
+</sdf>

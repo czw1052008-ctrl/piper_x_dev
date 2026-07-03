@@ -1,0 +1,9 @@
+picking_msgs/DetectedBerry[] berries
+geometry_msgs/Vector3 stem_direction
+bool stem_direction_valid
+geometry_msgs/PoseStamped contact_pose
+bool contact_pose_valid
+---
+picking_msgs/VibrationPlan plan
+bool success
+string message

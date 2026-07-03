@@ -1,0 +1,9 @@
+# Rod horizontal, bolts vertical. joint5 must stay within URDF limit (±1.55334 rad).
+initial_positions:
+  joint1: 0.0
+  joint2: 1.0
+  joint3: -1.0
+  joint4: 0.0
+  joint5: 1.553
+  joint6: 1.5708
+  vibration_slide_joint: 0.0

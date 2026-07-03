@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- Optional profile; SHM is disabled via RMW_FASTRTPS_USE_SHM=0 in launch scripts. -->
+<profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <participant profile_name="default_participant" is_default_profile="true">
+    <rtps>
+      <useBuiltinTransports>true</useBuiltinTransports>
+    </rtps>
+  </participant>
+</profiles>

@@ -1,0 +1,67 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <xacro:macro name="picking_ros2_control" params="name initial_positions_file use_gazebo:=false use_gz:=false vibration_eef:=false controllers_yaml:='$(find picking_moveit_config)/config/ros2_controllers.yaml'">
+    <xacro:property name="initial_positions" value="${xacro.load_yaml(initial_positions_file)['initial_positions']}"/>
+
+    <ros2_control name="${name}" type="system">
+      <hardware>
+        <xacro:if value="${use_gz}">
+          <plugin>gz_ros2_control/GazeboSimSystem</plugin>
+        </xacro:if>
+        <xacro:unless value="${use_gz}">
+          <xacro:if value="${use_gazebo}">
+            <plugin>gazebo_ros2_control/GazeboSystem</plugin>
+          </xacro:if>
+          <xacro:unless value="${use_gazebo}">
+            <plugin>mock_components/GenericSystem</plugin>
+          </xacro:unless>
+        </xacro:unless>
+      </hardware>
+
+      <xacro:macro name="arm_joint" params="joint_name">
+        <joint name="${joint_name}">
+          <command_interface name="position"/>
+          <state_interface name="position">
+            <param name="initial_value">${initial_positions[joint_name]}</param>
+          </state_interface>
+          <state_interface name="velocity"/>
+        </joint>
+      </xacro:macro>
+
+      <xacro:arm_joint joint_name="joint1"/>
+      <xacro:arm_joint joint_name="joint2"/>
+      <xacro:arm_joint joint_name="joint3"/>
+      <xacro:arm_joint joint_name="joint4"/>
+      <xacro:arm_joint joint_name="joint5"/>
+      <xacro:arm_joint joint_name="joint6"/>
+      <xacro:if value="${vibration_eef}">
+        <joint name="vibration_slide_joint">
+          <command_interface name="position"/>
+          <state_interface name="position">
+            <param name="initial_value">${initial_positions['vibration_slide_joint']}</param>
+          </state_interface>
+          <state_interface name="velocity"/>
+        </joint>
+      </xacro:if>
+    </ros2_control>
+
+    <xacro:if value="${use_gz}">
+      <gazebo>
+        <plugin filename="libgz_ros2_control-system.so"
+                name="gz_ros2_control::GazeboSimROS2ControlPlugin">
+          <parameters>${controllers_yaml}</parameters>
+        </plugin>
+      </gazebo>
+    </xacro:if>
+
+    <xacro:if value="${use_gazebo}">
+      <gazebo>
+        <plugin filename="libgazebo_ros2_control.so" name="gazebo_ros2_control">
+          <parameters>${controllers_yaml}</parameters>
+        </plugin>
+      </gazebo>
+    </xacro:if>
+  </xacro:macro>
+
+</robot>

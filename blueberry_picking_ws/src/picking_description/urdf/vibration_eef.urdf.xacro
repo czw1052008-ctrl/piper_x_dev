@@ -1,0 +1,130 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <!--
+    link6 (+Z) → flange → motor housing → [vibration_slide_joint prismatic] → rod → eef_link.
+
+    vibration_slide_joint: telescopic motor reciprocates the rod along +Z (±1.5 mm).
+    Real hardware driver oscillates this joint at high frequency; BT ActivateVibration is log-only.
+  -->
+  <xacro:property name="vibration_stroke" value="0.003"/>
+  <xacro:property name="flange_thickness" value="0.003"/>
+  <xacro:property name="motor_x" value="0.012"/>
+  <xacro:property name="motor_y" value="0.008"/>
+  <xacro:property name="motor_z" value="0.010"/>
+  <xacro:property name="rod_length" value="0.30"/>
+  <xacro:property name="rod_radius" value="0.008"/>
+  <xacro:property name="bolt_from_tip_near" value="0.02"/>
+  <xacro:property name="bolt_from_tip_far" value="0.06"/>
+  <xacro:property name="bolt_z_near" value="${rod_length - bolt_from_tip_near}"/>
+  <xacro:property name="bolt_z_far" value="${rod_length - bolt_from_tip_far}"/>
+
+  <link name="flange_link">
+    <visual name="flange_visual">
+      <geometry><box size="0.04 0.04 ${flange_thickness}"/></geometry>
+      <material name="flange_silver"><color rgba="0.75 0.75 0.78 1"/></material>
+    </visual>
+    <collision name="flange_collision">
+      <geometry><box size="0.04 0.04 ${flange_thickness}"/></geometry>
+    </collision>
+    <inertial>
+      <mass value="0.02"/>
+      <inertia ixx="1e-5" ixy="0" ixz="0" iyy="1e-5" iyz="0" izz="1e-5"/>
+    </inertial>
+  </link>
+
+  <joint name="flange_joint" type="fixed">
+    <parent link="link6"/>
+    <child link="flange_link"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+
+  <link name="vibration_motor_link">
+    <visual name="motor_visual">
+      <origin xyz="0 0 ${motor_z * 0.5}" rpy="0 0 0"/>
+      <geometry><box size="${motor_x} ${motor_y} ${motor_z}"/></geometry>
+      <material name="motor_black"><color rgba="0.15 0.15 0.18 1"/></material>
+    </visual>
+    <collision name="motor_collision">
+      <origin xyz="0 0 ${motor_z * 0.5}" rpy="0 0 0"/>
+      <geometry><box size="${motor_x} ${motor_y} ${motor_z}"/></geometry>
+    </collision>
+    <inertial>
+      <mass value="0.08"/>
+      <origin xyz="0 0 ${motor_z * 0.5}"/>
+      <inertia ixx="1e-5" ixy="0" ixz="0" iyy="1e-5" iyz="0" izz="1e-5"/>
+    </inertial>
+  </link>
+
+  <joint name="vibration_motor_joint" type="fixed">
+    <parent link="flange_link"/>
+    <child link="vibration_motor_link"/>
+    <origin xyz="0 0 ${flange_thickness}" rpy="0 0 0"/>
+  </joint>
+
+  <link name="rod_link">
+    <visual name="rod_visual">
+      <origin xyz="0 0 ${rod_length * 0.5}" rpy="0 0 0"/>
+      <geometry><cylinder radius="${rod_radius}" length="${rod_length}"/></geometry>
+      <material name="rod_gray"><color rgba="0.55 0.55 0.58 1"/></material>
+    </visual>
+    <collision name="rod_collision">
+      <!-- Full rod for Gazebo contact; MoveIt uses separate scene objects. -->
+      <origin xyz="0 0 ${rod_length * 0.5}" rpy="0 0 0"/>
+      <geometry><cylinder radius="${rod_radius}" length="${rod_length}"/></geometry>
+    </collision>
+    <!-- Bolts pierce rod at ±X (⊥ rod axis +Z); slot = gap between bolts at 2 cm / 6 cm from tip. -->
+    <visual name="bolt_near_pos">
+      <origin xyz="${rod_radius + 0.010} 0 ${bolt_z_near}" rpy="0 1.5708 0"/>
+      <geometry><cylinder radius="0.004" length="0.020"/></geometry>
+      <material name="bolt_dark"><color rgba="0.2 0.2 0.22 1"/></material>
+    </visual>
+    <visual name="bolt_near_neg">
+      <origin xyz="${-rod_radius - 0.010} 0 ${bolt_z_near}" rpy="0 1.5708 0"/>
+      <geometry><cylinder radius="0.004" length="0.020"/></geometry>
+      <material name="bolt_dark"><color rgba="0.2 0.2 0.22 1"/></material>
+    </visual>
+    <visual name="bolt_far_pos">
+      <origin xyz="${rod_radius + 0.010} 0 ${bolt_z_far}" rpy="0 1.5708 0"/>
+      <geometry><cylinder radius="0.004" length="0.020"/></geometry>
+      <material name="bolt_dark"><color rgba="0.2 0.2 0.22 1"/></material>
+    </visual>
+    <visual name="bolt_far_neg">
+      <origin xyz="${-rod_radius - 0.010} 0 ${bolt_z_far}" rpy="0 1.5708 0"/>
+      <geometry><cylinder radius="0.004" length="0.020"/></geometry>
+      <material name="bolt_dark"><color rgba="0.2 0.2 0.22 1"/></material>
+    </visual>
+    <inertial>
+      <mass value="0.22"/>
+      <origin xyz="0 0 ${rod_length * 0.5}"/>
+      <inertia ixx="1e-4" ixy="0" ixz="0" iyy="1e-4" iyz="0" izz="1e-5"/>
+    </inertial>
+  </link>
+
+  <joint name="vibration_slide_joint" type="prismatic">
+    <parent link="vibration_motor_link"/>
+    <child link="rod_link"/>
+    <origin xyz="0 0 ${motor_z}" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-0.001" upper="${vibration_stroke + 0.001}" effort="20" velocity="0.05"/>
+    <dynamics damping="0.5" friction="0.1"/>
+  </joint>
+
+  <link name="eef_link">
+    <visual name="tip_marker">
+      <geometry><sphere radius="0.010"/></geometry>
+      <material name="tip_red"><color rgba="0.9 0.15 0.15 1"/></material>
+    </visual>
+    <inertial>
+      <mass value="0.01"/>
+      <inertia ixx="1e-6" ixy="0" ixz="0" iyy="1e-6" iyz="0" izz="1e-6"/>
+    </inertial>
+  </link>
+
+  <joint name="eef_joint" type="fixed">
+    <parent link="rod_link"/>
+    <child link="eef_link"/>
+    <origin xyz="0 0 ${rod_length}" rpy="0 0 0"/>
+  </joint>
+
+</robot>

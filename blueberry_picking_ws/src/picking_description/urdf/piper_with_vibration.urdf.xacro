@@ -1,0 +1,40 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="piper_with_vibration">
+
+  <xacro:arg name="use_gazebo" default="false"/>
+  <xacro:arg name="use_gz" default="false"/>
+  <xacro:arg name="initial_positions_file"
+    default="$(find picking_moveit_config)/config/initial_positions.yaml"/>
+
+  <xacro:include filename="$(find picking_description)/urdf/piper_base.urdf.xacro"/>
+  <xacro:include filename="$(find picking_description)/urdf/vibration_eef.urdf.xacro"/>
+  <xacro:include filename="$(find picking_description)/urdf/wrist_camera.urdf.xacro"/>
+  <xacro:include filename="$(find picking_description)/urdf/picking_ros2_control.xacro"/>
+
+  <xacro:if value="$(arg use_gz)">
+    <xacro:include filename="$(find picking_description)/urdf/piper_gz_materials.xacro"/>
+    <xacro:piper_gz_materials/>
+  </xacro:if>
+
+  <xacro:picking_ros2_control
+    name="PickingSystem"
+    initial_positions_file="$(arg initial_positions_file)"
+    use_gazebo="$(arg use_gazebo)"
+    use_gz="$(arg use_gz)"
+    vibration_eef="true"
+    controllers_yaml="$(find picking_moveit_config)/config/ros2_controllers_vibration.yaml"/>
+
+  <!-- Fixed work table for MoveIt rod-table collision (matches blueberry_picking.sdf) -->
+  <link name="work_table_collision">
+    <collision name="table_top">
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><box size="0.80 0.60 0.02"/></geometry>
+    </collision>
+  </link>
+  <joint name="work_table_collision_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="work_table_collision"/>
+    <origin xyz="0.45 0 0.30" rpy="0 0 0"/>
+  </joint>
+
+</robot>

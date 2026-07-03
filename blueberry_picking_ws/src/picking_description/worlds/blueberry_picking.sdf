@@ -1,0 +1,358 @@
+<?xml version="1.0" ?>
+<sdf version="1.9">
+  <world name="blueberry_picking">
+    <physics name="default" type="ode">
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+    </physics>
+    <plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics"/>
+    <plugin filename="gz-sim-user-commands-system" name="gz::sim::systems::UserCommands"/>
+    <plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster"/>
+    <plugin filename="gz-sim-sensors-system" name="gz::sim::systems::Sensors">
+      <render_engine>ogre2</render_engine>
+    </plugin>
+
+    <light type="directional" name="sun">
+      <cast_shadows>true</cast_shadows>
+      <pose>0 0 10 0 0 0</pose>
+      <diffuse>0.9 0.9 0.85 1</diffuse>
+      <specular>0.3 0.3 0.3 1</specular>
+    </light>
+
+    <light type="point" name="table_light">
+      <pose>0.45 0 1.1 0 0 0</pose>
+      <diffuse>0.95 0.9 0.8 1</diffuse>
+      <specular>0.2 0.2 0.2 1</specular>
+      <attenuation>
+        <range>4</range>
+        <constant>0.3</constant>
+        <linear>0.1</linear>
+      </attenuation>
+    </light>
+
+    <gui fullscreen="0">
+      <camera name="user_camera">
+        <pose>0.2 -1.0 0.75 0 0.35 1.57</pose>
+      </camera>
+    </gui>
+
+    <model name="ground_plane">
+      <static>true</static>
+      <link name="link">
+        <collision name="collision">
+          <geometry><plane><normal>0 0 1</normal><size>10 10</size></plane></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><plane><normal>0 0 1</normal><size>10 10</size></plane></geometry>
+          <material>
+            <ambient>0.5 0.5 0.5 1</ambient>
+            <diffuse>0.55 0.55 0.55 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="work_table">
+      <static>true</static>
+      <pose>0.45 0 0.4 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>0.8 0.6 0.02</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>0.8 0.6 0.02</size></box></geometry>
+          <material>
+            <ambient>0.55 0.35 0.18 1</ambient>
+            <diffuse>0.72 0.48 0.22 1</diffuse>
+            <specular>0.15 0.1 0.05 1</specular>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!--
+      Blueberry plant model. Model origin sits at table surface (world z=0.41).
+      Each branch: 0.18 m cylinder; berries form a tip cluster near +Z end
+      (spread in branch-local XY, NOT collinear along the branch like tanghulu).
+      Vibration contact = top branch fruit–stem junction + 3 cm toward trunk on branch axis.
+    -->
+    <model name="blueberry_plant">
+      <static>true</static>
+      <pose>0.45 0 0.41 0 0 0</pose>
+
+      <!-- Terracotta pot: r=0.07m, h=0.12m, center 6cm above model origin -->
+      <link name="pot">
+        <pose>0 0 0.060 0 0 0</pose>
+        <visual name="visual">
+          <geometry><cylinder><radius>0.070</radius><length>0.120</length></cylinder></geometry>
+          <material>
+            <ambient>0.65 0.30 0.15 1</ambient>
+            <diffuse>0.75 0.38 0.18 1</diffuse>
+            <specular>0.10 0.06 0.04 1</specular>
+          </material>
+        </visual>
+      </link>
+
+      <!-- Vertical trunk: r=0.012m, h=0.28m, from pot top (z=0.12) to z=0.40 -->
+      <link name="trunk">
+        <pose>0 0 0.260 0 0 0</pose>
+        <visual name="visual">
+          <geometry><cylinder><radius>0.012</radius><length>0.280</length></cylinder></geometry>
+          <material>
+            <ambient>0.30 0.16 0.06 1</ambient>
+            <diffuse>0.38 0.20 0.08 1</diffuse>
+            <specular>0.05 0.03 0.01 1</specular>
+          </material>
+        </visual>
+        <collision name="collision">
+          <geometry><cylinder><radius>0.012</radius><length>0.280</length></cylinder></geometry>
+        </collision>
+      </link>
+      <joint name="trunk_joint" type="fixed">
+        <parent>pot</parent><child>trunk</child>
+      </joint>
+
+      <!--
+        Branch 1: toward arm with +Y and upward tilt.
+        dir=(-0.945, 0.167, 0.278), origin z_local=0.19 on trunk
+        link center at (-0.085, 0.015, 0.215), pitch=1.289 rad, yaw=2.966 rad
+      -->
+      <link name="branch_1">
+        <pose>-0.085 0.015 0.215 0 1.289 2.966</pose>
+        <visual name="visual">
+          <geometry><cylinder><radius>0.009</radius><length>0.180</length></cylinder></geometry>
+          <material>
+            <ambient>0.30 0.16 0.06 1</ambient>
+            <diffuse>0.38 0.20 0.08 1</diffuse>
+            <specular>0.05 0.03 0.01 1</specular>
+          </material>
+        </visual>
+        <collision name="collision">
+          <geometry><cylinder><radius>0.009</radius><length>0.180</length></cylinder></geometry>
+        </collision>
+      </link>
+      <joint name="branch_1_joint" type="fixed">
+        <parent>trunk</parent><child>branch_1</child>
+      </joint>
+
+      <!-- Branch 1 berries: tip cluster outside branch +Z end (half_len=0.09, r=0.012 → z>=0.102) -->
+      <link name="berry_1_1">
+        <pose relative_to="branch_1">0.022 0.018 0.105 0 0 0</pose>
+        <visual name="visual">
+          <geometry><sphere><radius>0.014</radius></sphere></geometry>
+          <material>
+            <ambient>0.35 0.10 0.85 1</ambient><diffuse>0.45 0.15 0.95 1</diffuse>
+            <specular>0.20 0.20 0.30 1</specular><emissive>0.12 0.04 0.28 1</emissive>
+          </material>
+        </visual>
+      </link>
+      <joint name="b1_1" type="fixed"><parent>branch_1</parent><child>berry_1_1</child>
+      </joint>
+
+      <link name="berry_1_2">
+        <pose relative_to="branch_1">-0.018 -0.012 0.108 0 0 0</pose>
+        <visual name="visual">
+          <geometry><sphere><radius>0.014</radius></sphere></geometry>
+          <material>
+            <ambient>0.35 0.10 0.85 1</ambient><diffuse>0.45 0.15 0.95 1</diffuse>
+            <specular>0.20 0.20 0.30 1</specular><emissive>0.12 0.04 0.28 1</emissive>
+          </material>
+        </visual>
+      </link>
+      <joint name="b1_2" type="fixed"><parent>branch_1</parent><child>berry_1_2</child>
+      </joint>
+
+      <link name="berry_1_3">
+        <pose relative_to="branch_1">0.008 0.022 0.112 0 0 0</pose>
+        <visual name="visual">
+          <geometry><sphere><radius>0.014</radius></sphere></geometry>
+          <material>
+            <ambient>0.35 0.10 0.85 1</ambient><diffuse>0.45 0.15 0.95 1</diffuse>
+            <specular>0.20 0.20 0.30 1</specular><emissive>0.12 0.04 0.28 1</emissive>
+          </material>
+        </visual>
+      </link>
+      <joint name="b1_3" type="fixed"><parent>branch_1</parent><child>berry_1_3</child>
+      </joint>
+
+      <link name="berry_1_4">
+        <pose relative_to="branch_1">-0.020 0.006 0.106 0 0 0</pose>
+        <visual name="visual">
+          <geometry><sphere><radius>0.014</radius></sphere></geometry>
+          <material>
+            <ambient>0.35 0.10 0.85 1</ambient><diffuse>0.45 0.15 0.95 1</diffuse>
+            <specular>0.20 0.20 0.30 1</specular><emissive>0.12 0.04 0.28 1</emissive>
+          </material>
+        </visual>
+      </link>
+      <joint name="b1_4" type="fixed"><parent>branch_1</parent><child>berry_1_4</child>
+      </joint>
+
+      <!--
+        Branch 2: toward arm with -Y offset and moderate upward tilt.
+        dir=(-0.808, -0.505, 0.303), origin z_local=0.28 on trunk
+        link center at (-0.073, -0.045, 0.307), pitch=1.264 rad, yaw=-2.583 rad
+      -->
+      <link name="branch_2">
+        <pose>-0.073 -0.045 0.307 0 1.264 -2.583</pose>
+        <visual name="visual">
+          <geometry><cylinder><radius>0.009</radius><length>0.180</length></cylinder></geometry>
+          <material>
+            <ambient>0.30 0.16 0.06 1</ambient>
+            <diffuse>0.38 0.20 0.08 1</diffuse>
+            <specular>0.05 0.03 0.01 1</specular>
+          </material>
+        </visual>
+        <collision name="collision">
+          <geometry><cylinder><radius>0.009</radius><length>0.180</length></cylinder></geometry>
+        </collision>
+      </link>
+      <joint name="branch_2_joint" type="fixed">
+        <parent>trunk</parent><child>branch_2</child>
+      </joint>
+
+      <!-- Branch 2 berries: tip cluster outside branch +Z end -->
+      <link name="berry_2_1">
+        <pose relative_to="branch_2">0.022 0.018 0.105 0 0 0</pose>
+        <visual name="visual">
+          <geometry><sphere><radius>0.014</radius></sphere></geometry>
+          <material>
+            <ambient>0.35 0.10 0.85 1</ambient><diffuse>0.45 0.15 0.95 1</diffuse>
+            <specular>0.20 0.20 0.30 1</specular><emissive>0.12 0.04 0.28 1</emissive>
+          </material>
+        </visual>
+      </link>
+      <joint name="b2_1" type="fixed"><parent>branch_2</parent><child>berry_2_1</child>
+      </joint>
+
+      <link name="berry_2_2">
+        <pose relative_to="branch_2">-0.018 -0.012 0.108 0 0 0</pose>
+        <visual name="visual">
+          <geometry><sphere><radius>0.014</radius></sphere></geometry>
+          <material>
+            <ambient>0.35 0.10 0.85 1</ambient><diffuse>0.45 0.15 0.95 1</diffuse>
+            <specular>0.20 0.20 0.30 1</specular><emissive>0.12 0.04 0.28 1</emissive>
+          </material>
+        </visual>
+      </link>
+      <joint name="b2_2" type="fixed"><parent>branch_2</parent><child>berry_2_2</child>
+      </joint>
+
+      <link name="berry_2_3">
+        <pose relative_to="branch_2">0.008 0.022 0.112 0 0 0</pose>
+        <visual name="visual">
+          <geometry><sphere><radius>0.014</radius></sphere></geometry>
+          <material>
+            <ambient>0.35 0.10 0.85 1</ambient><diffuse>0.45 0.15 0.95 1</diffuse>
+            <specular>0.20 0.20 0.30 1</specular><emissive>0.12 0.04 0.28 1</emissive>
+          </material>
+        </visual>
+      </link>
+      <joint name="b2_3" type="fixed"><parent>branch_2</parent><child>berry_2_3</child>
+      </joint>
+
+      <link name="berry_2_4">
+        <pose relative_to="branch_2">-0.020 0.006 0.106 0 0 0</pose>
+        <visual name="visual">
+          <geometry><sphere><radius>0.014</radius></sphere></geometry>
+          <material>
+            <ambient>0.35 0.10 0.85 1</ambient><diffuse>0.45 0.15 0.95 1</diffuse>
+            <specular>0.20 0.20 0.30 1</specular><emissive>0.12 0.04 0.28 1</emissive>
+          </material>
+        </visual>
+      </link>
+      <joint name="b2_4" type="fixed"><parent>branch_2</parent><child>berry_2_4</child>
+      </joint>
+
+      <!--
+        Branch 3: near-horizontal toward arm.
+        dir=(-1, 0, 0), origin z_local=0.15 on trunk
+        link center at (-0.090, 0, 0.150), pitch=pi/2=1.5708, yaw=pi=3.1416
+      -->
+      <link name="branch_3">
+        <pose>-0.090 0.000 0.150 0 1.5708 3.1416</pose>
+        <visual name="visual">
+          <geometry><cylinder><radius>0.009</radius><length>0.180</length></cylinder></geometry>
+          <material>
+            <ambient>0.30 0.16 0.06 1</ambient>
+            <diffuse>0.38 0.20 0.08 1</diffuse>
+            <specular>0.05 0.03 0.01 1</specular>
+          </material>
+        </visual>
+        <collision name="collision">
+          <geometry><cylinder><radius>0.009</radius><length>0.180</length></cylinder></geometry>
+        </collision>
+      </link>
+      <joint name="branch_3_joint" type="fixed">
+        <parent>trunk</parent><child>branch_3</child>
+      </joint>
+
+      <!-- Branch 3 berries: tip cluster outside branch +Z end -->
+      <link name="berry_3_1">
+        <pose relative_to="branch_3">0.022 0.018 0.105 0 0 0</pose>
+        <visual name="visual">
+          <geometry><sphere><radius>0.014</radius></sphere></geometry>
+          <material>
+            <ambient>0.35 0.10 0.85 1</ambient><diffuse>0.45 0.15 0.95 1</diffuse>
+            <specular>0.20 0.20 0.30 1</specular><emissive>0.12 0.04 0.28 1</emissive>
+          </material>
+        </visual>
+      </link>
+      <joint name="b3_1" type="fixed"><parent>branch_3</parent><child>berry_3_1</child>
+      </joint>
+
+      <link name="berry_3_2">
+        <pose relative_to="branch_3">-0.018 -0.012 0.108 0 0 0</pose>
+        <visual name="visual">
+          <geometry><sphere><radius>0.014</radius></sphere></geometry>
+          <material>
+            <ambient>0.35 0.10 0.85 1</ambient><diffuse>0.45 0.15 0.95 1</diffuse>
+            <specular>0.20 0.20 0.30 1</specular><emissive>0.12 0.04 0.28 1</emissive>
+          </material>
+        </visual>
+      </link>
+      <joint name="b3_2" type="fixed"><parent>branch_3</parent><child>berry_3_2</child>
+      </joint>
+
+      <link name="berry_3_3">
+        <pose relative_to="branch_3">0.008 0.022 0.112 0 0 0</pose>
+        <visual name="visual">
+          <geometry><sphere><radius>0.014</radius></sphere></geometry>
+          <material>
+            <ambient>0.35 0.10 0.85 1</ambient><diffuse>0.45 0.15 0.95 1</diffuse>
+            <specular>0.20 0.20 0.30 1</specular><emissive>0.12 0.04 0.28 1</emissive>
+          </material>
+        </visual>
+      </link>
+      <joint name="b3_3" type="fixed"><parent>branch_3</parent><child>berry_3_3</child>
+      </joint>
+
+      <link name="berry_3_4">
+        <pose relative_to="branch_3">-0.020 0.006 0.106 0 0 0</pose>
+        <visual name="visual">
+          <geometry><sphere><radius>0.014</radius></sphere></geometry>
+          <material>
+            <ambient>0.35 0.10 0.85 1</ambient><diffuse>0.45 0.15 0.95 1</diffuse>
+            <specular>0.20 0.20 0.30 1</specular><emissive>0.12 0.04 0.28 1</emissive>
+          </material>
+        </visual>
+      </link>
+      <joint name="b3_4" type="fixed"><parent>branch_3</parent><child>berry_3_4</child>
+      </joint>
+
+      <!-- PosePublisher: per-link poses with names for ros_gz_bridge (not pose/info). -->
+      <plugin
+        filename="gz-sim-pose-publisher-system"
+        name="gz::sim::systems::PosePublisher">
+        <publish_link_pose>true</publish_link_pose>
+        <publish_collision_pose>false</publish_collision_pose>
+        <publish_visual_pose>false</publish_visual_pose>
+        <publish_nested_model_pose>true</publish_nested_model_pose>
+        <use_pose_vector_msg>true</use_pose_vector_msg>
+        <static_publisher>true</static_publisher>
+        <static_update_frequency>1</static_update_frequency>
+      </plugin>
+    </model>
+  </world>
+</sdf>

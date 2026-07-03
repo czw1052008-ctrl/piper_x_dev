@@ -1,0 +1,16 @@
+joint_limits:
+  joint1: {has_velocity_limits: true, max_velocity: 8.0, has_acceleration_limits: true, max_acceleration: 8.0}
+  joint2: {has_velocity_limits: true, max_velocity: 8.0, has_acceleration_limits: true, max_acceleration: 8.0}
+  joint3: {has_velocity_limits: true, max_velocity: 8.0, has_acceleration_limits: true, max_acceleration: 8.0}
+  joint4: {has_velocity_limits: true, max_velocity: 8.0, has_acceleration_limits: true, max_acceleration: 8.0}
+  joint5: {has_velocity_limits: true, max_velocity: 8.0, has_acceleration_limits: true, max_acceleration: 8.0}
+  joint6: {has_velocity_limits: true, max_velocity: 8.0, has_acceleration_limits: true, max_acceleration: 8.0}
+  # Gazebo may report slide joint slightly below 0; avoid START_STATE_INVALID (-26).
+  vibration_slide_joint:
+    has_position_limits: true
+    min_position: -0.001
+    max_position: 0.004
+    has_velocity_limits: true
+    max_velocity: 0.05
+    has_acceleration_limits: true
+    max_acceleration: 1.0

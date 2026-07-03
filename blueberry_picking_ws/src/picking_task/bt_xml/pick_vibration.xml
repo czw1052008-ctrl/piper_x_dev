@@ -1,0 +1,35 @@
+<root BTCPP_format="4">
+  <BehaviorTree ID="PickVibration">
+    <RetryUntilSuccessful num_attempts="{max_retries}">
+      <Sequence>
+        <RetryUntilSuccessful num_attempts="5">
+          <GlobalDetect cluster_pose="{cluster_pose}"/>
+        </RetryUntilSuccessful>
+        <MoveToNamed target_name="home"/>
+        <RetryUntilSuccessful num_attempts="3">
+          <ClusterAnalyze cluster_info="{cluster_info}"
+                          contact_pose="{contact_pose}"
+                          stem_direction="{stem_direction}"/>
+        </RetryUntilSuccessful>
+        <PlanVibration cluster_info="{cluster_info}"
+                       contact_pose="{contact_pose}"
+                       stem_direction="{stem_direction}"
+                       vib_plan="{vib_plan}"
+                       pre_approach="{pre_approach}" slot_pose="{slot_pose}" retract_pose="{retract_pose}"
+                       dump_pose="{dump_pose}"/>
+        <SelectApproach vib_plan="{vib_plan}" pre_approach="{pre_approach}" retract_pose="{retract_pose}"/>
+        <RetryUntilSuccessful num_attempts="3">
+          <Sequence>
+            <LateralApproach pre_approach="{pre_approach}" slot_pose="{slot_pose}"/>
+            <VerifyAlignment vib_plan="{vib_plan}" contact_pose="{contact_pose}" tolerance="0.020"/>
+          </Sequence>
+        </RetryUntilSuccessful>
+        <ActivateVibration enable="true"/>
+        <Delay delay_msec="3000"><AlwaysSuccess/></Delay>
+        <ActivateVibration enable="false"/>
+        <LateralRetract retract_pose="{retract_pose}"/>
+        <MoveToPose target="{dump_pose}" use_orientation="true"/>
+      </Sequence>
+    </RetryUntilSuccessful>
+  </BehaviorTree>
+</root>

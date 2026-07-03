@@ -1,0 +1,12 @@
+# Goal
+string end_effector_mode
+int32 max_retries
+---
+# Result
+bool success
+string message
+int32 total_picked
+---
+# Feedback
+string state
+geometry_msgs/PoseStamped current_target

@@ -1,0 +1,4 @@
+std_msgs/Header header
+geometry_msgs/PoseStamped pre_grasp
+geometry_msgs/PoseStamped grasp
+geometry_msgs/PoseStamped post_grasp

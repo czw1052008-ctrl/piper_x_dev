@@ -1,0 +1,9 @@
+std_msgs/Header header
+geometry_msgs/PoseStamped pre_approach
+geometry_msgs/PoseStamped[] pre_approach_candidates
+geometry_msgs/PoseStamped slot_pose
+geometry_msgs/PoseStamped retract_pose
+geometry_msgs/PoseStamped dump_pose
+geometry_msgs/Vector3 branch_dir
+float32 vibration_duration_sec
+bool perception_valid

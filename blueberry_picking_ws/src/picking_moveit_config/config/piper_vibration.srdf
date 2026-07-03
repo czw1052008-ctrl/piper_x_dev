@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<robot name="piper_with_vibration">
+  <group name="arm">
+    <chain base_link="base_link" tip_link="link6"/>
+  </group>
+  <group_state name="home" group="arm">
+    <joint name="joint1" value="0"/>
+    <joint name="joint2" value="1.0"/>
+    <joint name="joint3" value="-1.0"/>
+    <joint name="joint4" value="0"/>
+    <joint name="joint5" value="1.553"/>
+    <joint name="joint6" value="1.5708"/>
+  </group_state>
+  <passive_joint name="vibration_slide_joint"/>
+  <end_effector name="vibration_eef" parent_link="link6" group="arm"/>
+  <virtual_joint name="virtual_joint" type="fixed" parent_frame="world" child_link="base_link"/>
+  <disable_collisions link1="base_link" link2="link1" reason="Adjacent"/>
+  <disable_collisions link1="link1" link2="link2" reason="Adjacent"/>
+  <disable_collisions link1="link2" link2="link3" reason="Adjacent"/>
+  <disable_collisions link1="link3" link2="link4" reason="Adjacent"/>
+  <disable_collisions link1="link4" link2="link5" reason="Adjacent"/>
+  <disable_collisions link1="link5" link2="link6" reason="Adjacent"/>
+  <disable_collisions link1="link6" link2="flange_link" reason="Adjacent"/>
+  <disable_collisions link1="flange_link" link2="vibration_motor_link" reason="Adjacent"/>
+  <disable_collisions link1="vibration_motor_link" link2="rod_link" reason="Adjacent"/>
+  <disable_collisions link1="rod_link" link2="eef_link" reason="Adjacent"/>
+  <disable_collisions link1="link6" link2="camera_wrist_link" reason="Adjacent"/>
+  <disable_collisions link1="base_link" link2="work_table_collision" reason="Adjacent"/>
+  <!-- Coarse flange/motor/rod collision meshes overlap link5–link6 at home (Gazebo OK). -->
+  <disable_collisions link1="link5" link2="flange_link" reason="User"/>
+  <disable_collisions link1="link5" link2="vibration_motor_link" reason="User"/>
+  <disable_collisions link1="link5" link2="rod_link" reason="User"/>
+  <disable_collisions link1="link6" link2="vibration_motor_link" reason="Adjacent"/>
+  <disable_collisions link1="link4" link2="flange_link" reason="User"/>
+  <disable_collisions link1="link4" link2="rod_link" reason="User"/>
+</robot>

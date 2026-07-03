@@ -1,0 +1,6 @@
+# Placeholder eye-to-hand calibration (fixed camera → base_link)
+# Replace with easy_handeye2 result
+frame_id: base_link
+child_frame_id: camera_fixed_optical_frame
+translation: [0.45, 0.0, 0.55]
+rotation: [0.0, 0.7071, 0.0, 0.7071]  # xyzw quaternion

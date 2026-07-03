@@ -1,0 +1,4 @@
+---
+geometry_msgs/PoseStamped cluster_pose
+bool success
+string message

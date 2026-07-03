@@ -1,0 +1,5 @@
+# Unit sphere ~15mm diameter blueberry placeholder mesh
+v -0.0075 -0.0075 0.0
+v 0.0075 -0.0075 0.0
+v 0.0 0.0075 0.0
+f 1 2 3

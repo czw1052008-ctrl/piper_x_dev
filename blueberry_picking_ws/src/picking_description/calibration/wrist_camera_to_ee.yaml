@@ -1,0 +1,6 @@
+# Eye-in-hand: Piper X flange (link6 / 坐标系7) -> camera optical frame.
+# Mount: -Y 8cm; optical Z aligned with CS7 +Z (same axes, translation only).
+frame_id: link6
+child_frame_id: camera_wrist_link
+translation: [0.0, -0.08, 0.0]
+rotation: [0.0, 0.0, 0.0, 1.0]

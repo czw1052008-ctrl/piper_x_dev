@@ -1,0 +1,14 @@
+/**:
+  ros__parameters:
+    slot_center_from_tip: 0.04
+    slot_width_m: 0.04
+    max_branch_slot_angle_deg: 25.0
+    hover_z: 0.12
+    pre_approach_dist: 0.25
+    vibration_duration_sec: 3.0
+    min_berries: 2
+    dump_lift_z: 0.15
+    table_top_z: 0.31
+    table_clearance_m: 0.05
+    rod_radius: 0.008
+    rod_length_m: 0.30

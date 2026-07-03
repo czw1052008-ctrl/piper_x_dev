@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="piper_with_suction">
+
+  <xacro:arg name="use_gazebo" default="false"/>
+  <xacro:arg name="use_gz" default="false"/>
+  <xacro:arg name="initial_positions_file"
+    default="$(find picking_moveit_config)/config/initial_positions.yaml"/>
+
+  <xacro:include filename="$(find picking_description)/urdf/piper_base.urdf.xacro"/>
+  <xacro:include filename="$(find picking_description)/urdf/suction_eef.urdf.xacro"/>
+  <xacro:include filename="$(find picking_description)/urdf/wrist_camera.urdf.xacro"/>
+  <xacro:include filename="$(find picking_description)/urdf/picking_ros2_control.xacro"/>
+
+  <xacro:if value="$(arg use_gz)">
+    <xacro:include filename="$(find picking_description)/urdf/piper_gz_materials.xacro"/>
+    <xacro:piper_gz_materials/>
+  </xacro:if>
+
+  <xacro:picking_ros2_control
+    name="PickingSystem"
+    initial_positions_file="$(arg initial_positions_file)"
+    use_gazebo="$(arg use_gazebo)"
+    use_gz="$(arg use_gz)"/>
+
+</robot>

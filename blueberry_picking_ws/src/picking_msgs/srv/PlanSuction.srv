@@ -1,0 +1,5 @@
+picking_msgs/DetectedBerry[] berries
+---
+picking_msgs/SuctionGraspPlan plan
+bool success
+string message

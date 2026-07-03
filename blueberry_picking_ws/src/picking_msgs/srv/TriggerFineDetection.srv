@@ -1,0 +1,12 @@
+# Reset 2D track lock (e.g. after pick complete).
+bool reset_lock false
+---
+picking_msgs/DetectedBerry[] detected_berries
+geometry_msgs/Vector3 stem_direction
+bool stem_direction_valid
+geometry_msgs/PoseStamped contact_pose
+bool contact_pose_valid
+bool success
+string message
+# Index into detected_berries for the locked pick target (-1 = none).
+int32 locked_berry_index -1

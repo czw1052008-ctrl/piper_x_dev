@@ -1,0 +1,7 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <!-- Piper X arm base (6 DOF, no gripper) from agx_arm_urdf -->
+  <xacro:include filename="$(find agx_arm_description)/agx_arm_urdf/piper_x/urdf/piper_x_description.urdf" />
+
+</robot>

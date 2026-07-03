@@ -1,0 +1,53 @@
+<?xml version="1.0"?>
+<model name="blueberry_branch">
+  <static>true</static>
+
+  <!-- Branch cylinder -->
+  <link name="branch_link">
+    <pose>0 0 0 0 1.5708 0</pose>
+    <visual name="branch_visual">
+      <geometry><cylinder><radius>0.004</radius><length>0.15</length></cylinder></geometry>
+      <material><ambient>0.3 0.2 0.1 1</ambient></material>
+    </visual>
+    <collision name="branch_collision">
+      <geometry><cylinder><radius>0.004</radius><length>0.15</length></cylinder></geometry>
+    </collision>
+  </link>
+
+  <!-- Blueberry spheres along branch -->
+  <link name="berry_1"><pose>0.04 0 0 0 0 0</pose>
+    <visual><geometry><sphere><radius>0.0075</radius></sphere></geometry>
+      <material><ambient>0.2 0.1 0.6 1</ambient></material></visual>
+    <collision><geometry><sphere><radius>0.0075</radius></sphere></geometry></collision>
+  </link>
+  <joint name="berry_1_joint" type="fixed"><parent>branch_link</parent><child>berry_1</child></joint>
+
+  <link name="berry_2"><pose>0.0 0 0 0 0 0</pose>
+    <visual><geometry><sphere><radius>0.0075</radius></sphere></geometry>
+      <material><ambient>0.2 0.1 0.6 1</ambient></material></visual>
+    <collision><geometry><sphere><radius>0.0075</radius></sphere></geometry></collision>
+  </link>
+  <joint name="berry_2_joint" type="fixed"><parent>branch_link</parent><child>berry_2</child></joint>
+
+  <link name="berry_3"><pose>-0.04 0 0 0 0 0</pose>
+    <visual><geometry><sphere><radius>0.0075</radius></sphere></geometry>
+      <material><ambient>0.2 0.1 0.6 1</ambient></material></visual>
+    <collision><geometry><sphere><radius>0.0075</radius></sphere></geometry></collision>
+  </link>
+  <joint name="berry_3_joint" type="fixed"><parent>branch_link</parent><child>berry_3</child></joint>
+
+  <link name="berry_4"><pose>-0.08 0 0 0 0 0</pose>
+    <visual><geometry><sphere><radius>0.0075</radius></sphere></geometry>
+      <material><ambient>0.2 0.1 0.6 1</ambient></material></visual>
+    <collision><geometry><sphere><radius>0.0075</radius></sphere></geometry></collision>
+  </link>
+  <joint name="berry_4_joint" type="fixed"><parent>branch_link</parent><child>berry_4</child></joint>
+
+  <link name="berry_5"><pose>0.08 0 0 0 0 0</pose>
+    <visual><geometry><sphere><radius>0.0075</radius></sphere></geometry>
+      <material><ambient>0.2 0.1 0.6 1</ambient></material></visual>
+    <collision><geometry><sphere><radius>0.0075</radius></sphere></geometry></collision>
+  </link>
+  <joint name="berry_5_joint" type="fixed"><parent>branch_link</parent><child>berry_5</child></joint>
+
+</model>

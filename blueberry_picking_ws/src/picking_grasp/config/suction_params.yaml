@@ -1,0 +1,9 @@
+/**:
+  ros__parameters:
+    berry_radius: 0.0075
+    cup_contact_offset_m: 0.04
+    pre_grasp_offset: 0.15
+    post_grasp_offset: 0.12
+    berry_selection_mode: nearest
+    nearest_frame: camera_wrist_color_optical_frame
+    stream_topics: false

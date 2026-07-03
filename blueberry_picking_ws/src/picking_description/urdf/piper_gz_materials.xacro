@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <!-- High-contrast Gazebo materials so the arm is easy to see in Harmonic -->
+  <xacro:macro name="piper_gz_materials">
+    <xacro:property name="arm_color" value="0.85 0.55 0.15 1"/>
+    <xacro:property name="base_color" value="0.35 0.35 0.38 1"/>
+
+    <gazebo reference="base_link">
+      <visual><material><ambient>${base_color}</ambient><diffuse>${base_color}</diffuse></material></visual>
+    </gazebo>
+    <xacro:macro name="arm_link_mat" params="link">
+      <gazebo reference="${link}">
+        <visual><material><ambient>${arm_color}</ambient><diffuse>${arm_color}</diffuse></material></visual>
+      </gazebo>
+    </xacro:macro>
+    <xacro:arm_link_mat link="link1"/>
+    <xacro:arm_link_mat link="link2"/>
+    <xacro:arm_link_mat link="link3"/>
+    <xacro:arm_link_mat link="link4"/>
+    <xacro:arm_link_mat link="link5"/>
+    <xacro:arm_link_mat link="link6"/>
+    <gazebo reference="eef_link">
+      <visual><material><ambient>0.2 0.4 0.85 1</ambient><diffuse>0.2 0.4 0.85 1</diffuse></material></visual>
+    </gazebo>
+    <gazebo reference="camera_wrist_link">
+      <visual><material><ambient>0.1 0.1 0.1 1</ambient><diffuse>0.1 0.1 0.1 1</diffuse></material></visual>
+    </gazebo>
+  </xacro:macro>
+
+</robot>
