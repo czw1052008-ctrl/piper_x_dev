@@ -1,0 +1,62 @@
+digraph fine_detector {
+  rankdir=LR;
+  bgcolor="white";
+  pad=0.4;
+  nodesep=0.6;
+  ranksep=1.0;
+  fontname="DejaVu Sans";
+  node [shape=box, style="rounded,filled", fontname="DejaVu Sans", fontsize=11, margin="0.18,0.12"];
+  edge [fontname="DejaVu Sans", fontsize=9, color="#444444"];
+
+  subgraph cluster_hw {
+    label="Hardware / Drivers";
+    style=filled;
+    color="#E8F4FC";
+    fontsize=12;
+    fontname="DejaVu Sans";
+
+    orbbec [label="orbbec_camera\n(DaBai driver)", fillcolor="#B3D9F2"];
+    stf [label="static_transform_publisher\n(bringup)", fillcolor="#B3D9F2"];
+  }
+
+  subgraph cluster_fd {
+    label="fine_detector_node";
+    style=filled;
+    color="#E8F8E8";
+    fontsize=12;
+    fontname="DejaVu Sans";
+
+    cache [label="Latest frame cache\nRGB + Depth + K", fillcolor="#C8E6C9"];
+    yolo [label="YOLO seg", fillcolor="#A5D6A7"];
+    trk [label="BerryTracker", fillcolor="#A5D6A7"];
+    fp [label="FoundationPose", fillcolor="#81C784"];
+    srv [label="Service Server\ntrigger_fine_detection", fillcolor="#66BB6A", penwidth=2];
+  }
+
+  subgraph cluster_call {
+    label="Service Clients";
+    style=filled;
+    color="#FFF3E0";
+    fontsize=12;
+    fontname="DejaVu Sans";
+
+    pl [label="real_suction_pick_loop\n(on-demand, reset_lock?)", fillcolor="#FFCC80"];
+    viz [label="visualize_blueberry_detection\n(default every 8s)", fillcolor="#FFCC80"];
+  }
+
+  orbbec -> cache [label=" Topic ~30Hz\n /camera_wrist/color/image_raw\n sensor_msgs/Image RGB"];
+  orbbec -> cache [label=" Topic ~30Hz\n /camera_wrist/depth/image_raw\n depth (m)"];
+  orbbec -> cache [label=" CameraInfo\n intrinsics K"];
+  stf -> cache [label=" TF static\n link6 -> optical", style=dashed, color="#1976D2"];
+
+  pl -> srv [label=" Service call", color="#E65100", penwidth=2];
+  viz -> srv [label=" Service call", color="#E65100", penwidth=2];
+
+  srv -> yolo [label=" on trigger"];
+  yolo -> trk;
+  trk -> fp [label=" every 8 calls"];
+  srv -> pl [label=" Response\n DetectedBerry[]\n locked_berry_index", color="#2E7D32", dir=both, arrowtail=onormal, arrowhead=onormal];
+  srv -> viz [label=" Response\n (same)", color="#2E7D32", dir=both, arrowtail=onormal, arrowhead=onormal];
+
+  { rank=same; cache; yolo; trk; fp; }
+}

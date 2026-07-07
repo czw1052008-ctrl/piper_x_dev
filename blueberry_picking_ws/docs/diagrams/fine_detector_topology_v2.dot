@@ -1,0 +1,85 @@
+digraph fine_detector_v2 {
+  rankdir=TB;
+  bgcolor="white";
+  pad=0.5;
+  nodesep=0.45;
+  ranksep=0.7;
+  fontname="DejaVu Sans";
+  node [shape=box, style="rounded,filled", fontname="DejaVu Sans", fontsize=12, margin="0.2,0.12"];
+  edge [fontname="DejaVu Sans", fontsize=10, color="#333333"];
+
+  subgraph cluster_hw {
+    label="Layer 1: Hardware / Drivers";
+    labelloc=t;
+    style="rounded,filled";
+    color="#D6EAF8";
+    fontsize=13;
+
+    orbbec [label="orbbec_camera\n(DaBai wrist RGB-D)", fillcolor="#AED6F1"];
+    stf [label="static_transform_publisher\nlink6 -> optical frame", fillcolor="#AED6F1"];
+  }
+
+  subgraph cluster_in {
+    label="Layer 2: Subscribed inputs (~30 Hz continuous, queue_depth=1)";
+    labelloc=t;
+    style="rounded,filled";
+    color="#FCF3CF";
+    fontsize=12;
+
+    t_rgb [label="/camera_wrist/color/image_raw\nsensor_msgs/Image  (RGB 640x480)", shape=note, fillcolor="#F9E79F"];
+    t_depth [label="/camera_wrist/depth/image_raw\nsensor_msgs/Image  (depth in meters)", shape=note, fillcolor="#F9E79F"];
+    t_info [label="/camera_wrist/color/camera_info\nintrinsics K, distortion, frame_id", shape=note, fillcolor="#F9E79F"];
+    t_tf [label="TF lookup: base_link <- camera_wrist_color_optical_frame", shape=note, fillcolor="#F9E79F"];
+  }
+
+  subgraph cluster_fd {
+    label="Layer 3: fine_detector_node  (NO topic publishers)";
+    labelloc=t;
+    style="rounded,filled";
+    color="#D5F5E3";
+    fontsize=13;
+
+    pipeline [label="On each service call:\n  1. YOLO segmentation (every call)\n  2. BerryTracker 2D lock\n  3. FoundationPose (every 8th call)\n  4. Transform poses to base_link", fillcolor="#ABEBC6", width=3.8];
+    srv [label="SERVICE SERVER\n/trigger_fine_detection\n(TriggerFineDetection)", fillcolor="#58D68D", penwidth=2];
+  }
+
+  subgraph cluster_out {
+    label="Layer 4: Service response (not a topic)";
+    labelloc=t;
+    style="rounded,filled";
+    color="#E8DAEF";
+    fontsize=12;
+
+    resp [label="detected_berries[]  : pose + confidence per berry\nlocked_berry_index : which berry to pick\nsuccess, message", shape=note, fillcolor="#D7BDE2"];
+  }
+
+  subgraph cluster_cli {
+    label="Layer 5: Service clients";
+    labelloc=t;
+    style="rounded,filled";
+    color="#FDEBD0";
+    fontsize=13;
+
+    pl [label="real_suction_pick_loop\n~0.67 Hz at scan pose\nreset_lock=true on 1st detect", fillcolor="#F5B041"];
+    viz [label="visualize_blueberry_detection\n~0.125 Hz (default 8 s interval)\ndebug overlay only", fillcolor="#F5B041"];
+  }
+
+  orbbec -> t_rgb;
+  orbbec -> t_depth;
+  orbbec -> t_info;
+  stf -> t_tf;
+
+  t_rgb -> pipeline [label=" subscribe"];
+  t_depth -> pipeline [label=" subscribe"];
+  t_info -> pipeline [label=" subscribe"];
+  t_tf -> pipeline [label=" TF query", style=dashed, color="#1565C0"];
+
+  pl -> srv [label=" REQUEST", color="#E65100", penwidth=2];
+  viz -> srv [label=" REQUEST", color="#E65100", penwidth=2];
+  srv -> pipeline;
+  srv -> resp [label=" RESPONSE"];
+  resp -> pl [color="#2E7D32"];
+  resp -> viz [color="#2E7D32"];
+
+  { rank=same; t_rgb; t_depth; t_info; }
+}

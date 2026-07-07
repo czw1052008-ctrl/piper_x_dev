@@ -1,0 +1,85 @@
+digraph fine_detector_cn {
+  rankdir=TB;
+  bgcolor="white";
+  pad=0.5;
+  nodesep=0.5;
+  ranksep=0.65;
+  fontname="WenQuanYi Micro Hei";
+  node [shape=box, style="rounded,filled", fontname="WenQuanYi Micro Hei", fontsize=13, margin="0.22,0.14", width=2.8];
+  edge [fontname="WenQuanYi Micro Hei", fontsize=10, color="#333333"];
+
+  subgraph cluster_hw {
+    label="硬件 / 驱动层";
+    labelloc=t;
+    style="rounded,filled";
+    color="#D6EAF8";
+    fontsize=14;
+
+    orbbec [label="orbbec_camera\n(DaBai 手腕相机)", fillcolor="#AED6F1"];
+    stf [label="static_transform_publisher\n(link6 → 光学系)", fillcolor="#AED6F1"];
+  }
+
+  subgraph cluster_topics {
+    label="订阅 Topic（连续 ~30 Hz，queue_depth=1 只留最新帧）";
+    labelloc=t;
+    style="rounded,filled";
+    color="#FCF3CF";
+    fontsize=13;
+
+    t_rgb [label="/camera_wrist/color/image_raw\nsensor_msgs/Image  RGB", shape=note, fillcolor="#F9E79F"];
+    t_depth [label="/camera_wrist/depth/image_raw\nsensor_msgs/Image  深度(m)", shape=note, fillcolor="#F9E79F"];
+    t_info [label="/camera_wrist/color/camera_info\n内参 K + frame_id", shape=note, fillcolor="#F9E79F"];
+    t_tf [label="TF: link6 → camera_wrist_color_optical_frame", shape=note, fillcolor="#F9E79F"];
+  }
+
+  subgraph cluster_fd {
+    label="fine_detector_node（不发布任何 Topic）";
+    labelloc=t;
+    style="rounded,filled";
+    color="#D5F5E3";
+    fontsize=14;
+
+    pipeline [label="触发后流水线:\n1. YOLO 分割 (每次必跑)\n2. BerryTracker 2D 锁定\n3. FoundationPose (每 8 次 trigger 一次)\n4. TF → base_link 输出 3D 位姿", fillcolor="#ABEBC6", width=3.6];
+    srv [label="提供服务:\n/trigger_fine_detection\nTriggerFineDetection", fillcolor="#58D68D", penwidth=2];
+  }
+
+  subgraph cluster_resp {
+    label="Service 响应内容";
+    labelloc=t;
+    style="rounded,filled";
+    color="#E8DAEF";
+    fontsize=13;
+
+    resp [label="detected_berries[]  (每颗: pose + confidence)\nlocked_berry_index  (锁定目标下标)\nsuccess + message", shape=note, fillcolor="#D7BDE2"];
+  }
+
+  subgraph cluster_call {
+    label="Service 调用方";
+    labelloc=t;
+    style="rounded,filled";
+    color="#FDEBD0";
+    fontsize=14;
+
+    pl [label="real_suction_pick_loop\n按需调用 (~0.67 Hz)\nreset_lock 每个观测位首次=true", fillcolor="#F5B041"];
+    viz [label="visualize_blueberry_detection\n默认每 8s 调用一次\n仅调试用", fillcolor="#F5B041"];
+  }
+
+  orbbec -> t_rgb [style=invis];
+  orbbec -> t_depth [style=invis];
+  orbbec -> t_info [style=invis];
+  stf -> t_tf [style=invis];
+
+  t_rgb -> pipeline [label=" 订阅"];
+  t_depth -> pipeline [label=" 订阅"];
+  t_info -> pipeline [label=" 订阅"];
+  t_tf -> pipeline [label=" TF 查询", style=dashed, color="#1565C0"];
+
+  pl -> srv [label=" Service 请求", color="#E65100", penwidth=2];
+  viz -> srv [label=" Service 请求", color="#E65100", penwidth=2];
+  srv -> pipeline [label=" 触发处理"];
+  srv -> resp [label=" 返回"];
+  resp -> pl [label=" 响应", color="#2E7D32"];
+  resp -> viz [label=" 响应", color="#2E7D32"];
+
+  { rank=same; t_rgb; t_depth; t_info; }
+}
