@@ -1,16 +1,13 @@
 #!/usr/bin/env bash
-# One command: clean stale processes -> arm/camera/perception -> pick loop.
-# No need to run real_robot_shutdown.sh first.
+# DEPRECATED for real-robot main path.
+# Prefer the topic-driven reach pipeline:
+#   bash scripts/run_real_reach.sh
+#   see docs/REACH_PIPELINE.md
 #
-# Default: HOME -> teleop scan -> lock -> plan -> move -> auto retreat (single cycle).
-#
-# Usage:
-#   bash scripts/run_real_suction_pick.sh
-#   bash scripts/run_real_suction_pick.sh --no-bringup    # arm+camera already up, only replan/repick
-#   bash scripts/run_real_suction_pick.sh --keep-stack    # Ctrl+C leaves arm running
-#
+# Legacy: suction pick loop (service-based fine detection).
 # Logs: log/real_robot/*.log
 set -eo pipefail
+echo "[DEPRECATED] Prefer: bash scripts/run_real_reach.sh  (docs/REACH_PIPELINE.md)" >&2
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOG_DIR="${ROOT}/log/real_robot"

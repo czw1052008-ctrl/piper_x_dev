@@ -1,38 +1,34 @@
 #!/usr/bin/env bash
-# fine_detector_node with FoundationPose conda env + ROS 2 Jazzy (Python 3.12).
+# Start fine_detector_node (YOLO+depth topic stream, no FoundationPose by default).
 set -eo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ENV_NAME="${FOUNDATIONPOSE_CONDA_ENV:-foundationpose}"
-
 if [[ -f "${ROOT}/config/real_robot.env" ]]; then
   # shellcheck disable=SC1090
   source "${ROOT}/config/real_robot.env"
 fi
 
-set +u
-eval "$(conda shell.bash hook)"
-if ! conda activate "${ENV_NAME}" 2>/dev/null; then
-  echo "[fine_detector] ERROR: conda env '${ENV_NAME}' not found." >&2
-  echo "  Run: bash scripts/setup_foundationpose_env.sh" >&2
-  exit 1
+# Leave conda — system/ROS Python for Humble
+if [[ -n "${CONDA_PREFIX:-}" ]]; then
+  conda deactivate 2>/dev/null || true
 fi
 
-# shellcheck disable=SC1091
-source /opt/ros/jazzy/setup.bash
+set +u
 # shellcheck disable=SC1090
-source "${ROOT}/install/setup.bash"
+source "${ROOT}/scripts/setup_env.sh" >/dev/null
+set -u 2>/dev/null || true
 
-ROS_SITE="/opt/ros/jazzy/lib/python3.12/site-packages"
-WS_SITE="${ROOT}/install/picking_perception/lib/python3.12/site-packages"
-MSG_SITE="${ROOT}/install/picking_msgs/lib/python3.12/site-packages"
-export PYTHONPATH="${WS_SITE}:${MSG_SITE}:${ROS_SITE}:${ROOT}/src/picking_perception:${PYTHONPATH:-}"
+FP_FLAG="${ENABLE_FOUNDATION_POSE:-false}"
+ARGS=(--ros-args
+  -p enable_foundation_pose:="${FP_FLAG}"
+  -p publish_hz:=3.0
+  -p mask_source:=yolo
+)
 
-FP_CONFIG="${ROOT}/src/picking_perception/config/foundation_pose.yaml"
-ARGS=(--ros-args)
-if [[ -f "${FP_CONFIG}" ]]; then
-  ARGS+=(--params-file "${FP_CONFIG}")
+YOLO_CFG="${ROOT}/src/picking_perception/config/foundation_pose.yaml"
+if [[ -f "${YOLO_CFG}" ]]; then
+  ARGS+=(--params-file "${YOLO_CFG}")
 fi
 ARGS+=("$@")
 
-exec python -m picking_perception.fine_detector_node "${ARGS[@]}"
+exec ros2 run picking_perception fine_detector_node "${ARGS[@]}"

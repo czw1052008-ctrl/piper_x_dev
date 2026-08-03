@@ -1,4 +1,4 @@
-"""Global coarse detection using fixed camera (HSV + size prior)."""
+"""Global coarse detection — fixed camera, topic stream (no business service)."""
 
 from __future__ import annotations
 
@@ -6,14 +6,23 @@ import math
 
 import numpy as np
 import rclpy
-from cv_bridge import CvBridge
 from geometry_msgs.msg import PoseStamped
-from picking_msgs.srv import TriggerGlobalDetection
+from picking_msgs.msg import DetectedBerry, DetectedBerryArray
 from rclpy.node import Node
-from sensor_msgs.msg import CameraInfo, Image
+from sensor_msgs.msg import Image
 from tf2_ros import Buffer, TransformListener
 
 from picking_perception.segmentation import segment_blueberry_hsv
+
+
+def _image_to_rgb(msg: Image) -> np.ndarray:
+    enc = msg.encoding.lower()
+    if enc in ('rgb8',):
+        return np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, 3).copy()
+    if enc in ('bgr8',):
+        bgr = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, 3)
+        return bgr[:, :, ::-1].copy()
+    raise ValueError(f'unsupported color encoding: {msg.encoding}')
 
 
 class GlobalDetectorNode(Node):
@@ -21,62 +30,87 @@ class GlobalDetectorNode(Node):
         super().__init__('global_detector_node')
         self.declare_parameter('berry_diameter_m', 0.015)
         self.declare_parameter('camera_focal_px', 500.0)
+        self.declare_parameter('publish_hz', 3.0)
+        self.declare_parameter('image_topic', '/camera_fixed/image_raw')
+        self.declare_parameter('camera_frame', 'camera_fixed_optical_frame')
+        self.declare_parameter('base_frame', 'base_link')
+        self.declare_parameter('min_mask_px', 100)
 
-        self._bridge = CvBridge()
         self._rgb = None
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self)
 
-        self.create_subscription(Image, '/camera_fixed/image_raw', self._on_rgb, 1)
-        self.create_service(
-            TriggerGlobalDetection, 'trigger_global_detection', self._on_detect)
+        image_topic = self.get_parameter('image_topic').value
+        self.create_subscription(Image, image_topic, self._on_rgb, 1)
+        self._pub = self.create_publisher(DetectedBerryArray, '/perception/global/berries', 10)
+
+        hz = max(float(self.get_parameter('publish_hz').value), 0.2)
+        self.create_timer(1.0 / hz, self._tick)
+        self.get_logger().info(
+            f'global_detector streaming /perception/global/berries @ {hz:.1f} Hz '
+            f'(image={image_topic})')
 
     def _on_rgb(self, msg: Image) -> None:
-        self._rgb = self._bridge.imgmsg_to_cv2(msg, 'rgb8')
+        try:
+            self._rgb = _image_to_rgb(msg)
+        except ValueError as exc:
+            self.get_logger().warn(str(exc))
 
-    def _on_detect(self, _req, res):
+    def _tick(self) -> None:
         if self._rgb is None:
-            res.success = False
-            res.message = 'No fixed camera image'
-            return res
+            return
 
         mask = segment_blueberry_hsv(self._rgb)
-        if mask.sum() < 100:
-            res.success = False
-            res.message = 'No blueberry colored region'
-            return res
+        min_px = int(self.get_parameter('min_mask_px').value)
+        if mask.sum() < min_px:
+            out = DetectedBerryArray()
+            out.header.stamp = self.get_clock().now().to_msg()
+            out.header.frame_id = self.get_parameter('base_frame').value
+            self._pub.publish(out)
+            return
 
         ys, xs = np.where(mask > 0)
         cx, cy = float(xs.mean()), float(ys.mean())
         area = max(float(mask.sum()), 1.0)
         diameter_px = 2.0 * math.sqrt(area / math.pi)
-        focal = self.get_parameter('camera_focal_px').value
-        berry_d = self.get_parameter('berry_diameter_m').value
+        focal = float(self.get_parameter('camera_focal_px').value)
+        berry_d = float(self.get_parameter('berry_diameter_m').value)
         distance = focal * berry_d / max(diameter_px, 1.0)
 
+        cam_frame = self.get_parameter('camera_frame').value
+        base_frame = self.get_parameter('base_frame').value
+        stamp = self.get_clock().now().to_msg()
+
         pose = PoseStamped()
-        pose.header.frame_id = 'camera_fixed_optical_frame'
-        pose.header.stamp = self.get_clock().now().to_msg()
+        pose.header.frame_id = cam_frame
+        pose.header.stamp = stamp
         pose.pose.position.x = (cx - self._rgb.shape[1] / 2) * distance / focal
         pose.pose.position.y = (cy - self._rgb.shape[0] / 2) * distance / focal
         pose.pose.position.z = distance
         pose.pose.orientation.w = 1.0
 
+        out_frame = cam_frame
         try:
-            tf = self._tf_buffer.lookup_transform(
-                'base_link', pose.header.frame_id, rclpy.time.Time())
-            # Simplified: use translation only
-            pose.header.frame_id = 'base_link'
-            pose.pose.position.x += tf.transform.translation.x
-            pose.pose.position.y += tf.transform.translation.y
-            pose.pose.position.z += tf.transform.translation.z
+            tf = self._tf_buffer.lookup_transform(base_frame, cam_frame, rclpy.time.Time())
+            t = tf.transform.translation
+            pose.header.frame_id = base_frame
+            pose.pose.position.x += t.x
+            pose.pose.position.y += t.y
+            pose.pose.position.z += t.z
+            out_frame = base_frame
         except Exception as exc:
-            self.get_logger().warn('TF lookup failed: %s', exc)
+            self.get_logger().warn(f'TF {base_frame}<-{cam_frame} failed: {exc}')
 
-        res.cluster_pose = pose
-        res.success = True
-        res.message = 'Global detection OK'
-        return res
+        berry = DetectedBerry()
+        berry.header = pose.header
+        berry.pose = pose
+        berry.confidence = 0.5
+
+        arr = DetectedBerryArray()
+        arr.header.stamp = stamp
+        arr.header.frame_id = out_frame
+        arr.berries = [berry]
+        self._pub.publish(arr)
 
 
 def main() -> None:

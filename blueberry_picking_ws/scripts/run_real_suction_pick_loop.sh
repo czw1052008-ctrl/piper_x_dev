@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# DEPRECATED for real-robot main path.
+# Prefer: bash scripts/run_real_reach.sh  (docs/REACH_PIPELINE.md)
+#
 # Full real-robot suction pipeline (pick loop only — stack must already be running).
 #
 # One-click (stack + pick):  bash scripts/run_real_suction_pick.sh
@@ -11,6 +14,7 @@
 #   G      at grasp: suction on, then retreat
 #   Q      quit
 set -eo pipefail
+echo "[DEPRECATED] Prefer: bash scripts/run_real_reach.sh  (docs/REACH_PIPELINE.md)" >&2
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOG_DIR="${ROOT}/log/real_robot"

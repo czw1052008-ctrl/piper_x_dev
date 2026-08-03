@@ -1,32 +1,30 @@
-# Blueberry Picking System — Architecture (v2.5)
+# Blueberry Picking System — Architecture (v3.0 — Reach)
 
-本文档描述 **当前已实现** 的 ROS 2 通信架构：节点职责、消息/服务、数据流、帧率与触发策略，以及设计取舍。
+本文档描述 ROS 2 通信架构。**真机主路径已收敛为触达管线**（见 [`docs/REACH_PIPELINE.md`](docs/REACH_PIPELINE.md)）。
 
 ---
 
 ## 1. 设计总览
 
-系统分为两条主线：
-
 | 主线 | 场景 | 感知模式 | 运动编排 |
 |------|------|----------|----------|
-| **仿真** | Gazebo Harmonic + MoveIt | **流式**（10 Hz topic）+ 可选 service | BT `picking_task` / 键盘 teleop |
-| **真机** | Piper X + Orbbec 手腕相机 | **触发式**（`trigger_fine_detection` service） | `real_suction_pick_loop.py` 状态机 |
+| **真机（主）** | Piper X + 固定单目 + Orbbec 手腕 | **Topic 流** `/perception/global|fine/berries` | `reach_fsm_node`（触达→确认→reset） |
+| **仿真** | Gazebo + MoveIt | 流式 `/perception/*` + 可选 service | BT / teleop（本迭代不维护） |
+| **旧真机采摘** | service `trigger_fine_detection` | 已 deprecated | `run_real_suction_pick.sh` |
 
 核心设计原则：
 
-1. **真机感知 = 按需拉取，不做连续流**  
-   YOLO + FoundationPose 单次推理可达 **0.5–5 s**；采摘流程在 detect 阶段机械臂已静止，无需 30 Hz 连续识别。Service 调用天然串行、易超时、易 `reset_lock`。
+1. **真机触达 = topic 消费**  
+   固定相机锁定目标（`/perception/target_lock`）；手腕 YOLO+depth 发 `/perception/fine/berries`；FSM 发 `/reach/plan` / `/reach/status`。不新增业务 service。
 
-2. **仿真感知 = 连续流**  
-   Gazebo GT 位姿计算廉价；振动模式 teleop 需要实时 `/perception/*` 反馈，故 `fake_perception_node` 以 **10 Hz** 发布 topic，并同时提供 service 兼容 BT。
+2. **双相机分工**  
+   固定单目：选定采集对象。手腕 RGB-D：触达用 3D（深度优先，失败用尺寸先验）。
 
-3. **相机流与识别流解耦**  
-   相机以 **~30 Hz** 发布 RGB/Depth；感知节点仅 **订阅最新帧**（`queue_depth=1`），被 trigger 时才消费。
+3. **规划单轨**  
+   Reach 路径在 FSM 内 Python cup-axis 规划，跳过 C++ `plan_suction` + Python refine 双轨。
 
-4. **规划与感知解耦**  
-   `grasp_planner_node` 纯几何规划，通过 `plan_suction` / `plan_vibration` service 接收 `DetectedBerry[]`，不直接读相机。
-
+4. **仿真**  
+   仍可保留 service 兼容 BT；与真机入口分离。
 ---
 
 ## 2. 坐标系
@@ -38,17 +36,17 @@
 | `tcp_link` | 吸盘杯口接触点（`suction_eef.urdf.xacro`，link6 +Z 约 5 cm） |
 | `eef_link` | 仿真 / 振动棒 MoveIt 规划 tip |
 | `camera_wrist_color_optical_frame` | 手腕 RGB 光学系（真机：与 link6 **同向**，光轴 = +Z，仅平移 -Y 8 cm） |
-| `camera_fixed_optical_frame` | 固定相机光学系（仿真粗定位） |
+| `camera_fixed_optical_frame` | 固定 4K 单目光学系（真机粗定位；外参见 `FIXED_CAM_*` / `calibration/fixed_camera_to_base.yaml`，当前占位） |
 
 真机 TF 链（简化）：
 
 ```
 base_link → … → link6 → [static] → camera_wrist_color_optical_frame
 base_link → … → link6 → [fixed joint] → tcp_link
+base_link → [static] → camera_fixed_optical_frame
 ```
 
-Orbbec 驱动默认 `publish_tf:=false`，由 `real_robot_bringup.sh` 发布 link6→optical 静态 TF，避免 SDK 内置 optical 旋转与实物不符。
-
+Orbbec：**SDK v1**（`OrbbecSDK_ROS2_main` + `dabai.launch.py`），`publish_tf:=false`；由 `real_robot_bringup.sh` 发布 link6→optical 静态 TF（默认 `CAMERA_MOUNT_TY=-0.08`）。
 ---
 
 ## 3. 消息与服务定义（`picking_msgs`）
@@ -877,6 +875,8 @@ G-4（probe 夹角，低成本诊断）
 | v2.3 | §4.1 增加 JPG 拓扑图（`docs/diagrams/fine_detector_topology_cn.jpg`） |
 | v2.4 | 新增 §5 节点实现与算法详解（YOLO/Track/FP 顺序、Suction+MoveIt） |
 | v2.5 | 新增 §13 待办与 Roadmap（规划/refine 技术债、感知加速、真机能力、文档图） |
+| v3.0 | 真机主路径改为触达 topic 管线（固定单目锁目标 + 手腕精定位 + reach_fsm）；见 REACH_PIPELINE.md |
+| v3.1 | 手腕相机改用 OrbbecSDK v1（`OrbbecSDK_ROS2_main`）；dry-run 全状态机验收通过 |
 
 ---
 
@@ -886,14 +886,23 @@ G-4（probe 夹角，低成本诊断）
 
 ### 13.1 真机运行 — 一键入口
 
+| 脚本 | 说明 |
+|------|------|
+| **`run_real_reach.sh`** | sh | **主入口**：bringup（臂+Orbbec v1+固定相机+global/fine）+ `reach_fsm_node` | `bash scripts/run_real_reach.sh [--dry-run]` |
+| **`reach_fsm_node.py`** | py | Topic FSM：`/reach/cmd` → status/plan/reached | 被 `run_real_reach.sh` 调用 |
+| **`real_robot_teleop.sh`** | sh | 键盘笛卡尔遥操（栈已起） | `bash scripts/real_robot_teleop.sh` |
+| **`phase0_smoke.sh`** | sh | 硬件/环境冒烟 | |
+| `run_real_suction_pick.sh` 等 | sh/py | **DEPRECATED** 旧 service 采摘环；勿当真机主路径 | 仅兼容/对照 |
+
+<details><summary>旧采摘环脚本（已弃用，保留对照）</summary>
+
 | 脚本 | 类型 | 做什么 | 典型用法 |
 |------|------|--------|----------|
-| **`run_real_suction_pick.sh`** | sh | **主入口**：清僵尸进程 → `real_robot_bringup` → `run_grasp_planner` → 可选 viz → `real_suction_pick_loop`；退出时可 shutdown | `bash scripts/run_real_suction_pick.sh --move --once` |
-| | | 支持 `--no-bringup`（栈已起）、`--probe-only`（只探针不抓）、`--keep-stack` | |
-| **`run_real_suction_pick_loop.sh`** | sh | 仅跑采摘状态机（**前提**：bringup + perception 已起） | 栈已有时单独重跑 pick |
-| **`real_suction_pick_loop.py`** | py | **采摘状态机核心**：HOME → 遥操位扫描 → detect → LOCK → plan_suction → MoveIt 运动 → 发布 `/pick/*` | 被上面 sh 调用；也可直接 `python3 scripts/real_suction_pick_loop.py --move --once` |
-| **`real_suction_approach.py`** | py | **简化版**：当前位置一次 detect → 最近果 plan → 可选移动（无 patrol/多 pose 扫描） | 快速验证 detect+plan |
-| **`run_real_suction_approach.sh`** | sh | 起 grasp_planner + 执行 `real_suction_approach.py` | `bash scripts/run_real_suction_approach.sh --move` |
+| **`run_real_suction_pick.sh`** | sh | 旧主入口：bringup → grasp → pick loop | `bash scripts/run_real_suction_pick.sh --move --once` |
+| **`run_real_suction_pick_loop.sh`** | sh | 仅跑旧采摘状态机 | 栈已有时单独重跑 pick |
+| **`real_suction_pick_loop.py`** | py | 旧采摘状态机核心（`trigger_fine_detection`） | |
+| **`real_suction_approach.py`** | py | 旧简化一次 detect→plan | |
+| **`run_real_suction_approach.sh`** | sh | 起 grasp_planner + approach | |
 
 **`real_suction_pick_loop.py` 单周期操作（`--move`）：**
 
@@ -904,10 +913,11 @@ G-4（probe 夹角，低成本诊断）
 5. MoveIt：pre_grasp → grasp → post_grasp（`--auto-retreat` 定时 retreat）  
 6. 键盘：R/H 急停回零，G 确认吸盘+retreat，Q 退出  
 
+</details>
+
 ---
 
 ### 13.2 真机栈 — 启动 / 停止 / 子服务
-
 | 脚本 | 做什么 | 启动的 ROS 组件 / 操作 |
 |------|--------|------------------------|
 | **`real_robot_bringup.sh`** | 真机栈一键后台启动 | CAN 检查 → `agx_arm_ctrl` MoveIt → `/joint_states` relay → Orbbec 相机 → link6→optical 静态 TF → 可选 `fine_detector` → 可选 teleop 前台 |

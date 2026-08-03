@@ -1,26 +1,33 @@
-"""Fine detection using wrist RGB-D + FoundationPose."""
+"""Fine detection — wrist RGB-D YOLO+depth, streaming topics (FP optional)."""
 
 from __future__ import annotations
 
 import os
+from typing import Any, List, Optional, Tuple
 
 import numpy as np
 import rclpy
 from geometry_msgs.msg import PoseStamped
-from picking_msgs.msg import DetectedBerry
-from picking_msgs.srv import TriggerFineDetection
+from picking_msgs.msg import DetectedBerry, DetectedBerryArray
 from rclpy.node import Node
 from sensor_msgs.msg import CameraInfo, Image
 from tf2_ros import Buffer, TransformListener
 
 from picking_perception.berry_tracker import BerryTracker
-from picking_perception.foundation_pose_wrapper import FoundationPoseWrapper
 from picking_perception.segmentation import filter_berry_mask, segment_blueberry_hsv
 from picking_perception.yolo_berry_detector import YoloBerryDetector
 
 
+class _NoFoundationPose:
+    """Stub so BerryTracker can run without FoundationPose."""
+
+    ready = False
+
+    def detect_all(self, *_args, **_kwargs):
+        return []
+
+
 def _image_to_rgb(msg: Image) -> np.ndarray:
-    """Decode sensor_msgs/Image without cv_bridge (avoids NumPy 1.x ABI clash in conda)."""
     enc = msg.encoding.lower()
     if enc in ('rgb8',):
         return np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, 3).copy()
@@ -47,7 +54,7 @@ def _matrix_from_tf(transform) -> np.ndarray:
     x, y, z, w = q.x, q.y, q.z, q.w
     R = np.array([
         [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
-        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z + x * w)],
         [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
     ])
     T = np.eye(4)
@@ -69,9 +76,6 @@ def _pose_to_msg(T: np.ndarray, header) -> PoseStamped:
 class FineDetectorNode(Node):
     def __init__(self) -> None:
         super().__init__('fine_detector_node')
-        self.declare_parameter('mesh_path', '')
-        self.declare_parameter(
-            'foundation_pose_root', '/home/ziwei/piper_x_dev/FoundationPose')
         self.declare_parameter('score_threshold', 0.3)
         self.declare_parameter('max_detections', 8)
         self.declare_parameter('mask_source', 'yolo')
@@ -88,27 +92,43 @@ class FineDetectorNode(Node):
         self.declare_parameter('depth_min_m', 0.03)
         self.declare_parameter('depth_max_m', 1.8)
         self.declare_parameter('track_lost_max_frames', 25)
+        self.declare_parameter('publish_hz', 3.0)
+        self.declare_parameter('enable_foundation_pose', False)
+        self.declare_parameter('mesh_path', '')
+        self.declare_parameter('foundation_pose_root', '')
+        self.declare_parameter('base_frame', 'base_link')
+        self.declare_parameter('camera_frame', 'camera_wrist_color_optical_frame')
+        self.declare_parameter('color_topic', '/camera_wrist/color/image_raw')
+        self.declare_parameter('depth_topic', '/camera_wrist/depth/image_raw')
+        self.declare_parameter('info_topic', '/camera_wrist/color/camera_info')
 
-        mesh_path = self.get_parameter('mesh_path').value
-        if not mesh_path:
-            from ament_index_python.packages import get_package_share_directory
-            mesh_path = os.path.join(
-                get_package_share_directory('picking_perception'), 'meshes', 'blueberry.obj')
-
-        self._fp = FoundationPoseWrapper(
-            mesh_path=mesh_path,
-            foundation_pose_root=self.get_parameter('foundation_pose_root').value,
-        )
-        if self._fp.ready:
-            self.get_logger().info(f'FoundationPose ready (mesh={mesh_path})')
+        self._fp: Any = _NoFoundationPose()
+        if bool(self.get_parameter('enable_foundation_pose').value):
+            try:
+                from picking_perception.foundation_pose_wrapper import FoundationPoseWrapper
+                mesh_path = self.get_parameter('mesh_path').value
+                if not mesh_path:
+                    from ament_index_python.packages import get_package_share_directory
+                    mesh_path = os.path.join(
+                        get_package_share_directory('picking_perception'), 'meshes', 'blueberry.obj')
+                fp_root = self.get_parameter('foundation_pose_root').value or \
+                    '/home/user/codes/piper_x_dev/FoundationPose'
+                self._fp = FoundationPoseWrapper(
+                    mesh_path=mesh_path, foundation_pose_root=fp_root)
+                if self._fp.ready:
+                    self.get_logger().info(f'FoundationPose ready (mesh={mesh_path})')
+                else:
+                    self.get_logger().warn('FoundationPose requested but not ready — YOLO+depth only')
+                    self._fp = _NoFoundationPose()
+            except Exception as exc:
+                self.get_logger().warn(f'FoundationPose init failed ({exc}) — YOLO+depth only')
+                self._fp = _NoFoundationPose()
         else:
-            self.get_logger().error(
-                'FoundationPose NOT ready — run: bash scripts/setup_foundationpose_env.sh '
-                'and start node via scripts/run_fine_detector_node.sh')
+            self.get_logger().info('FoundationPose disabled — YOLO + depth / mono prior')
 
         self._mask_source = str(self.get_parameter('mask_source').value).lower()
         self._enable_tracking = bool(self.get_parameter('enable_tracking').value)
-        self._yolo: YoloBerryDetector | None = None
+        self._yolo: Optional[YoloBerryDetector] = None
         if self._mask_source == 'yolo':
             prompts = [
                 p.strip() for p in str(self.get_parameter('yolo_classes').value).split(',') if p.strip()]
@@ -124,7 +144,7 @@ class FineDetectorNode(Node):
                 open_vocab=bool(self.get_parameter('yolo_open_vocab').value),
             )
             if self._yolo.ready:
-                self.get_logger().info(f'YOLO mask source ready prompts={prompts}')
+                self.get_logger().info(f'YOLO ready prompts={prompts}')
             else:
                 self.get_logger().warn('YOLO unavailable — falling back to HSV masks')
                 self._mask_source = 'hsv'
@@ -136,22 +156,25 @@ class FineDetectorNode(Node):
             track_lost_max_frames=int(self.get_parameter('track_lost_max_frames').value),
         )
 
-        self.declare_parameter('base_frame', 'base_link')
-        self.declare_parameter('camera_frame', 'camera_wrist_color_optical_frame')
         self._base_frame = self.get_parameter('base_frame').value
         self._camera_frame = self.get_parameter('camera_frame').value
-
         self._rgb = None
         self._depth = None
         self._k = None
+        self._target_lock: Optional[DetectedBerry] = None
 
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self)
 
-        self.create_subscription(Image, '/camera_wrist/color/image_raw', self._on_rgb, 1)
-        self.create_subscription(Image, '/camera_wrist/depth/image_raw', self._on_depth, 1)
-        self.create_subscription(CameraInfo, '/camera_wrist/color/camera_info', self._on_info, 1)
-        self.create_service(TriggerFineDetection, 'trigger_fine_detection', self._on_detect)
+        self.create_subscription(Image, self.get_parameter('color_topic').value, self._on_rgb, 1)
+        self.create_subscription(Image, self.get_parameter('depth_topic').value, self._on_depth, 1)
+        self.create_subscription(CameraInfo, self.get_parameter('info_topic').value, self._on_info, 1)
+        self.create_subscription(DetectedBerry, '/perception/target_lock', self._on_lock, 10)
+
+        self._pub = self.create_publisher(DetectedBerryArray, '/perception/fine/berries', 10)
+        hz = max(float(self.get_parameter('publish_hz').value), 0.2)
+        self.create_timer(1.0 / hz, self._tick)
+        self.get_logger().info(f'fine_detector streaming /perception/fine/berries @ {hz:.1f} Hz')
 
     def _on_rgb(self, msg: Image) -> None:
         try:
@@ -169,70 +192,61 @@ class FineDetectorNode(Node):
         if self._k is None:
             self._k = np.array(msg.k).reshape(3, 3)
 
-    def _build_tracked(self, rgb, depth, k, reset_lock: bool):
-        if self._yolo is None or not self._yolo.ready:
-            return [], -1, 'YOLO not ready'
-        yolo_dets = self._yolo.detect(rgb)
-        return self._tracker.process(
-            yolo_dets, rgb, depth, k, self._fp, reset_lock=reset_lock)
+    def _on_lock(self, msg: DetectedBerry) -> None:
+        self._target_lock = msg
 
-    def _build_hsv_fp(self, rgb, depth, k):
-        mask = segment_blueberry_hsv(rgb)
-        mask = filter_berry_mask(mask)
-        if mask.sum() < 100:
-            return [], 'Mask too small (no round berry-colored blobs)'
-        fp_dets = self._fp.detect_all(rgb, depth, k, mask)
-        if not fp_dets:
-            z_m = self._tracker.mono_depth_from_mask(mask, k)
-            u, v = int(k[0, 2]), int(k[1, 2])
-            if mask.sum() > 0:
-                ys, xs = np.where(mask > 0)
-                u, v = int(xs.mean()), int(ys.mean())
-            x, y, z = self._tracker.uv_to_cam_xyz(u, v, z_m, k)
-            T = np.eye(4)
-            T[0, 3], T[1, 3], T[2, 3] = x, y, z
-            return [(T, 0.4)], 'HSV mono fallback (depth invalid)'
-        return fp_dets, ''
+    def _detect_cam_poses(self) -> Tuple[List[Tuple[np.ndarray, float]], str]:
+        rgb, depth, k = self._rgb, self._depth, self._k
+        assert rgb is not None and depth is not None and k is not None
 
-    def _on_detect(self, req, res):
-        res.locked_berry_index = -1
-        if not self._fp.ready:
-            res.success = False
-            res.message = 'FoundationPose not initialized (see setup_foundationpose_env.sh)'
-            return res
-
-        if self._rgb is None or self._depth is None or self._k is None:
-            res.success = False
-            res.message = 'Camera data not ready'
-            return res
-
-        lock_idx = -1
-        track_msg = ''
-        if self._mask_source == 'yolo' and self._enable_tracking:
-            tracked, lock_idx, track_msg = self._build_tracked(
-                self._rgb, self._depth, self._k, reset_lock=bool(req.reset_lock))
+        if self._mask_source == 'yolo' and self._enable_tracking and self._yolo and self._yolo.ready:
+            yolo_dets = self._yolo.detect(rgb)
+            tracked, _lock_idx, track_msg = self._tracker.process(
+                yolo_dets, rgb, depth, k, self._fp, reset_lock=False)
             if not tracked:
-                res.success = False
-                res.message = track_msg
-                return res
-            detections = [(t.pose_cam, t.confidence) for t in tracked]
-        elif self._mask_source == 'yolo':
-            yolo_dets = self._yolo.detect(self._rgb) if self._yolo else []
-            detections = []
-            for det in yolo_dets:
-                for pose_cam, score in self._fp.detect_all(self._rgb, self._depth, self._k, det.mask):
-                    detections.append((pose_cam, float(score) * det.confidence))
-            if not detections:
-                res.success = False
-                res.message = 'YOLO+FP found no poses'
-                return res
-        else:
-            detections, err = self._build_hsv_fp(self._rgb, self._depth, self._k)
-            if not detections:
-                res.success = False
-                res.message = err
-                return res
+                return [], track_msg
+            return [(t.pose_cam, t.confidence) for t in tracked], track_msg
 
+        if self._mask_source == 'yolo' and self._yolo and self._yolo.ready:
+            detections = []
+            for det in self._yolo.detect(rgb):
+                z = self._tracker.depth_in_mask(depth, det.mask)
+                if z is None:
+                    z = self._tracker.mono_depth_from_mask(det.mask, k)
+                ys, xs = np.where(det.mask > 0)
+                u, v = int(xs.mean()), int(ys.mean())
+                x, y, zz = self._tracker.uv_to_cam_xyz(u, v, z, k)
+                T = np.eye(4)
+                T[0, 3], T[1, 3], T[2, 3] = x, y, zz
+                detections.append((T, float(det.confidence)))
+            if not detections:
+                return [], 'YOLO found no blueberries'
+            return detections, 'YOLO depth'
+
+        mask = filter_berry_mask(segment_blueberry_hsv(rgb))
+        if mask.sum() < 100:
+            return [], 'HSV mask too small'
+        z = self._tracker.depth_in_mask(depth, mask)
+        if z is None:
+            z = self._tracker.mono_depth_from_mask(mask, k)
+        ys, xs = np.where(mask > 0)
+        u, v = int(xs.mean()), int(ys.mean())
+        x, y, zz = self._tracker.uv_to_cam_xyz(u, v, z, k)
+        T = np.eye(4)
+        T[0, 3], T[1, 3], T[2, 3] = x, y, zz
+        return [(T, 0.4)], 'HSV mono/depth'
+
+    def _tick(self) -> None:
+        stamp = self.get_clock().now().to_msg()
+        # Always publish (even empty) so bringup readiness and FSM can proceed.
+        if self._rgb is None or self._depth is None or self._k is None:
+            arr = DetectedBerryArray()
+            arr.header.stamp = stamp
+            arr.header.frame_id = self._camera_frame
+            self._pub.publish(arr)
+            return
+
+        detections, msg = self._detect_cam_poses()
         try:
             tf = self._tf_buffer.lookup_transform(
                 self._base_frame, self._camera_frame, rclpy.time.Time())
@@ -240,16 +254,15 @@ class FineDetectorNode(Node):
             out_frame = self._base_frame
         except Exception as exc:
             self.get_logger().warn(
-                f'TF {self._base_frame}->{self._camera_frame} failed ({exc}); '
-                f'returning poses in {self._camera_frame}')
+                f'TF {self._base_frame}->{self._camera_frame} failed ({exc})')
             T_base_cam = None
             out_frame = self._camera_frame
 
         header = PoseStamped().header
         header.frame_id = out_frame
-        header.stamp = self.get_clock().now().to_msg()
+        header.stamp = stamp
 
-        berries = []
+        berries: List[DetectedBerry] = []
         for pose_cam, score in detections:
             T_out = T_base_cam @ pose_cam if T_base_cam is not None else pose_cam
             b = DetectedBerry()
@@ -258,27 +271,27 @@ class FineDetectorNode(Node):
             b.pose = _pose_to_msg(T_out, header)
             berries.append(b)
 
-        if lock_idx < 0 and berries and not track_msg:
-            lock_idx = int(min(
-                range(len(berries)),
-                key=lambda i: berries[i].pose.pose.position.z,
-            ))
-        elif lock_idx < 0 and len(berries) == 1:
-            lock_idx = 0
+        # Prefer berry closest to locked global target when available
+        if self._target_lock is not None and berries and \
+                self._target_lock.pose.header.frame_id == out_frame:
+            lx = self._target_lock.pose.pose.position.x
+            ly = self._target_lock.pose.pose.position.y
+            lz = self._target_lock.pose.pose.position.z
 
-        res.detected_berries = berries
-        res.locked_berry_index = lock_idx
-        res.success = True
-        src = self._mask_source.upper()
-        n = len(berries)
-        base = f'{n} berries ({src})'
-        if track_msg:
-            base = f'{base} | {track_msg}'
-        if T_base_cam is None:
-            res.message = f'{base} frame={out_frame}'
-        else:
-            res.message = base
-        return res
+            def _dist2(b: DetectedBerry) -> float:
+                dx = b.pose.pose.position.x - lx
+                dy = b.pose.pose.position.y - ly
+                dz = b.pose.pose.position.z - lz
+                return dx * dx + dy * dy + dz * dz
+
+            berries = sorted(berries, key=_dist2)
+
+        arr = DetectedBerryArray()
+        arr.header = header
+        arr.berries = berries
+        self._pub.publish(arr)
+        if msg:
+            self.get_logger().debug(msg)
 
 
 def main() -> None:

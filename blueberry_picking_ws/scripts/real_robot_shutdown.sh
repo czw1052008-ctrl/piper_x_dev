@@ -42,7 +42,7 @@ _disable_arm() {
   fi
   set +u
   # shellcheck disable=SC1091
-  source /opt/ros/jazzy/setup.bash 2>/dev/null || source /opt/ros/humble/setup.bash 2>/dev/null || true
+  source /opt/ros/humble/setup.bash 2>/dev/null || source /opt/ros/jazzy/setup.bash 2>/dev/null || true
   # shellcheck disable=SC1090
   source "${AGX_ARM_WS}/install/setup.bash" 2>/dev/null || true
   set -u 2>/dev/null || true
@@ -81,6 +81,17 @@ _kill_patterns() {
     'perception.launch.py'
     'fine_detector_node'
     'run_fine_detector_node'
+    'global_detector_node'
+    'run_global_detector_node'
+    'reach_fsm_node'
+    'v4l2_camera_node'
+    'fixed_camera.launch.py'
+    'global_detector_node'
+    'run_global_detector_node'
+    'fixed_camera.launch'
+    'v4l2_camera_node'
+    'reach_fsm_node'
+    'run_real_reach'
     'link6_teleop_node'
     'grasp_planner.launch.py'
     'grasp_planner_node'

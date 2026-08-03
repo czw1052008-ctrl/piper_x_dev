@@ -1,14 +1,16 @@
 fine_detector_node:
   ros__parameters:
     mesh_path: ""
-    foundation_pose_root: "/home/ziwei/piper_x_dev/FoundationPose"
+    foundation_pose_root: "/home/user/codes/piper_x_dev/FoundationPose"
+    enable_foundation_pose: false
+    publish_hz: 3.0
     est_refine_iter: 5
     track_refine_iter: 2
     score_threshold: 0.3
     max_detections: 6
     # mask_source: yolo (custom trained) | hsv
     mask_source: yolo
-    yolo_model: /home/ziwei/piper_x_dev/blueberry_picking_ws/runs/detect/blueberry-4/weights/best.pt
+    yolo_model: /home/user/codes/piper_x_dev/blueberry_picking_ws/runs/detect/blueberry-4/weights/best.pt
     yolo_open_vocab: false
     yolo_classes: "blueberry"
     yolo_conf_threshold: 0.38

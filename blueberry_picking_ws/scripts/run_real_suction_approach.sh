@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
+# DEPRECATED for real-robot main path.
+# Prefer: bash scripts/run_real_reach.sh  (docs/REACH_PIPELINE.md)
+#
 # Detect (YOLO+FP) -> plan nearest berry suction -> optional arm move.
 set -eo pipefail
+echo "[DEPRECATED] Prefer: bash scripts/run_real_reach.sh  (docs/REACH_PIPELINE.md)" >&2
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 

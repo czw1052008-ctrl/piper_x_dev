@@ -1,58 +1,52 @@
 # piper_x_dev
 
-Piper X 蓝莓采摘真机开发环境单体仓库，包含主工作空间与全部本地依赖。
+Piper X 蓝莓**触达**真机开发单体仓库（Ubuntu 22.04 + ROS 2 Humble）。
+
+主能力：键盘遥操、固定单目锁定采集目标、手腕 RGB-D 精细触达、人工确认后 reset。  
+详细约定见 [`blueberry_picking_ws/docs/REACH_PIPELINE.md`](blueberry_picking_ws/docs/REACH_PIPELINE.md)。
 
 ## 目录结构
 
-| 目录 | 说明 | 上游 |
-|------|------|------|
-| `blueberry_picking_ws/` | 蓝莓采摘 ROS 2 主工作空间（感知、规划、真机脚本） | 本项目核心 |
-| `agx_arm_ros/` | AgileX 机械臂 ROS 2 驱动与 MoveIt | [agilexrobotics/agx_arm_ros](https://github.com/agilexrobotics/agx_arm_ros) |
-| `piper_ros/` | Piper 机械臂 ROS 1 包（历史参考） | [agilexrobotics/piper_ros](https://github.com/agilexrobotics/piper_ros) |
-| `pyAgxArm/` | Python CAN 控制库 | [agilexrobotics/pyAgxArm](https://github.com/agilexrobotics/pyAgxArm) |
-| `OrbbecSDK_ROS2_main/` | Orbbec 手腕相机 ROS 2 驱动（**真机使用**） | [orbbec/OrbbecSDK_ROS2](https://github.com/orbbec/OrbbecSDK_ROS2) |
-| `OrbbecSDK_ROS2/` | Orbbec 驱动备用副本 | 同上 |
-| `FoundationPose/` | 6D 姿态估计（可选感知后端） | [NVlabs/FoundationPose](https://github.com/NVlabs/FoundationPose) |
-| `agilex_open_class/` | AgileX 公开课资料 | [agilexrobotics/agilex_open_class](https://github.com/agilexrobotics/agilex_open_class) |
+| 目录 | 说明 |
+|------|------|
+| `blueberry_picking_ws/` | 感知、触达 FSM、遥操、真机脚本（核心） |
+| `agx_arm_ros/` | AgileX 臂 ROS 2 驱动与 MoveIt |
+| `pyAgxArm/` | Python CAN 控制库 |
+| `OrbbecSDK_ROS2_main/` | **真机手腕相机驱动（SDK v1 / OpenNI，DaBai DC1）** |
+| `OrbbecSDK_ROS2/` | Orbbec SDK v2 树（DC1 会 `No matched`，勿作主路径） |
+| `FoundationPose/` | 可选 6D 后端（触达主路径默认关闭） |
+| `archive/` | 已移出日常编译的冗余树（见 `docs/CLEANUP.md`） |
 
 ## 快速开始
 
 ```bash
-# 1. 克隆本仓库
-git clone https://github.com/czw1052008-ctrl/piper_x_dev.git ~/piper_x_dev
-cd ~/piper_x_dev
-
-# 2. 本地配置（不提交 git）
+# 1. 配置
 cp blueberry_picking_ws/config/real_robot.env.example \
    blueberry_picking_ws/config/real_robot.env
-# 编辑 CAN、USB、相机等参数
+# 编辑 PIPER_X_DEV（本机常为 /home/user/codes/piper_x_dev）、CAN、固定相机设备号
 
-# 3. 编译各工作空间
-source /opt/ros/jazzy/setup.bash
+# 2. 编译
+source /opt/ros/humble/setup.bash
 cd agx_arm_ros && colcon build --symlink-install && source install/setup.bash
 cd ../OrbbecSDK_ROS2_main && colcon build --symlink-install && source install/setup.bash
 cd ../blueberry_picking_ws && bash scripts/setup_agx_arm.sh
 colcon build --symlink-install && source install/setup.bash
 
-# 4. 真机采摘
-bash scripts/run_real_suction_pick.sh --move --once
+# 3. 触达（默认 dry-run 可加 --dry-run；真机运动去掉）
+bash scripts/run_real_reach.sh --dry-run
+# 另开终端
+ros2 topic pub --once /reach/cmd std_msgs/String "{data: start}"
+# 触达完成后
+ros2 topic pub --once /reach/cmd std_msgs/String "{data: confirm_reset}"
+
+# 键盘遥操（栈已起）
+bash scripts/real_robot_teleop.sh
 ```
 
-## FoundationPose 权重
+## 真机配置要点
 
-大文件（>100MB）通过 **Git LFS** 托管，克隆后需拉取 LFS 对象：
-
-```bash
-git lfs install
-git lfs pull
-```
-
-若未安装 LFS，可从 [FoundationPose 官方](https://github.com/NVlabs/FoundationPose) 手动下载权重到 `FoundationPose/weights/`。
-
-## 真机配置
-
-`blueberry_picking_ws/config/real_robot.env` 已纳入仓库（含 CAN/USB 总线号等参考值）。新机器请按实际硬件修改 `USBIP_CAN_BUSID`、`ORBBEC_USB_PORT` 等字段。
-
-## 许可证
-
-各子目录保留其上游开源许可证；`blueberry_picking_ws` 为本项目自有代码。
+- 原生 Ubuntu：用本地 `can0`，**不要**再开 WSL `USBIP_*`。
+- `FIXED_CAMERA_DEVICE`：4K USB 的 `/dev/videoX`（先用 `v4l2-ctl --list-devices` 确认）。
+- 手腕相机：`ORBBEC_WS=.../OrbbecSDK_ROS2_main`；`ORBBEC_PUBLISH_TF=false`，由 bringup 发 `link6→camera_wrist_color_optical_frame`。
+- 固定相机外参：`FIXED_CAM_*` / `calibration/fixed_camera_to_base.yaml`（当前为粗占位，需实测精调）。
+- **禁止**在臂使能时整卡 xHCI reset（见 `docs/REACH_PIPELINE.md`）。

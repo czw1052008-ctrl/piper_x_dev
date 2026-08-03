@@ -5,6 +5,7 @@
 #   cp config/real_robot.env.example config/real_robot.env   # once
 #   bash scripts/real_robot_bringup.sh                       # stack in background
 #   bash scripts/real_robot_bringup.sh --teleop              # stack + keyboard teleop (foreground)
+#   bash scripts/real_robot_bringup.sh --fixed-cam --reach-perception  # reach pipeline sensors
 #   bash scripts/real_robot_shutdown.sh                      # stop + disable arm
 #
 set -euo pipefail
@@ -18,24 +19,28 @@ ENABLE_ARM=true
 ENABLE_RELAY=true
 ENABLE_PERCEPTION=""
 ENABLE_TELEOP=""
+ENABLE_FIXED_CAM=""
+ENABLE_REACH_PERCEPTION=""
 USBIP_ATTACH=""
 FOREGROUND_WAIT=true
 NO_WAIT=false
 
 usage() {
-  sed -n '2,12p' "$0"
+  sed -n '2,13p' "$0"
   echo ""
   echo "Options:"
-  echo "  --config PATH       Config file (default: config/real_robot.env)"
-  echo "  --teleop            Start link6 keyboard teleop in foreground after stack is up"
-  echo "  --perception        Enable fine_detector_node (FoundationPose)"
-  echo "  --no-wait           Start stack in background and exit (for run_real_suction_pick.sh)"
-  echo "  --no-camera         Skip Orbbec driver"
-  echo "  --no-arm            Skip agx_arm (camera + perception only)"
-  echo "  --camera-only       Same as --no-arm --perception"
-  echo "  --attach-usb        Run usbipd attach for USBIP_CAN_BUSID (Windows PowerShell)"
-  echo "  --check-only        Preflight checks, then exit"
-  echo "  -h, --help          Show help"
+  echo "  --config PATH         Config file (default: config/real_robot.env)"
+  echo "  --teleop              Start link6 keyboard teleop in foreground after stack is up"
+  echo "  --perception          Legacy fine_detector (optional FP)"
+  echo "  --fixed-cam           Start fixed USB camera + TF (/camera_fixed/...)"
+  echo "  --reach-perception    Start global + fine topic detectors (reach path)"
+  echo "  --no-wait             Start stack in background and exit"
+  echo "  --no-camera           Skip Orbbec driver"
+  echo "  --no-arm              Skip agx_arm (camera + perception only)"
+  echo "  --camera-only         Same as --no-arm --perception"
+  echo "  --attach-usb          WSL only: usbipd attach for USBIP_CAN_BUSID"
+  echo "  --check-only          Preflight checks, then exit"
+  echo "  -h, --help            Show help"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -43,6 +48,8 @@ while [[ $# -gt 0 ]]; do
     --config) CONFIG="$2"; shift 2 ;;
     --teleop) ENABLE_TELEOP=true; shift ;;
     --perception) ENABLE_PERCEPTION=true; shift ;;
+    --fixed-cam) ENABLE_FIXED_CAM=true; shift ;;
+    --reach-perception) ENABLE_REACH_PERCEPTION=true; shift ;;
     --no-wait) NO_WAIT=true; shift ;;
     --no-camera) ENABLE_CAMERA=false; shift ;;
     --no-arm) ENABLE_ARM=false; ENABLE_RELAY=false; shift ;;
@@ -57,7 +64,8 @@ done
 # CLI flags must win over config/real_robot.env
 _CLI_ENABLE_PERCEPTION="${ENABLE_PERCEPTION}"
 _CLI_ENABLE_TELEOP="${ENABLE_TELEOP}"
-
+_CLI_ENABLE_FIXED_CAM="${ENABLE_FIXED_CAM}"
+_CLI_ENABLE_REACH_PERCEPTION="${ENABLE_REACH_PERCEPTION}"
 # Defaults if no config file
 PIPER_X_DEV="${HOME}/piper_x_dev"
 AGX_ARM_WS="${PIPER_X_DEV}/agx_arm_ros"
@@ -86,10 +94,22 @@ CAMERA_MOUNT_TY=-0.08
 CAMERA_MOUNT_TZ=0.0
 CAMERA_MOUNT_RPY=0.0,0.0,0.0
 ENABLE_PERCEPTION_CFG=false
-FINE_PERCEPTION=foundation_pose
+ENABLE_FIXED_CAMERA="${ENABLE_FIXED_CAMERA:-false}"
+ENABLE_REACH_PERCEPTION_CFG=false
+FINE_PERCEPTION=yolo_depth
 ENABLE_TELEOP_CFG=false
 TELEOP_LINEAR_SPEED=0.03
 TELEOP_ANGULAR_SPEED=10.0
+FIXED_CAMERA_DEVICE=/dev/video0
+FIXED_CAMERA_NAME=camera_fixed
+FIXED_CAMERA_FRAME=camera_fixed_optical_frame
+FIXED_CAM_TX=0.45
+FIXED_CAM_TY=0.0
+FIXED_CAM_TZ=0.55
+FIXED_CAM_QX=0.0
+FIXED_CAM_QY=0.7071
+FIXED_CAM_QZ=0.0
+FIXED_CAM_QW=0.7071
 LOG_DIR="${ROOT}/log/real_robot"
 
 if [[ -f "${CONFIG}" ]]; then
@@ -106,12 +126,19 @@ fi
 if [[ -n "${_CLI_ENABLE_TELEOP}" ]]; then
   ENABLE_TELEOP="${_CLI_ENABLE_TELEOP}"
 fi
+if [[ -n "${_CLI_ENABLE_FIXED_CAM}" ]]; then
+  ENABLE_FIXED_CAMERA=true
+fi
+if [[ -n "${_CLI_ENABLE_REACH_PERCEPTION}" ]]; then
+  ENABLE_REACH_PERCEPTION_CFG=true
+fi
 
 [[ "${ENABLE_PERCEPTION}" == "true" ]] && ENABLE_PERCEPTION_CFG=true
 [[ "${ENABLE_TELEOP}" == "true" ]] && ENABLE_TELEOP_CFG=true
+[[ "${ENABLE_FIXED_CAMERA}" == "true" ]] && ENABLE_FIXED_CAMERA=true
+[[ "${ENABLE_REACH_PERCEPTION:-false}" == "true" ]] && ENABLE_REACH_PERCEPTION_CFG=true
 [[ "${USBIP_ATTACH}" == "true" ]] && USBIP_AUTO_ATTACH=true
 [[ "${NO_WAIT}" == "true" ]] && FOREGROUND_WAIT=false
-
 CHECK_ONLY="${CHECK_ONLY:-false}"
 
 _log() { echo "[bringup] $*"; }
@@ -127,6 +154,8 @@ _conda_warn() {
 _source_ros_env() {
   _conda_warn
   export RMW_FASTRTPS_USE_SHM=0
+  # Keep system SciPy (apt) working: user-site NumPy 2.x breaks agx_arm_ctrl.
+  export PYTHONNOUSERSITE=1
   set +u
   # shellcheck disable=SC1091
   source "${ROOT}/scripts/setup_env.sh" >/dev/null
@@ -173,11 +202,8 @@ _setup_can() {
     cat >&2 <<EOF
 [bringup] ERROR: ${CAN_INTERFACE} not found.
 
-Windows (Admin PowerShell), once per USB plug:
-  usbipd list
-  usbipd attach --wsl --busid ${USBIP_CAN_BUSID}
-
-See: pyAgxArm/docs/wsl2_usb_can_guide.md
+Native Ubuntu: plug GS-USB CAN adapter, then:
+  sudo ip link set can0 up type can bitrate ${CAN_BITRATE}
 EOF
     exit 1
   fi
@@ -227,7 +253,7 @@ _wait_for_action() {
 
 _check_orbbec_usb() {
   if ! lsusb 2>/dev/null | grep -q '2bc5:0657'; then
-    _die "Orbbec depth USB (0657) not in WSL. Attach both camera USB devices via usbipd."
+    _die "Orbbec depth USB (0657) not found. Re-seat DaBai USB cables."
   fi
   if ! lsusb 2>/dev/null | grep -q '2bc5:0557'; then
     _log "WARN: color USB (0557) not seen — depth-only; color topic may be missing"
@@ -298,10 +324,9 @@ _report_arm_failure() {
   echo "" >&2
   echo "[bringup] ERROR: ${topic} not publishing — arm driver likely failed to enable." >&2
   echo "[bringup] Common fixes:" >&2
-  echo "  1. Windows Admin: usbipd attach --wsl --busid <CAN-BUSID>" >&2
-  echo "  2. sudo ip link set can0 up type can bitrate 1000000" >&2
-  echo "  3. Power-cycle arm, then retry" >&2
-  echo "  4. tail -40 ${LOG_DIR}/arm.log" >&2
+  echo "  1. sudo ip link set can0 up type can bitrate 1000000" >&2
+  echo "  2. Power-cycle arm / re-seat GS-USB, then retry" >&2
+  echo "  3. tail -40 ${LOG_DIR}/arm.log" >&2
   if [[ -f "${LOG_DIR}/arm.log" ]]; then
     echo "[bringup] --- arm.log (last 15 lines) ---" >&2
     tail -15 "${LOG_DIR}/arm.log" >&2 || true
@@ -364,7 +389,18 @@ main() {
   rm -f "${PIDFILE}"
   mkdir -p "${LOG_DIR}"
 
-  local ros_setup="set +u; source /opt/ros/${ROS_DISTRO:-jazzy}/setup.bash; \
+  # Prefer detected distro (Humble on 22.04); fall back to jazzy only if present
+  local _ros_distro="${ROS_DISTRO:-}"
+  if [[ -z "${_ros_distro}" ]]; then
+    if [[ -f /opt/ros/humble/setup.bash ]]; then
+      _ros_distro=humble
+    elif [[ -f /opt/ros/jazzy/setup.bash ]]; then
+      _ros_distro=jazzy
+    else
+      _die "No /opt/ros/{humble,jazzy}. Run: bash scripts/install_deps.sh (needs sudo)"
+    fi
+  fi
+  local ros_setup="set +u; source /opt/ros/${_ros_distro}/setup.bash; \
 source ${AGX_ARM_WS}/install/setup.bash; source ${ROOT}/install/setup.bash"
   if [[ "${ENABLE_CAMERA}" == "true" ]]; then
     ros_setup="${ros_setup}; source ${ORBBEC_WS}/install/setup.bash"
@@ -389,10 +425,22 @@ tcp_offset:='${ARM_TCP_OFFSET:-[0.0,0.0,0.05,0.0,0.0,0.0]}'" truncate
   fi
 
   if [[ "${ENABLE_CAMERA}" == "true" ]]; then
+    # Ensure Orbbec SDK libs are visible to component_container
+    # SDK v1 (OpenNI Dabai) needs libob_usb/liblive555 from install or SDK/lib/x64.
+    local _orb_install_lib="${ORBBEC_WS}/install/orbbec_camera/lib"
+    local _orb_sdk_lib="${ORBBEC_WS}/orbbec_camera/SDK/lib/x64"
+    local _orb_ld=""
+    [[ -d "${_orb_install_lib}" ]] && _orb_ld="${_orb_install_lib}:${_orb_ld}"
+    [[ -d "${_orb_sdk_lib}" ]] && _orb_ld="${_orb_sdk_lib}:${_orb_sdk_lib}/extensions/depthengine:${_orb_ld}"
+    if [[ -n "${_orb_ld}" ]]; then
+      export LD_LIBRARY_PATH="${_orb_ld}${LD_LIBRARY_PATH:-}"
+      ros_setup="export LD_LIBRARY_PATH=${_orb_ld}\${LD_LIBRARY_PATH:-}; ${ros_setup}"
+    fi
     _check_orbbec_usb
     _detect_orbbec_usb_port
     ORBBEC_PUBLISH_TF="${ORBBEC_PUBLISH_TF:-false}"
     CAMERA_TF_CHILD="${CAMERA_TF_CHILD:-${ORBBEC_CAMERA_NAME}_color_optical_frame}"
+    # dabai.launch in OrbbecSDK_ROS2_main (SDK v1) has no uvc_backend arg.
     local camera_args="camera_name:=${ORBBEC_CAMERA_NAME} depth_registration:=${ORBBEC_DEPTH_REGISTRATION} publish_tf:=${ORBBEC_PUBLISH_TF}"
     if [[ -n "${ORBBEC_USB_PORT:-}" ]]; then
       camera_args="${camera_args} usb_port:=${ORBBEC_USB_PORT}"
@@ -409,9 +457,26 @@ tcp_offset:='${ARM_TCP_OFFSET:-[0.0,0.0,0.05,0.0,0.0,0.0]}'" truncate
 --frame-id ${_cam_parent} --child-frame-id ${CAMERA_TF_CHILD}"
   fi
 
-  if [[ "${ENABLE_PERCEPTION_CFG}" == "true" ]]; then
+  if [[ "${ENABLE_FIXED_CAMERA}" == "true" ]]; then
+    if [[ ! -e "${FIXED_CAMERA_DEVICE}" ]]; then
+      _die "FIXED_CAMERA_DEVICE=${FIXED_CAMERA_DEVICE} missing"
+    fi
+    _start_bg fixed_cam "${ros_setup}; exec ros2 launch picking_perception fixed_camera.launch.py \
+video_device:=${FIXED_CAMERA_DEVICE} camera_name:=${FIXED_CAMERA_NAME} \
+frame_id:=${FIXED_CAMERA_FRAME} \
+tx:=${FIXED_CAM_TX} ty:=${FIXED_CAM_TY} tz:=${FIXED_CAM_TZ} \
+qx:=${FIXED_CAM_QX} qy:=${FIXED_CAM_QY} qz:=${FIXED_CAM_QZ} qw:=${FIXED_CAM_QW}"
+    _wait_for_topic "/${FIXED_CAMERA_NAME}/image_raw" 60 fixed_cam.log
+  fi
+
+  if [[ "${ENABLE_REACH_PERCEPTION_CFG}" == "true" ]]; then
+    _start_bg global_det "bash ${ROOT}/scripts/run_global_detector_node.sh"
+    _start_bg fine_det "bash ${ROOT}/scripts/run_fine_detector_node.sh"
+    _wait_for_topic /perception/global/berries 120 global_det.log
+    _wait_for_topic /perception/fine/berries 180 fine_det.log
+  elif [[ "${ENABLE_PERCEPTION_CFG}" == "true" ]]; then
     _start_bg perception "bash ${ROOT}/scripts/run_fine_detector_node.sh"
-    _wait_for_service trigger_fine_detection 180
+    _wait_for_topic /perception/fine/berries 180 perception.log
   fi
 
   STACK_RUNNING=true
@@ -434,10 +499,14 @@ tcp_offset:='${ARM_TCP_OFFSET:-[0.0,0.0,0.05,0.0,0.0,0.0]}'" truncate
     ros2 topic hz /${ORBBEC_CAMERA_NAME}/depth/image_raw
     ros2 action list | grep move_action
 
+  Reach:
+    bash scripts/run_real_reach.sh
+    ros2 topic pub --once /reach/cmd std_msgs/String "{data: start}"
+
   Teleop (new terminal):
     bash scripts/real_robot_teleop.sh
 
-  View camera:
+  View cameras:
     ros2 run rqt_image_view rqt_image_view /${ORBBEC_CAMERA_NAME}/color/image_raw
 ================================================================================
 

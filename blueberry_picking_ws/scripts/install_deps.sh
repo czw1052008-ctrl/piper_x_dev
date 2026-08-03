@@ -67,14 +67,20 @@ install_ros_packages() {
     "${prefix}-cv-bridge"
     "${prefix}-robot-state-publisher"
     "${prefix}-launch-ros"
+    "${prefix}-v4l2-camera"
+    "${prefix}-topic-tools"
+    "${prefix}-image-transport"
     python3-colcon-common-extensions
     python3-pytest
     python3-rosdep
     python3-catkin-pkg
+    python3-pip
     build-essential
     cmake
     git
     libeigen3-dev
+    can-utils
+    v4l-utils
   )
 
   local -a sim_pkgs=()
