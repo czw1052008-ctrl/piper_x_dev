@@ -10,6 +10,7 @@ import rclpy
 from geometry_msgs.msg import PoseStamped
 from picking_msgs.msg import DetectedBerry, DetectedBerryArray
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CameraInfo, Image
 from tf2_ros import Buffer, TransformListener
 
@@ -73,6 +74,18 @@ def _pose_to_msg(T: np.ndarray, header) -> PoseStamped:
     return ps
 
 
+def _rgb_to_imgmsg(rgb: np.ndarray, stamp, frame_id: str) -> Image:
+    msg = Image()
+    msg.header.stamp = stamp
+    msg.header.frame_id = frame_id
+    msg.height, msg.width = int(rgb.shape[0]), int(rgb.shape[1])
+    msg.encoding = 'rgb8'
+    msg.is_bigendian = False
+    msg.step = msg.width * 3
+    msg.data = np.ascontiguousarray(rgb, dtype=np.uint8).tobytes()
+    return msg
+
+
 class FineDetectorNode(Node):
     def __init__(self) -> None:
         super().__init__('fine_detector_node')
@@ -101,6 +114,8 @@ class FineDetectorNode(Node):
         self.declare_parameter('color_topic', '/camera_wrist/color/image_raw')
         self.declare_parameter('depth_topic', '/camera_wrist/depth/image_raw')
         self.declare_parameter('info_topic', '/camera_wrist/color/camera_info')
+        self.declare_parameter('viz_topic', '/perception/fine/detection_viz')
+        self.declare_parameter('publish_viz', True)
 
         self._fp: Any = _NoFoundationPose()
         if bool(self.get_parameter('enable_foundation_pose').value):
@@ -146,7 +161,9 @@ class FineDetectorNode(Node):
             if self._yolo.ready:
                 self.get_logger().info(f'YOLO ready prompts={prompts}')
             else:
-                self.get_logger().warn('YOLO unavailable — falling back to HSV masks')
+                self.get_logger().warn(
+                    'YOLO unavailable — falling back to HSV masks '
+                    f'(model={self.get_parameter("yolo_model").value})')
                 self._mask_source = 'hsv'
 
         self._tracker = BerryTracker(
@@ -166,12 +183,21 @@ class FineDetectorNode(Node):
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self)
 
-        self.create_subscription(Image, self.get_parameter('color_topic').value, self._on_rgb, 1)
-        self.create_subscription(Image, self.get_parameter('depth_topic').value, self._on_depth, 1)
-        self.create_subscription(CameraInfo, self.get_parameter('info_topic').value, self._on_info, 1)
+        self.create_subscription(
+            Image, self.get_parameter('color_topic').value, self._on_rgb, qos_profile_sensor_data)
+        self.create_subscription(
+            Image, self.get_parameter('depth_topic').value, self._on_depth, qos_profile_sensor_data)
+        self.create_subscription(
+            CameraInfo, self.get_parameter('info_topic').value, self._on_info, qos_profile_sensor_data)
         self.create_subscription(DetectedBerry, '/perception/target_lock', self._on_lock, 10)
 
         self._pub = self.create_publisher(DetectedBerryArray, '/perception/fine/berries', 10)
+        self._publish_viz = bool(self.get_parameter('publish_viz').value)
+        self._viz_pub = None
+        if self._publish_viz:
+            self._viz_pub = self.create_publisher(
+                Image, str(self.get_parameter('viz_topic').value), qos_profile_sensor_data)
+        self._last_viz_boxes: List[Tuple[Tuple[int, int, int, int], float]] = []
         hz = max(float(self.get_parameter('publish_hz').value), 0.2)
         self.create_timer(1.0 / hz, self._tick)
         self.get_logger().info(f'fine_detector streaming /perception/fine/berries @ {hz:.1f} Hz')
@@ -198,18 +224,23 @@ class FineDetectorNode(Node):
     def _detect_cam_poses(self) -> Tuple[List[Tuple[np.ndarray, float]], str]:
         rgb, depth, k = self._rgb, self._depth, self._k
         assert rgb is not None and depth is not None and k is not None
+        self._last_viz_boxes = []
 
         if self._mask_source == 'yolo' and self._enable_tracking and self._yolo and self._yolo.ready:
             yolo_dets = self._yolo.detect(rgb)
+            self._last_viz_boxes = [(d.bbox_xyxy, float(d.confidence)) for d in yolo_dets]
             tracked, _lock_idx, track_msg = self._tracker.process(
                 yolo_dets, rgb, depth, k, self._fp, reset_lock=False)
             if not tracked:
                 return [], track_msg
+            self._last_viz_boxes = [
+                (tuple(int(v) for v in t.bbox), float(t.confidence)) for t in tracked]
             return [(t.pose_cam, t.confidence) for t in tracked], track_msg
 
         if self._mask_source == 'yolo' and self._yolo and self._yolo.ready:
             detections = []
             for det in self._yolo.detect(rgb):
+                self._last_viz_boxes.append((det.bbox_xyxy, float(det.confidence)))
                 z = self._tracker.depth_in_mask(depth, det.mask)
                 if z is None:
                     z = self._tracker.mono_depth_from_mask(det.mask, k)
@@ -231,10 +262,32 @@ class FineDetectorNode(Node):
             z = self._tracker.mono_depth_from_mask(mask, k)
         ys, xs = np.where(mask > 0)
         u, v = int(xs.mean()), int(ys.mean())
+        x0, x1 = int(xs.min()), int(xs.max())
+        y0, y1 = int(ys.min()), int(ys.max())
+        self._last_viz_boxes = [((x0, y0, x1, y1), 0.4)]
         x, y, zz = self._tracker.uv_to_cam_xyz(u, v, z, k)
         T = np.eye(4)
         T[0, 3], T[1, 3], T[2, 3] = x, y, zz
         return [(T, 0.4)], 'HSV mono/depth'
+
+    def _publish_detection_viz(self, stamp, label: str) -> None:
+        if self._viz_pub is None or self._rgb is None:
+            return
+        # Lazy import keeps node import light when viz disabled.
+        import cv2  # type: ignore
+
+        vis = self._rgb.copy()
+        for i, (bbox, conf) in enumerate(self._last_viz_boxes):
+            x0, y0, x1, y1 = [int(v) for v in bbox]
+            color = (0, 255, 0) if i == 0 else (255, 200, 0)
+            cv2.rectangle(vis, (x0, y0), (x1, y1), color, 2)
+            cv2.putText(
+                vis, f'{i}:{conf:.2f}', (x0, max(y0 - 6, 12)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+        cv2.putText(
+            vis, f'YOLO/fine n={len(self._last_viz_boxes)} {label}'[:60],
+            (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (50, 220, 255), 2, cv2.LINE_AA)
+        self._viz_pub.publish(_rgb_to_imgmsg(vis, stamp, self._camera_frame))
 
     def _tick(self) -> None:
         stamp = self.get_clock().now().to_msg()
@@ -290,6 +343,7 @@ class FineDetectorNode(Node):
         arr.header = header
         arr.berries = berries
         self._pub.publish(arr)
+        self._publish_detection_viz(stamp, msg or '')
         if msg:
             self.get_logger().debug(msg)
 

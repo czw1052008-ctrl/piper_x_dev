@@ -96,6 +96,8 @@ _kill_patterns() {
     'grasp_planner.launch.py'
     'grasp_planner_node'
     'visualize_blueberry_detection.py'
+    'wrist_depth_viz_node.py'
+    'rqt_image_view'
     'real_suction_pick_loop.py'
   )
   local pat pid

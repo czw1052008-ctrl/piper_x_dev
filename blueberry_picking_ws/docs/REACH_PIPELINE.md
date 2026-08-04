@@ -67,8 +67,14 @@ source install/setup.bash
 # Keep SciPy/apt compatible (avoid user-site NumPy 2.x breaking agx_arm_ctrl)
 export PYTHONNOUSERSITE=1
 
-# 键盘遥操
-bash scripts/real_robot_teleop.sh
+# 键盘遥操（可叠加相机/YOLO 可视化）
+bash scripts/real_robot_teleop.sh --viz
+# 仅开窗口不遥操：
+bash scripts/run_teleop_viz.sh
+# 窗口：固定 HSV、手腕 YOLO、手腕深度伪彩
+# topic：/perception/global/detection_viz
+#         /perception/fine/detection_viz
+#         /perception/wrist/depth_viz
 
 # 触达管线（臂 + 双相机 + 感知 + FSM）
 bash scripts/run_real_reach.sh
@@ -87,7 +93,7 @@ ros2 topic pub --once /reach/cmd std_msgs/String "{data: confirm_reset}"
 - [x] 工作空间可编译：`picking_msgs/perception/bringup/grasp`  
 - [x] dry-run：`/reach/cmd start` → `LOCKING→REFINING→PLANNING→APPROACHING→REACHED→WAIT_CONFIRM` → `confirm_reset` → `IDLE`  
 - [ ] 真机运动（去掉 `--dry-run`）`start` → `REACHED` → `confirm_reset`  
-- [ ] 键盘 teleop  
+- [ ] 键盘 teleop（`bash scripts/real_robot_teleop.sh --viz`）  
 
 ### Orbbec 已知问题（2026-08）
 

@@ -39,8 +39,8 @@ ros2 topic pub --once /reach/cmd std_msgs/String "{data: start}"
 # 触达完成后
 ros2 topic pub --once /reach/cmd std_msgs/String "{data: confirm_reset}"
 
-# 键盘遥操（栈已起）
-bash scripts/real_robot_teleop.sh
+# 键盘遥操（可叠加相机/YOLO 可视化）
+bash scripts/real_robot_teleop.sh --viz
 ```
 
 ## 真机配置要点
@@ -49,4 +49,9 @@ bash scripts/real_robot_teleop.sh
 - `FIXED_CAMERA_DEVICE`：4K USB 的 `/dev/videoX`（先用 `v4l2-ctl --list-devices` 确认）。
 - 手腕相机：`ORBBEC_WS=.../OrbbecSDK_ROS2_main`；`ORBBEC_PUBLISH_TF=false`，由 bringup 发 `link6→camera_wrist_color_optical_frame`。
 - 固定相机外参：`FIXED_CAM_*` / `calibration/fixed_camera_to_base.yaml`（当前为粗占位，需实测精调）。
+- 遥操可视化：`bash scripts/real_robot_teleop.sh --viz`（固定 HSV + 手腕 YOLO + 深度伪彩）。
 - **禁止**在臂使能时整卡 xHCI reset（见 `docs/REACH_PIPELINE.md`）。
+
+## 许可证
+
+各子目录保留上游许可证；`blueberry_picking_ws` 为本项目自有代码。
