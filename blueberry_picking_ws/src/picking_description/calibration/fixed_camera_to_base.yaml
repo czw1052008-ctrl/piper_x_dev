@@ -1,14 +1,11 @@
-# Eye-to-hand calibration: fixed camera optical → base_link
-# Used by fixed_camera.launch.py / real_robot.env FIXED_CAM_*
+# Eye-to-hand: fixed camera optical → base_link
+# Synced with config/real_robot.env FIXED_CAM_*
 #
-# Placeholder values — coarse room setup. Refine with:
-#   1) measure camera XYZ relative to arm base (m)
-#   2) set FIXED_CAM_TX/TY/TZ and quaternion in real_robot.env
-#   3) or edit this file and keep env in sync
-#
-# Reach contact uses wrist RGB-D fine pose; this TF mainly supports
-# global target selection (/perception/global/berries → target_lock).
+# 2026-08-04 coarse tape + look-at (desk photo):
+#   translation measured by user (m, base_link)
+#   rotation = optical +Z toward plant/workspace ~ (0.32, 0.08, 0.10)
+# Reach contact still uses wrist RGB-D; this TF is for global lock / coarse align.
 frame_id: base_link
 child_frame_id: camera_fixed_optical_frame
-translation: [0.45, 0.0, 0.55]
-rotation: [0.0, 0.7071, 0.0, 0.7071]  # xyzw quaternion
+translation: [0.60, 0.33, 0.48]
+rotation: [-0.3780, -0.8443, 0.3467, 0.1552]  # xyzw

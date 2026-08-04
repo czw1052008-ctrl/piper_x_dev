@@ -26,6 +26,28 @@ def yaw_to_quat(yaw: float) -> Quaternion:
     return q
 
 
+def matrix_from_tf(transform: TransformStamped) -> np.ndarray:
+    """4x4 SE3 from geometry_msgs TransformStamped (translation + quat xyzw)."""
+    t = transform.transform.translation
+    q = transform.transform.rotation
+    x, y, z, w = q.x, q.y, q.z, q.w
+    R = np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ], dtype=np.float64)
+    T = np.eye(4, dtype=np.float64)
+    T[:3, :3] = R
+    T[:3, 3] = [t.x, t.y, t.z]
+    return T
+
+
+def transform_xyz(T: np.ndarray, x: float, y: float, z: float) -> Tuple[float, float, float]:
+    """Apply 4x4 SE3 to a point."""
+    p = T @ np.array([x, y, z, 1.0], dtype=np.float64)
+    return float(p[0]), float(p[1]), float(p[2])
+
+
 def pose_from_transform(transform: TransformStamped) -> PoseStamped:
     ps = PoseStamped()
     ps.header = transform.header

@@ -15,6 +15,7 @@ from sensor_msgs.msg import CameraInfo, Image
 from tf2_ros import Buffer, TransformListener
 
 from picking_perception.berry_tracker import BerryTracker
+from picking_perception.perception_utils import matrix_from_tf
 from picking_perception.segmentation import filter_berry_mask, segment_blueberry_hsv
 from picking_perception.yolo_berry_detector import YoloBerryDetector
 
@@ -47,21 +48,6 @@ def _image_to_depth_m(msg: Image) -> np.ndarray:
         return depth_mm.astype(np.float32) / 1000.0
     arr = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, -1)
     return arr.astype(np.float32)
-
-
-def _matrix_from_tf(transform) -> np.ndarray:
-    t = transform.transform.translation
-    q = transform.transform.rotation
-    x, y, z, w = q.x, q.y, q.z, q.w
-    R = np.array([
-        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
-        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z + x * w)],
-        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
-    ])
-    T = np.eye(4)
-    T[:3, :3] = R
-    T[:3, 3] = [t.x, t.y, t.z]
-    return T
 
 
 def _pose_to_msg(T: np.ndarray, header) -> PoseStamped:
@@ -105,7 +91,7 @@ class FineDetectorNode(Node):
         self.declare_parameter('depth_min_m', 0.03)
         self.declare_parameter('depth_max_m', 1.8)
         self.declare_parameter('track_lost_max_frames', 25)
-        self.declare_parameter('publish_hz', 3.0)
+        self.declare_parameter('publish_hz', 10.0)
         self.declare_parameter('enable_foundation_pose', False)
         self.declare_parameter('mesh_path', '')
         self.declare_parameter('foundation_pose_root', '')
@@ -303,7 +289,7 @@ class FineDetectorNode(Node):
         try:
             tf = self._tf_buffer.lookup_transform(
                 self._base_frame, self._camera_frame, rclpy.time.Time())
-            T_base_cam = _matrix_from_tf(tf)
+            T_base_cam = matrix_from_tf(tf)
             out_frame = self._base_frame
         except Exception as exc:
             self.get_logger().warn(

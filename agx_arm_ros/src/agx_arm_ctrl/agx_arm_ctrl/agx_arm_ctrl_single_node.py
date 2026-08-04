@@ -358,6 +358,28 @@ class AgxArmRosNode(Node):
                 return False
             time.sleep(poll_interval)
 
+    def _joint_enable_diag(self) -> str:
+        parts = []
+        for joint_index in range(1, self.arm_joint_count + 1):
+            state = self.agx_arm.get_driver_states(joint_index=joint_index)
+            if state is None:
+                parts.append(f"j{joint_index}:no_feedback")
+                continue
+            foc = state.msg.foc_status
+            code = getattr(state.msg, "foc_status_code", 0)
+            parts.append(
+                f"j{joint_index}:code=0x{code:02X}"
+                f" en={int(bool(foc.driver_enable_status))}"
+                f" err={int(bool(foc.driver_error_status))}"
+                f" coll={int(bool(foc.collision_status))}"
+                f" stall={int(bool(foc.stall_status))}"
+                f" uv={int(bool(foc.voltage_too_low))}"
+                f" oc={int(bool(foc.driver_overcurrent))}"
+                f" hot_drv={int(bool(foc.driver_overheating))}"
+                f" hot_m={int(bool(foc.motor_overheating))}"
+            )
+        return " | ".join(parts)
+
     def _enable_arm(self, enable: bool = True, timeout: float = 5.0) -> bool:
         start_time = time.time()
         action_name = "enable" if enable else "disable"
@@ -366,6 +388,9 @@ class AgxArmRosNode(Node):
             if time.time() - start_time > timeout:
                 self.get_logger().error(
                     f"Timeout waiting for arm to {action_name} after {timeout} seconds"
+                )
+                self.get_logger().error(
+                    f"{action_name} diagnostic: {self._joint_enable_diag()}"
                 )
                 return False
             time.sleep(1)
@@ -379,6 +404,9 @@ class AgxArmRosNode(Node):
         else:
             self.get_logger().warn(
                 f"Not all joints are {action_name}d after {action_name}ing the arm"
+            )
+            self.get_logger().warn(
+                f"{action_name} diagnostic: {self._joint_enable_diag()}"
             )
         
         return True

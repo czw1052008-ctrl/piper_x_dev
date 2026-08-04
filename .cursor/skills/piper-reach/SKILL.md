@@ -12,8 +12,9 @@ description: >-
 ## Before any code change
 
 1. Read [docs/REACH_PIPELINE.md](../../../blueberry_picking_ws/docs/REACH_PIPELINE.md).
-2. Read [docs/CLEANUP.md](../../../blueberry_picking_ws/docs/CLEANUP.md) if touching repo layout.
-3. Prefer reusing existing nodes over new packages.
+2. If continuing **ALIGNING / Gate A / agent set_joints**: read [docs/ALIGN_HANDOFF_2026-08-04.md](../../../blueberry_picking_ws/docs/ALIGN_HANDOFF_2026-08-04.md) first (current protocol; do not revive fixed whole_arm ±steps).
+3. Read [docs/CLEANUP.md](../../../blueberry_picking_ws/docs/CLEANUP.md) if touching repo layout.
+4. Prefer reusing existing nodes over new packages.
 
 ## Hard rules
 
@@ -31,6 +32,8 @@ description: >-
 | Role | Path |
 |------|------|
 | Reach FSM | `blueberry_picking_ws/scripts/reach_fsm_node.py` |
+| ALIGN judge | `scripts/align_judge.py` + `write_align_decision.py` + `run_align_qa.sh` |
+| ALIGN handoff | `docs/ALIGN_HANDOFF_2026-08-04.md` |
 | Global detector | `picking_perception/.../global_detector_node.py` |
 | Fine detector | `picking_perception/.../fine_detector_node.py` |
 | Teleop | `picking_bringup/.../link6_teleop_node.py` |
@@ -40,7 +43,8 @@ description: >-
 ## Cmd / status
 
 - `/reach/cmd`: `start` | `confirm_reset` | `abort` | `clear_lock`
-- `/reach/status`: `IDLE` | `LOCKING` | `REFINING` | `PLANNING` | `APPROACHING` | `REACHED` | `WAIT_CONFIRM` | `RESETTING` | `ERROR`
+- `/reach/status`: `IDLE` | `LOCKING` | `ALIGNING` | `REFINING` | `PLANNING` | `APPROACHING` | `REACHED` | `WAIT_CONFIRM` | `RESETTING` | `ERROR`
+- Stage smoke: `bash scripts/reach_stage_smoke.sh [0|1|2|3|4|all]`
 
 ## Hardware smoke (before claiming broken)
 

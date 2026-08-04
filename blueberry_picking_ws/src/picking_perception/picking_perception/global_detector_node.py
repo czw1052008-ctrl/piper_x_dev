@@ -1,10 +1,9 @@
-"""Global coarse detection — fixed camera, topic stream (no business service)."""
+"""Global coarse detection — fixed mono camera, YOLO(+HSV fallback), topic stream."""
 
 from __future__ import annotations
 
 import math
-
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import rclpy
@@ -15,7 +14,9 @@ from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
 from tf2_ros import Buffer, TransformListener
 
-from picking_perception.segmentation import segment_blueberry_hsv
+from picking_perception.perception_utils import matrix_from_tf, transform_xyz
+from picking_perception.segmentation import filter_berry_mask, segment_blueberry_hsv
+from picking_perception.yolo_berry_detector import YoloBerryDetector, YoloDetection
 
 
 def _image_to_rgb(msg: Image) -> np.ndarray:
@@ -49,20 +50,59 @@ class GlobalDetectorNode(Node):
         super().__init__('global_detector_node')
         self.declare_parameter('berry_diameter_m', 0.015)
         self.declare_parameter('camera_focal_px', 500.0)
-        self.declare_parameter('publish_hz', 3.0)
+        self.declare_parameter('publish_hz', 10.0)
         self.declare_parameter('image_topic', '/camera_fixed/image_raw')
         self.declare_parameter('camera_frame', 'camera_fixed_optical_frame')
         self.declare_parameter('base_frame', 'base_link')
         self.declare_parameter('min_mask_px', 100)
+        self.declare_parameter('max_mask_px', 25000)
         self.declare_parameter('viz_topic', '/perception/global/detection_viz')
         self.declare_parameter('publish_viz', True)
+        self.declare_parameter('mask_source', 'yolo')
+        self.declare_parameter('yolo_model', 'yoloe-11s-seg-pf.pt')
+        self.declare_parameter('yolo_classes', 'blueberry,blueberries,berry')
+        self.declare_parameter('yolo_conf_threshold', 0.22)
+        self.declare_parameter('yolo_min_area_px', 120)
+        self.declare_parameter('yolo_max_area_frac', 0.08)
+        self.declare_parameter('yolo_min_circularity', 0.35)
+        self.declare_parameter('yolo_max_aspect_ratio', 2.5)
+        self.declare_parameter('yolo_open_vocab', True)
 
         self._rgb = None
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self)
+        self._mask_source = str(self.get_parameter('mask_source').value).lower()
+        self._yolo: Optional[YoloBerryDetector] = None
+        self._det_mode = 'hsv'
+
+        if self._mask_source == 'yolo':
+            prompts = [
+                p.strip()
+                for p in str(self.get_parameter('yolo_classes').value).split(',')
+                if p.strip()
+            ]
+            self._yolo = YoloBerryDetector(
+                model_name=str(self.get_parameter('yolo_model').value),
+                class_prompts=prompts,
+                conf_threshold=float(self.get_parameter('yolo_conf_threshold').value),
+                min_area_px=int(self.get_parameter('yolo_min_area_px').value),
+                max_area_frac=float(self.get_parameter('yolo_max_area_frac').value),
+                min_circularity=float(self.get_parameter('yolo_min_circularity').value),
+                max_aspect_ratio=float(self.get_parameter('yolo_max_aspect_ratio').value),
+                open_vocab=bool(self.get_parameter('yolo_open_vocab').value),
+            )
+            if self._yolo.ready:
+                self._det_mode = 'yolo'
+                self.get_logger().info(
+                    f'global YOLO ready model={self.get_parameter("yolo_model").value}')
+            else:
+                self.get_logger().warn('global YOLO unavailable — falling back to HSV')
+                self._det_mode = 'hsv'
+        else:
+            self._det_mode = 'hsv'
+            self.get_logger().info('global mask_source=hsv')
 
         image_topic = self.get_parameter('image_topic').value
-        # Match v4l2_camera / rqt (BEST_EFFORT sensor QoS).
         self.create_subscription(
             Image, image_topic, self._on_rgb, qos_profile_sensor_data)
         self._pub = self.create_publisher(DetectedBerryArray, '/perception/global/berries', 10)
@@ -76,7 +116,7 @@ class GlobalDetectorNode(Node):
         self.create_timer(1.0 / hz, self._tick)
         self.get_logger().info(
             f'global_detector streaming /perception/global/berries @ {hz:.1f} Hz '
-            f'(image={image_topic})')
+            f'(image={image_topic}, mode={self._det_mode})')
 
     def _on_rgb(self, msg: Image) -> None:
         try:
@@ -84,28 +124,55 @@ class GlobalDetectorNode(Node):
         except ValueError as exc:
             self.get_logger().warn(str(exc))
 
+    def _detect(self) -> Tuple[Optional[np.ndarray], List[YoloDetection], str]:
+        assert self._rgb is not None
+        if self._det_mode == 'yolo' and self._yolo is not None and self._yolo.ready:
+            dets = self._yolo.detect(self._rgb)
+            if dets:
+                mask = np.zeros(self._rgb.shape[:2], dtype=np.uint8)
+                for d in dets:
+                    mask = np.maximum(mask, d.mask)
+                return mask, dets, 'yolo'
+        mask = segment_blueberry_hsv(self._rgb)
+        min_px = int(self.get_parameter('min_mask_px').value)
+        max_px = int(self.get_parameter('max_mask_px').value)
+        mask = filter_berry_mask(mask, min_area=min_px, max_area=max_px)
+        return mask, [], 'hsv'
+
     def _tick(self) -> None:
         if self._rgb is None:
             return
 
-        mask = segment_blueberry_hsv(self._rgb)
-        min_px = int(self.get_parameter('min_mask_px').value)
         stamp = self.get_clock().now().to_msg()
         cam_frame = self.get_parameter('camera_frame').value
         base_frame = self.get_parameter('base_frame').value
+        min_px = int(self.get_parameter('min_mask_px').value)
 
-        if mask.sum() < min_px:
+        mask, dets, mode = self._detect()
+        if mask is None or int(mask.sum()) < min_px:
             out = DetectedBerryArray()
             out.header.stamp = stamp
             out.header.frame_id = base_frame
             self._pub.publish(out)
-            self._publish_detection_viz(stamp, cam_frame, mask, None, None)
+            self._publish_detection_viz(stamp, cam_frame, mask, dets, mode, None, None)
             return
 
-        ys, xs = np.where(mask > 0)
-        cx, cy = float(xs.mean()), float(ys.mean())
-        area = max(float(mask.sum()), 1.0)
-        diameter_px = 2.0 * math.sqrt(area / math.pi)
+        if dets:
+            best = max(dets, key=lambda d: d.confidence)
+            x0, y0, x1, y1 = best.bbox_xyxy
+            cx = 0.5 * (x0 + x1)
+            cy = 0.5 * (y0 + y1)
+            diameter_px = float(max(x1 - x0, y1 - y0))
+            conf = float(best.confidence)
+            viz_dets = dets
+        else:
+            ys, xs = np.where(mask > 0)
+            cx, cy = float(xs.mean()), float(ys.mean())
+            area = max(float(mask.sum()), 1.0)
+            diameter_px = 2.0 * math.sqrt(area / math.pi)
+            conf = 0.5
+            viz_dets = []
+
         focal = float(self.get_parameter('camera_focal_px').value)
         berry_d = float(self.get_parameter('berry_diameter_m').value)
         distance = focal * berry_d / max(diameter_px, 1.0)
@@ -121,11 +188,13 @@ class GlobalDetectorNode(Node):
         out_frame = cam_frame
         try:
             tf = self._tf_buffer.lookup_transform(base_frame, cam_frame, rclpy.time.Time())
-            t = tf.transform.translation
+            bx, by, bz = transform_xyz(
+                matrix_from_tf(tf),
+                pose.pose.position.x, pose.pose.position.y, pose.pose.position.z)
             pose.header.frame_id = base_frame
-            pose.pose.position.x += t.x
-            pose.pose.position.y += t.y
-            pose.pose.position.z += t.z
+            pose.pose.position.x = bx
+            pose.pose.position.y = by
+            pose.pose.position.z = bz
             out_frame = base_frame
         except Exception as exc:
             self.get_logger().warn(f'TF {base_frame}<-{cam_frame} failed: {exc}')
@@ -133,7 +202,7 @@ class GlobalDetectorNode(Node):
         berry = DetectedBerry()
         berry.header = pose.header
         berry.pose = pose
-        berry.confidence = 0.5
+        berry.confidence = conf
 
         arr = DetectedBerryArray()
         arr.header.stamp = stamp
@@ -141,10 +210,12 @@ class GlobalDetectorNode(Node):
         arr.berries = [berry]
         self._pub.publish(arr)
         self._publish_detection_viz(
-            stamp, cam_frame, mask, (int(cx), int(cy)), int(max(diameter_px * 0.5, 8)))
+            stamp, cam_frame, mask, viz_dets, mode,
+            (int(cx), int(cy)), int(max(diameter_px * 0.5, 8)))
 
     def _publish_detection_viz(
-        self, stamp, frame_id: str, mask: np.ndarray,
+        self, stamp, frame_id: str, mask: Optional[np.ndarray],
+        dets: List[YoloDetection], mode: str,
         center: Optional[Tuple[int, int]], radius: Optional[int],
     ) -> None:
         if self._viz_pub is None or self._rgb is None:
@@ -152,20 +223,27 @@ class GlobalDetectorNode(Node):
         import cv2  # type: ignore
 
         vis = self._rgb.copy()
-        # HSV mask tint (cyan)
-        tint = vis.copy()
-        tint[mask > 0] = (0, 220, 220)
-        vis = cv2.addWeighted(vis, 0.65, tint, 0.35, 0)
+        if mask is not None and mask.any():
+            tint = vis.copy()
+            tint[mask > 0] = (0, 220, 220)
+            vis = cv2.addWeighted(vis, 0.65, tint, 0.35, 0)
+        for d in dets:
+            x0, y0, x1, y1 = d.bbox_xyxy
+            cv2.rectangle(vis, (x0, y0), (x1, y1), (0, 255, 0), 2)
+            cv2.putText(
+                vis, f'{d.confidence:.2f}', (x0, max(y0 - 4, 12)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
         if center is not None and radius is not None:
             cv2.circle(vis, center, radius, (0, 255, 0), 2)
             cv2.circle(vis, center, 3, (0, 255, 0), -1)
-            cv2.putText(
-                vis, f'global HSV @ {center}', (8, 22),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (50, 220, 255), 2, cv2.LINE_AA)
+        label = f'global {mode}'
+        if center is not None:
+            label += f' @ {center}'
         else:
-            cv2.putText(
-                vis, 'global: no berry', (8, 22),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (80, 80, 255), 2, cv2.LINE_AA)
+            label += ': no berry'
+        cv2.putText(
+            vis, label, (8, 22),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (50, 220, 255), 2, cv2.LINE_AA)
         self._viz_pub.publish(_rgb_to_imgmsg(vis, stamp, frame_id))
 
 

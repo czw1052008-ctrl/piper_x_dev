@@ -177,3 +177,26 @@ def test_compose_pose_static_to_world():
     assert world[0].child_frame_id == 'berry_1_1'
     assert abs(world[0].transform.translation.x - 0.47) < 1e-6
     assert abs(world[0].transform.translation.z - 0.50) < 1e-6
+
+
+def test_matrix_from_tf_rotates_and_translates():
+    """Slanted optical frame: camera +Z must map via full SE3, not translation-only."""
+    from geometry_msgs.msg import TransformStamped
+    from picking_perception.perception_utils import matrix_from_tf, transform_xyz
+
+    tf = TransformStamped()
+    tf.transform.translation.x = 0.60
+    tf.transform.translation.y = 0.33
+    tf.transform.translation.z = 0.48
+    # -90 deg about Y: cam +Z -> world -X → (0,0,0.5) + t ≈ (0.10, 0.33, 0.48)
+    tf.transform.rotation.x = 0.0
+    tf.transform.rotation.y = -0.70710678
+    tf.transform.rotation.z = 0.0
+    tf.transform.rotation.w = 0.70710678
+    T = matrix_from_tf(tf)
+    bx, by, bz = transform_xyz(T, 0.0, 0.0, 0.5)
+    assert abs(bx - 0.10) < 1e-5
+    assert abs(by - 0.33) < 1e-5
+    assert abs(bz - 0.48) < 1e-5
+    # translation-only must NOT match
+    assert abs(bx - 0.60) > 0.1

@@ -29,14 +29,24 @@
 ## 状态机
 
 ```
-IDLE → LOCKING → REFINING → PLANNING → APPROACHING → REACHED → WAIT_CONFIRM → RESETTING → IDLE
+IDLE → LOCKING → ALIGNING → REFINING → PLANNING → APPROACHING → REACHED → WAIT_CONFIRM → RESETTING → IDLE
 ```
 
 - `start`：从 IDLE 进入 LOCKING  
+- `ALIGNING`：**agent/启发式估关节目标 → 位置控制 → hold → 粗方位判定**（`set_joints` / `coarse_ok`）；详见 [ALIGN_HANDOFF_2026-08-04.md](ALIGN_HANDOFF_2026-08-04.md)。`run_align_qa.sh` 默认 file+agent。旧「写死整臂步长」已废弃。  
+- `REFINING`：手腕 fine 3D；超时则回退用全局锁定位姿规划（粗）  
 - `confirm_reset`：WAIT_CONFIRM → 关节回 `[0,0,0,0,0,0]`  
 - `abort` / `clear_lock`：中止并清锁  
 
-运动期间请停 teleop，避免与 MoveIt 抢控制。
+运动期间请停 teleop，避免与 MoveIt 抢控制。FSM 用 **异步 MoveIt**（`MultiThreadedExecutor` + 非阻塞 poll），避免 timer 内 `spin_until_future_complete` 死锁。
+
+### 阶段冒烟
+
+```bash
+# 0 硬件 / 1 global / 2 fine / 3 规划单测 / 4 FSM dry-run；截图在 log/real_robot/stage_N/
+bash scripts/reach_stage_smoke.sh 0
+bash scripts/reach_stage_smoke.sh all
+```
 
 ## 相机分工
 
@@ -44,13 +54,10 @@ IDLE → LOCKING → REFINING → PLANNING → APPROACHING → REACHED → WAIT_
 2. **手腕 RGB-D**：深度中值 → base 系 3D；失败时 mono 尺寸先验。主导触达坐标。  
 3. 固定相机 `fixed_camera_to_base.yaml` / `FIXED_CAM_*` 若为占位，全局位姿可能漂；触达仍以手腕精定位为准。
 
-### 固定相机外参（占位 → 实测）
+### 固定相机外参（卷尺粗标，2026-08-04）
 
-当前 `FIXED_CAM_TX/TY/TZ=(0.45,0,0.55)`、四元数 `(0,0.7071,0,0.7071)` 为粗占位。精调：
-
-1. 卷尺/手测固定相机光学中心相对 `base_link` 的 XYZ（米）与大致朝向。  
-2. 写入 `config/real_robot.env` 的 `FIXED_CAM_*`，并同步 `src/picking_description/calibration/fixed_camera_to_base.yaml`。  
-3. 用 `ros2 run tf2_ros tf2_echo base_link camera_fixed_optical_frame` 与 `/perception/global/berries` 对照实物位置；手腕 `/perception/fine/berries` 主导接触坐标。
+`FIXED_CAM_TX/TY/TZ=(0.60,0.33,0.48)`；朝向按「斜下看工作区/植株」look-at 生成四元数（见 `fixed_camera_to_base.yaml`）。  
+重启固定相机 launch 后生效：`tf2_echo base_link camera_fixed_optical_frame`。若粗对准仍偏，微调平移或 look-at 目标点。
 
 ## 启动
 
@@ -91,9 +98,10 @@ ros2 topic pub --once /reach/cmd std_msgs/String "{data: confirm_reset}"
 - [x] `/camera_fixed/image_raw` 有数据  
 - [x] `link6 → camera_wrist_color_optical_frame` 静态 TF（bringup `camera_tf`；`CAMERA_MOUNT_TY=-0.08`）  
 - [x] 工作空间可编译：`picking_msgs/perception/bringup/grasp`  
-- [x] dry-run：`/reach/cmd start` → `LOCKING→REFINING→PLANNING→APPROACHING→REACHED→WAIT_CONFIRM` → `confirm_reset` → `IDLE`  
-- [ ] 真机运动（去掉 `--dry-run`）`start` → `REACHED` → `confirm_reset`  
-- [ ] 键盘 teleop（`bash scripts/real_robot_teleop.sh --viz`）  
+- [x] dry-run：`/reach/cmd start` → `LOCKING→ALIGNING→REFINING→PLANNING→APPROACHING→REACHED→WAIT_CONFIRM` → `confirm_reset` → `IDLE`  
+- [x] 真机运动（2026-08-04）：异步 MoveIt；`align/pre/contact/home` 均 OK → `WAIT_CONFIRM` → `IDLE`  
+- [ ] 键盘 teleop（`bash scripts/real_robot_teleop.sh --viz`）— 可选验收  
+- [ ] 手腕 FOV 对准植株后精测距（当前 ALIGNING 仅位置约束，腕姿可能未朝向果簇；YOLO 因 numpy/matplotlib 冲突回退 HSV）  
 
 ### Orbbec 已知问题（2026-08）
 

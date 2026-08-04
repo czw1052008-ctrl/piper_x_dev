@@ -3,7 +3,7 @@ fine_detector_node:
     mesh_path: ""
     foundation_pose_root: "/home/user/codes/piper_x_dev/FoundationPose"
     enable_foundation_pose: false
-    publish_hz: 3.0
+    publish_hz: 10.0
     est_refine_iter: 5
     track_refine_iter: 2
     score_threshold: 0.3
@@ -23,3 +23,21 @@ fine_detector_node:
     depth_min_m: 0.03
     depth_max_m: 1.8
     track_lost_max_frames: 8
+
+global_detector_node:
+  ros__parameters:
+    mask_source: yolo
+    # Custom blueberry-4 misfires on arm/cup in this scene; use open-vocab for coarse plant lock.
+    yolo_model: yoloe-11s-seg-pf.pt
+    yolo_open_vocab: true
+    yolo_classes: "blueberry plant,blueberries,blueberry"
+    yolo_conf_threshold: 0.45
+    yolo_min_area_px: 400
+    yolo_max_area_frac: 0.22
+    yolo_min_circularity: 0.08
+    yolo_max_aspect_ratio: 3.5
+    berry_diameter_m: 0.08
+    camera_focal_px: 900.0
+    publish_hz: 10.0
+    min_mask_px: 200
+    max_mask_px: 80000
