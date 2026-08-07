@@ -57,7 +57,7 @@ fi
 set -u 2>/dev/null || true
 
 EE="${PICK_EE_LINK:-tcp_link}"
-CUP="${PICK_CUP_CONTACT_OFFSET:-0.04}"
+CUP="${PICK_CUP_CONTACT_OFFSET:-0.015}"
 DRY_FLAG=()
 [[ "${DRY_RUN}" == "true" ]] && DRY_FLAG=(--dry-run)
 QA_DIR_DEFAULT="${ROOT}/log/real_robot/qa"

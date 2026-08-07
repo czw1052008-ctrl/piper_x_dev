@@ -91,8 +91,8 @@ ORBBEC_PUBLISH_TF=false
 CAMERA_MOUNT_FRAME=link6
 CAMERA_MOUNT_TX=0.0
 CAMERA_MOUNT_TY=-0.08
-CAMERA_MOUNT_TZ=0.0
-CAMERA_MOUNT_RPY=0.0,0.0,0.0
+CAMERA_MOUNT_TZ=-0.04
+CAMERA_MOUNT_RPY=-0.410152,0.0,0.0
 ENABLE_PERCEPTION_CFG=false
 ENABLE_FIXED_CAMERA="${ENABLE_FIXED_CAMERA:-false}"
 ENABLE_REACH_PERCEPTION_CFG=false
@@ -450,7 +450,7 @@ tcp_offset:='${ARM_TCP_OFFSET:-[0.0,0.0,0.05,0.0,0.0,0.0]}'" truncate
     _wait_for_topic "/${ORBBEC_CAMERA_NAME}/color/image_raw" 120 camera.log
     IFS=',' read -r _r _p _y <<< "${CAMERA_MOUNT_RPY}"
     _cam_parent="${CAMERA_MOUNT_FRAME:-link6}"
-    # Lens Z = CS7 +Z; optical axes match link6 — only mount translation (no Orbbec optical rpy)
+    # Optical pitched ~23.5deg down vs link6 +Z (CAMERA_MOUNT_RPY roll); + mount translation
     _start_bg camera_tf "${ros_setup}; exec ros2 run tf2_ros static_transform_publisher \
 --x ${CAMERA_MOUNT_TX} --y ${CAMERA_MOUNT_TY} --z ${CAMERA_MOUNT_TZ} \
 --roll ${_r:-0} --pitch ${_p:-0} --yaw ${_y:-0} \

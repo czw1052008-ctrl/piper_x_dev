@@ -32,6 +32,20 @@ JOINT_KEYS = ('joint1', 'joint2', 'joint3', 'joint4', 'joint5', 'joint6')
 DEFAULT_LEAN_J2_DEG = -12.0
 DEFAULT_LEAN_J3_DEG = 15.0
 
+# Fixed mono: plant_uv − ee_uv in align observation (pixels).
+DEFAULT_FIXED_TOL_X_PX = 90.0
+DEFAULT_FIXED_TOL_Y_PX = 120.0
+FIXED_J1_GAIN_DEG_PER_PX = 0.035
+FIXED_J2_GAIN_DEG_PER_PX = 0.018
+FIXED_J3_GAIN_DEG_PER_PX = -0.022
+FIXED_J5_GAIN_DEG_PER_PX = 0.012
+MAX_FIXED_CORRECTION_DEG = 12.0
+# Reach pose when fixed mono shows plant below EE (wrist can see plant); see qa align judge snaps.
+REACH_J2_DEG = 12.0
+REACH_J3_DEG = -8.0
+DEFAULT_EE_ANGLE_MAX_DEG = 48.0
+DEFAULT_J2_REACH_MAX_DEG = 35.0
+
 
 def _clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
@@ -142,6 +156,26 @@ def is_target_visible(
     return float(obs.get('fine_visible', 0.0)) >= 1.0 and float(obs.get('fine_confidence', 0.0)) >= conf
 
 
+def fixed_mono_error_px(obs: Dict[str, float]) -> Optional[Tuple[float, float]]:
+    """Plant minus EE in fixed mono image (px). None when projection unavailable."""
+    if float(obs.get('fixed_has_view', 0.0)) < 0.5:
+        return None
+    return float(obs.get('fixed_dx_px', 0.0)), float(obs.get('fixed_dy_px', 0.0))
+
+
+def fixed_mono_aligned(
+    obs: Dict[str, float],
+    *,
+    tol_x_px: float = DEFAULT_FIXED_TOL_X_PX,
+    tol_y_px: float = DEFAULT_FIXED_TOL_Y_PX,
+) -> bool:
+    err = fixed_mono_error_px(obs)
+    if err is None:
+        return False
+    dx, dy = err
+    return abs(dx) <= tol_x_px and abs(dy) <= tol_y_px
+
+
 def _deg_map_from_decision(decision: Dict[str, object], key: str) -> Dict[str, float]:
     raw = decision.get(key)
     if not isinstance(raw, dict):
@@ -166,10 +200,10 @@ def estimate_joint_targets_deg(
     lean_j3_deg: float = DEFAULT_LEAN_J3_DEG,
 ) -> Dict[str, float]:
     """
-    Heuristic one-shot absolute targets (degrees).
+    Heuristic absolute joint targets (degrees).
 
-    Prefer aiming joint1 at plant_yaw (not a fixed ±step), mild shoulder/elbow lean,
-    and wrist pitch toward pitch_target. Agent should override with visual estimates.
+    Primary: fixed mono plant↔EE pixel error drives j1/j2/j3/j5 corrections.
+    Fallback (no fixed projection): plant_yaw on j1 + mild lean when yaw far.
     """
     j1 = float(obs.get('joint1', 0.0))
     j2 = float(obs.get('joint2', 0.0))
@@ -178,26 +212,81 @@ def estimate_joint_targets_deg(
     plant_yaw = float(obs.get('plant_yaw', j1))
     yaw_err = norm_angle(plant_yaw - j1)
 
-    # Absolute j1 at plant_yaw (clamped). No fixed overshoot step.
-    j1_tgt = _clamp(math.degrees(plant_yaw), -joint1_limit_deg, joint1_limit_deg)
-    j5_tgt = _clamp(
-        math.degrees(pitch_target_rad),
-        math.degrees(joint5_min_rad),
-        math.degrees(joint5_max_rad),
-    )
-    # Only lean if still far in yaw; otherwise keep current shoulder/elbow.
-    if abs(math.degrees(yaw_err)) > 8.0:
-        j2_tgt = math.degrees(j2) + lean_j2_deg
-        j3_tgt = math.degrees(j3) + lean_j3_deg
+    j5_min_deg = math.degrees(joint5_min_rad)
+    j5_max_deg = math.degrees(joint5_max_rad)
+    j5_tgt = _clamp(math.degrees(pitch_target_rad), j5_min_deg, j5_max_deg)
+
+    err = fixed_mono_error_px(obs)
+    if err is not None:
+        dx, dy = err
+        cap = MAX_FIXED_CORRECTION_DEG
+        j1_tgt = math.degrees(j1) + _clamp(-dx * FIXED_J1_GAIN_DEG_PER_PX, -cap, cap)
+        # plant below EE in fixed mono (dy>0) → reach out (lower j2, unfold j3), not raise arm.
+        j2_tgt = math.degrees(j2) - _clamp(dy * FIXED_J2_GAIN_DEG_PER_PX, -cap, cap)
+        j3_tgt = math.degrees(j3) + _clamp(dy * abs(FIXED_J3_GAIN_DEG_PER_PX), -cap, cap)
+        j5_tgt = _clamp(
+            j5_tgt - _clamp(dy * FIXED_J5_GAIN_DEG_PER_PX, -cap * 0.5, cap * 0.5),
+            j5_min_deg,
+            j5_max_deg,
+        )
+        if math.degrees(j2) > 40.0 and dy > 60.0:
+            blend = min(0.55, dy / 350.0)
+            j2_tgt = (1.0 - blend) * j2_tgt + blend * REACH_J2_DEG
+            j3_tgt = (1.0 - blend) * j3_tgt + blend * REACH_J3_DEG
     else:
-        j2_tgt = math.degrees(j2)
-        j3_tgt = math.degrees(j3)
+        j1_tgt = _clamp(math.degrees(plant_yaw), -joint1_limit_deg, joint1_limit_deg)
+        if abs(math.degrees(yaw_err)) > 8.0:
+            j2_tgt = math.degrees(j2) + lean_j2_deg
+            j3_tgt = math.degrees(j3) + lean_j3_deg
+        else:
+            j2_tgt = math.degrees(j2)
+            j3_tgt = math.degrees(j3)
+
+    j1_tgt = _clamp(j1_tgt, -joint1_limit_deg, joint1_limit_deg)
     return {
         'joint1': j1_tgt,
         'joint2': _clamp(j2_tgt, -100.0, 100.0),
         'joint3': _clamp(j3_tgt, -100.0, 100.0),
         'joint5': j5_tgt,
     }
+
+
+def align_entry_ready(
+    obs: Dict[str, float],
+    *,
+    fine_visible_conf: float = 0.25,
+    yaw_deadband_deg: float = 8.0,
+    pitch_target_rad: float = -0.75,
+    pitch_deadband_rad: float = 0.12,
+    fixed_tol_x_px: float = DEFAULT_FIXED_TOL_X_PX,
+    fixed_tol_y_px: float = DEFAULT_FIXED_TOL_Y_PX,
+    ee_angle_max_deg: float = DEFAULT_EE_ANGLE_MAX_DEG,
+    j2_reach_max_deg: float = DEFAULT_J2_REACH_MAX_DEG,
+) -> Tuple[bool, str]:
+    """ALIGN done when wrist sees plant, or fixed-mono + reach pose (EE toward plant, arm extended)."""
+    if is_target_visible(obs, fine_visible_conf=fine_visible_conf):
+        return True, 'wrist RGB sees plant'
+    fixed_err = fixed_mono_error_px(obs)
+    fixed_ok = fixed_mono_aligned(
+        obs, tol_x_px=fixed_tol_x_px, tol_y_px=fixed_tol_y_px)
+    j1 = float(obs.get('joint1', 0.0))
+    j5 = float(obs.get('joint5', 0.0))
+    plant_yaw = float(obs.get('plant_yaw', j1))
+    yaw_err_deg = abs(math.degrees(
+        float(obs['yaw_error']) if 'yaw_error' in obs else norm_angle(plant_yaw - j1)))
+    pitch_err = pitch_target_rad - j5
+    yaw_pitch_ok = yaw_err_deg <= yaw_deadband_deg and abs(pitch_err) <= pitch_deadband_rad
+    ee_angle = float(obs.get('ee_target_angle_deg', 180.0))
+    j2_deg = float(obs.get('joint2_deg', math.degrees(float(obs.get('joint2', 0.0)))))
+    reach_ok = ee_angle <= ee_angle_max_deg and j2_deg <= j2_reach_max_deg
+    if fixed_ok and yaw_pitch_ok and reach_ok:
+        return True, (
+            f'fixed-mono aligned + reach pose (ee_angle={ee_angle:.0f}deg j2={j2_deg:.0f}deg)')
+    if fixed_err is not None:
+        return False, (
+            f'need reach: dx={fixed_err[0]:.0f} dy={fixed_err[1]:.0f}px '
+            f'ee_angle={ee_angle:.0f}deg j2={j2_deg:.0f}deg wrist_vis=0')
+    return False, f'no fixed-mono view; ee_angle={ee_angle:.0f}deg j2={j2_deg:.0f}deg'
 
 
 def decide_action(
@@ -211,15 +300,19 @@ def decide_action(
     ee_angle_trigger_deg: float = 20.0,
     phase: str = 'command',
     allow_done_without_visible: bool = False,
+    fixed_tol_x_px: float = DEFAULT_FIXED_TOL_X_PX,
+    fixed_tol_y_px: float = DEFAULT_FIXED_TOL_Y_PX,
 ) -> Dict[str, object]:
     """
     Heuristic / agent-fallback decision.
 
-    phase=command → set_joints with estimated absolute targets (or coarse_ok if already good).
-    phase=judge   → after hold: coarse_ok if roughly facing plant, else re-estimate set_joints.
+    phase=command → set_joints from fixed-mono until wrist can see plant (or reach pose OK).
+    phase=judge   → coarse_ok only when align_entry_ready; else set_joints.
     """
-    del ee_angle_trigger_deg, failed_actions
-    visible = is_target_visible(obs, fine_visible_conf=fine_visible_conf)
+    del failed_actions, allow_done_without_visible
+    fixed_err = fixed_mono_error_px(obs)
+    fixed_ok = fixed_mono_aligned(
+        obs, tol_x_px=fixed_tol_x_px, tol_y_px=fixed_tol_y_px)
     j1 = float(obs.get('joint1', 0.0))
     j5 = float(obs.get('joint5', 0.0))
     plant_yaw = float(obs.get('plant_yaw', j1))
@@ -227,62 +320,71 @@ def decide_action(
     yaw_err_deg = abs(math.degrees(yaw_err))
     pitch_err = pitch_target_rad - j5
     ee_angle = float(obs.get('ee_target_angle_deg', 180.0))
+    j2_deg = float(obs.get('joint2_deg', math.degrees(float(obs.get('joint2', 0.0)))))
+    wrist_ok = is_target_visible(obs, fine_visible_conf=fine_visible_conf)
+    ready, ready_reason = align_entry_ready(
+        obs,
+        fine_visible_conf=fine_visible_conf,
+        yaw_deadband_deg=yaw_deadband_deg,
+        pitch_target_rad=pitch_target_rad,
+        pitch_deadband_rad=pitch_deadband_rad,
+        fixed_tol_x_px=fixed_tol_x_px,
+        fixed_tol_y_px=fixed_tol_y_px,
+        ee_angle_max_deg=max(ee_angle_trigger_deg, DEFAULT_EE_ANGLE_MAX_DEG),
+        j2_reach_max_deg=DEFAULT_J2_REACH_MAX_DEG,
+    )
 
     meta: Dict[str, object] = {
-        'visible': visible,
         'phase': phase,
         'yaw_error_deg': math.degrees(yaw_err),
         'pitch_error_rad': pitch_err,
         'ee_target_angle_deg': ee_angle,
+        'joint2_deg': j2_deg,
         'plant_yaw_deg': math.degrees(plant_yaw),
         'joint1_deg': math.degrees(j1),
         'joint5_deg': math.degrees(j5),
+        'fixed_ok': fixed_ok,
+        'wrist_visible': wrist_ok,
+        'fixed_dx_px': fixed_err[0] if fixed_err is not None else None,
+        'fixed_dy_px': fixed_err[1] if fixed_err is not None else None,
         'source': 'heuristic',
     }
 
-    roughly_facing = (
-        visible
-        or (yaw_err_deg <= yaw_deadband_deg and abs(pitch_err) <= pitch_deadband_rad)
-        or (allow_done_without_visible and yaw_err_deg <= yaw_deadband_deg)
-    )
-
     if phase == 'judge':
-        if roughly_facing:
+        if ready:
             return {
                 **meta,
                 'action': 'coarse_ok',
-                'reason': 'held pose: coarse facing OK → wrist fine control',
+                'reason': f'held pose: {ready_reason} → REFINING',
             }
         targets = estimate_joint_targets_deg(obs, pitch_target_rad=pitch_target_rad)
-        return {
-            **meta,
-            'action': 'set_joints',
-            'joints_deg': targets,
-            'reason': (
-                f'held pose still off (yaw_err={yaw_err_deg:.1f}deg) → '
-                f're-aim j1→{targets["joint1"]:.1f}deg j5→{targets["joint5"]:.1f}deg'
-            ),
-        }
+        reason = ready_reason if fixed_err is None else (
+            f'{ready_reason} → j1={targets["joint1"]:.1f} j2={targets["joint2"]:.1f} '
+            f'j3={targets["joint3"]:.1f} j5={targets["joint5"]:.1f}deg'
+        )
+        return {**meta, 'action': 'set_joints', 'joints_deg': targets, 'reason': reason}
 
     # command phase
-    if roughly_facing and (visible or allow_done_without_visible or yaw_err_deg <= yaw_deadband_deg):
-        if visible or yaw_err_deg <= yaw_deadband_deg:
-            return {
-                **meta,
-                'action': 'coarse_ok',
-                'reason': 'already roughly facing plant (or wrist sees it)',
-            }
+    if ready:
+        return {
+            **meta,
+            'action': 'coarse_ok',
+            'reason': f'align entry ready: {ready_reason}',
+        }
 
     targets = estimate_joint_targets_deg(obs, pitch_target_rad=pitch_target_rad)
-    return {
-        **meta,
-        'action': 'set_joints',
-        'joints_deg': targets,
-        'reason': (
-            f'estimate absolute pose: j1→{targets["joint1"]:.1f}deg '
-            f'(plant_yaw) j5→{targets["joint5"]:.1f}deg'
-        ),
-    }
+    if fixed_err is None:
+        reason = (
+            f'estimate pose (no fixed view): j1→{targets["joint1"]:.1f}deg '
+            f'j5→{targets["joint5"]:.1f}deg'
+        )
+    else:
+        reason = (
+            f'fixed-mono dx={fixed_err[0]:.0f} dy={fixed_err[1]:.0f}px → '
+            f'j1={targets["joint1"]:.1f} j2={targets["joint2"]:.1f} '
+            f'j3={targets["joint3"]:.1f} j5={targets["joint5"]:.1f}deg'
+        )
+    return {**meta, 'action': 'set_joints', 'joints_deg': targets, 'reason': reason}
 
 
 def inverse_action(action: str) -> str:
@@ -318,6 +420,7 @@ def apply_joint_command(
     joint2_max_rad: float = 1.8,
     joint3_min_rad: float = -1.8,
     joint3_max_rad: float = 1.8,
+    joint6_limit_rad: float = 0.0,
     restore_joints: Optional[Sequence[float]] = None,
 ) -> List[float]:
     """Apply set_joints (absolute joints_deg or relative delta_deg) as position targets."""
@@ -351,13 +454,19 @@ def apply_joint_command(
             joint1_limit_deg=joint1_limit_deg,
             joint5_min_rad=joint5_min_rad,
             joint5_max_rad=joint5_max_rad,
+            joint6_limit_rad=joint6_limit_rad,
         )
 
     limit = math.radians(joint1_limit_deg)
+    j6_lim = abs(float(joint6_limit_rad))
     target[0] = _clamp(target[0], -limit, limit)
     target[1] = _clamp(target[1], joint2_min_rad, joint2_max_rad)
     target[2] = _clamp(target[2], joint3_min_rad, joint3_max_rad)
     target[4] = _clamp(target[4], joint5_min_rad, joint5_max_rad)
+    if j6_lim <= 1e-9:
+        target[5] = 0.0
+    else:
+        target[5] = _clamp(target[5], -j6_lim, j6_lim)
     return target
 
 
@@ -383,6 +492,7 @@ def apply_action_to_joints(
     joint2_max_rad: float = 1.8,
     joint3_min_rad: float = -1.8,
     joint3_max_rad: float = 1.8,
+    joint6_limit_rad: float = 0.0,
     fixed_dx_px: Optional[float] = None,
     fixed_has_view: Optional[bool] = None,
     restore_joints: Optional[Sequence[float]] = None,
@@ -454,20 +564,28 @@ def apply_action_to_joints(
         target[4] += pitch_step
 
     limit = math.radians(joint1_limit_deg)
+    j6_lim = abs(float(joint6_limit_rad))
     target[0] = _clamp(target[0], -limit, limit)
     target[1] = _clamp(target[1], joint2_min_rad, joint2_max_rad)
     target[2] = _clamp(target[2], joint3_min_rad, joint3_max_rad)
     target[4] = _clamp(target[4], joint5_min_rad, joint5_max_rad)
+    # joint6_limit_rad==0 → lock at 0; >0 → clamp to ±limit
+    if j6_lim <= 1e-9:
+        target[5] = 0.0
+    else:
+        target[5] = _clamp(target[5], -j6_lim, j6_lim)
     return target
 
 
 def score_observation(obs: Dict[str, float], *, pitch_target_rad: float = -0.75) -> float:
-    fine_bonus = 20.0 if float(obs.get('fine_visible', 0.0)) >= 1.0 else 0.0
-    fine_conf = 5.0 * float(obs.get('fine_confidence', 0.0))
     pitch_bonus = max(0.0, pitch_target_rad - float(obs.get('joint5', 0.0))) * 0.5
     yaw_penalty = abs(math.degrees(float(obs.get('yaw_error', 0.0)))) * 0.15
     angle_penalty = float(obs.get('ee_target_angle_deg', 180.0)) * 0.08
-    return fine_bonus + fine_conf + pitch_bonus - yaw_penalty - angle_penalty
+    fixed_err = fixed_mono_error_px(obs)
+    fixed_penalty = 0.0
+    if fixed_err is not None:
+        fixed_penalty = (abs(fixed_err[0]) + abs(fixed_err[1])) * 0.04
+    return pitch_bonus - yaw_penalty - angle_penalty - fixed_penalty
 
 
 def verify_step(
@@ -492,14 +610,24 @@ def verify_step(
     yaw_after = abs(math.degrees(float(after.get('yaw_error', 0.0))))
     yaw_before = abs(math.degrees(float(before.get('yaw_error', 0.0))))
 
+    fixed_before = fixed_mono_error_px(before)
+    fixed_after = fixed_mono_error_px(after)
+    fixed_improved = False
+    if fixed_before is not None and fixed_after is not None:
+        err_b = abs(fixed_before[0]) + abs(fixed_before[1])
+        err_a = abs(fixed_after[0]) + abs(fixed_after[1])
+        fixed_improved = err_a + min_fixed_err_improve_px <= err_b
+
     accepted = bool(
-        is_target_visible(after)
+        fixed_mono_aligned(after)
+        or fixed_improved
         or score_delta > accept_score_margin
         or (moved and ee_gain >= min_ee_angle_gain_deg)
         or (moved and yaw_after + 1.0 < yaw_before)
     )
-    reason = 'wrist sees target' if is_target_visible(after) else (
-        'improved observation' if accepted else 'no observable improvement')
+    reason = 'fixed-mono aligned' if fixed_mono_aligned(after) else (
+        'fixed-mono improved' if fixed_improved else (
+            'improved observation' if accepted else 'no observable improvement'))
     return accepted, {
         'accepted': accepted,
         'before_score': before_score,

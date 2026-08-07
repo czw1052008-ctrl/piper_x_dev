@@ -114,6 +114,29 @@ class BerryTracker:
         z = fx * (self.berry_diameter_m * 0.5) / r_px
         return float(np.clip(z, self.depth_min_m, self.depth_max_m))
 
+    def mono_depth_near_uv(
+        self,
+        mask: np.ndarray,
+        u: float,
+        v: float,
+        k: np.ndarray,
+        *,
+        radius_px: Optional[float] = None,
+    ) -> float:
+        """Mono depth from mask pixels near a reference UV (surface-ward subset)."""
+        ys, xs = np.where(mask > 0)
+        if xs.size == 0:
+            return self.mono_depth_from_mask(mask, k)
+        dists = np.hypot(xs.astype(np.float64) - float(u), ys.astype(np.float64) - float(v))
+        if radius_px is None:
+            radius_px = max(25.0, math.sqrt(float(xs.size) / math.pi) * 0.6)
+        near = dists <= float(radius_px)
+        if not near.any():
+            return self.mono_depth_from_mask(mask, k)
+        sub = np.zeros_like(mask)
+        sub[ys[near], xs[near]] = mask[ys[near], xs[near]]
+        return self.mono_depth_from_mask(sub, k)
+
     def uv_to_cam_xyz(
         self, u: int, v: int, z: float, k: np.ndarray,
     ) -> Tuple[float, float, float]:
@@ -226,6 +249,7 @@ class BerryTracker:
         fp_wrapper,
         *,
         reset_lock: bool = False,
+        force_lock_idx: Optional[int] = None,
     ) -> Tuple[List[TrackedBerry], int, str]:
         if reset_lock:
             self.reset_lock()
@@ -236,9 +260,11 @@ class BerryTracker:
                 if self._lock.lost_frames > self.track_lost_max_frames:
                     self.reset_lock()
                     return [], -1, 'TRACK lost (no YOLO detections)'
-                # Hold lock internally for re-acquire, but do not export ghost coast target.
-                return [], -1, (
-                    f'TRACK hold lost={self._lock.lost_frames}/{self.track_lost_max_frames}')
+                # Keep publishing coast pose so FSM can continue tracking one fruit.
+                coast = self._coast_tracked(k)
+                return [coast], 0, (
+                    f'TRACK coast no-yolo lost={self._lock.lost_frames}/'
+                    f'{self.track_lost_max_frames} id={self._lock.track_id}')
             return [], -1, 'YOLO found no blueberries'
 
         self._frames_since_fp += 1
@@ -250,10 +276,16 @@ class BerryTracker:
 
         lock_idx = self._match_lock_index(yolo_dets)
         if self._lock is None:
-            # Prefer lowest in image (largest v): user picks bottom berry in view.
-            viable = [i for i, b in enumerate(berries) if b.confidence >= 0.15]
-            pool = viable if viable else list(range(len(berries)))
-            lock_idx = int(max(pool, key=lambda i: berries[i].uv[1]))
+            if (
+                force_lock_idx is not None
+                and 0 <= int(force_lock_idx) < len(berries)
+            ):
+                lock_idx = int(force_lock_idx)
+            else:
+                # Prefer lowest in image (largest v): user picks bottom berry in view.
+                viable = [i for i, b in enumerate(berries) if b.confidence >= 0.15]
+                pool = viable if viable else list(range(len(berries)))
+                lock_idx = int(max(pool, key=lambda i: berries[i].uv[1]))
             det = yolo_dets[lock_idx]
             self._lock = _LockState(
                 track_id=self._next_track_id,

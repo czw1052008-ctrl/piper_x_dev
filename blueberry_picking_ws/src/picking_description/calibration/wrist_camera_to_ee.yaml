@@ -1,6 +1,11 @@
 # Eye-in-hand: Piper X flange (link6 / 坐标系7) -> camera optical frame.
-# Mount: -Y 8cm; optical Z aligned with CS7 +Z (same axes, translation only).
+# Mount: -Y 8cm, -Z 4cm (retracted toward flange).
+# Optical axis pitched DOWN vs link6 +Z by ~23.5deg (roll about X).
+# Fit 20260807_171055 user GT: tip→berry +25mm, cam_center→berry +55mm.
 frame_id: link6
 child_frame_id: camera_wrist_link
-translation: [0.0, -0.08, 0.0]
-rotation: [0.0, 0.0, 0.0, 1.0]
+translation: [0.0, -0.08, -0.04]
+# quaternion xyzw for Rx(-23.5deg)
+rotation: [-0.203642, 0.0, 0.0, 0.979045]
+rpy_rad: [-0.410152, 0.0, 0.0]
+rpy_deg: [-23.5, 0.0, 0.0]

@@ -1,4 +1,4 @@
-path: /home/ziwei/piper_x_dev/blueberry_picking_ws/datasets/blueberry
+path: /home/user/codes/piper_x_dev/blueberry_picking_ws/datasets/blueberry
 train: train/images
 val: val/images
 

@@ -1,4 +1,7 @@
 arm:
+  # NOTE: Piper URDF + MoveIt lock joint6 at 0 → 5-DOF. Absolute SE(3)
+  # /compute_ik (KDL) therefore fails for most Cartesian targets; REFINING
+  # uses scripts/piper_position_ik.py (position-only Jacobian) instead.
   kinematics_solver: kdl_kinematics_plugin/KDLKinematicsPlugin
   kinematics_solver_search_resolution: 0.005
-  kinematics_solver_timeout: 0.005
+  kinematics_solver_timeout: 0.05

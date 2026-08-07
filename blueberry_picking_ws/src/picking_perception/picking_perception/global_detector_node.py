@@ -1,4 +1,4 @@
-"""Global coarse detection — fixed mono camera, YOLO(+HSV fallback), topic stream."""
+"""Global coarse detection — fixed mono camera, YOLO (no HSV auto-fallback), topic stream."""
 
 from __future__ import annotations
 
@@ -96,11 +96,13 @@ class GlobalDetectorNode(Node):
                 self.get_logger().info(
                     f'global YOLO ready model={self.get_parameter("yolo_model").value}')
             else:
-                self.get_logger().warn('global YOLO unavailable — falling back to HSV')
-                self._det_mode = 'hsv'
+                self.get_logger().error(
+                    'global YOLO unavailable — publishing empty (HSV fallback removed)')
+                self._det_mode = 'none'
         else:
+            # Explicit hsv only for offline debug; approved reach path is YOLO.
             self._det_mode = 'hsv'
-            self.get_logger().info('global mask_source=hsv')
+            self.get_logger().warn('global mask_source=hsv (explicit debug; not approved reach path)')
 
         image_topic = self.get_parameter('image_topic').value
         self.create_subscription(
@@ -133,6 +135,9 @@ class GlobalDetectorNode(Node):
                 for d in dets:
                     mask = np.maximum(mask, d.mask)
                 return mask, dets, 'yolo'
+            return None, [], 'yolo_empty'
+        if self._det_mode != 'hsv':
+            return None, [], 'yolo_unavailable'
         mask = segment_blueberry_hsv(self._rgb)
         min_px = int(self.get_parameter('min_mask_px').value)
         max_px = int(self.get_parameter('max_mask_px').value)
@@ -203,6 +208,10 @@ class GlobalDetectorNode(Node):
         berry.header = pose.header
         berry.pose = pose
         berry.confidence = conf
+        berry.track_id = -1
+        berry.depth_mode = ''
+        berry.z_depth_m = -1.0
+        berry.z_mono_m = -1.0
 
         arr = DetectedBerryArray()
         arr.header.stamp = stamp

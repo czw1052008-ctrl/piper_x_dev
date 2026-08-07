@@ -2,8 +2,8 @@
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro">
 
   <!-- Wrist Orbbec DaBai on Piper X flange (link6 = 坐标系7 / end-effector fixture).
-       Physical mount: camera on CS7 -Y (~8cm); lens Z aligns with CS7 +Z (see install photo).
-       Optical frame = same axes as link6 (no extra rpy); only translation from link6. -->
+       Physical mount: camera on CS7 -Y (~8cm), -Z (~4cm).
+       Optical axis pitched down vs link6 +Z ~23.5deg (roll X); GT fit 20260807_171055. -->
   <link name="camera_wrist_link">
     <visual>
       <geometry><box size="0.04 0.02 0.02"/></geometry>
@@ -21,7 +21,7 @@
   <joint name="camera_wrist_joint" type="fixed">
     <parent link="link6"/>
     <child link="camera_wrist_link"/>
-    <origin xyz="0 -0.08 0" rpy="0 0 0"/>
+    <origin xyz="0 -0.08 -0.04" rpy="-0.410152 0 0"/>
   </joint>
 
   <link name="camera_wrist_color_optical_frame"/>

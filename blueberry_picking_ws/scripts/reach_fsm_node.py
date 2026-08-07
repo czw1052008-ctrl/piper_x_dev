@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Topic-driven reach FSM: lock → align → fine 3D → plan → touch → confirm reset.
+"""Topic-driven reach FSM: agent region lock → align → wrist visual servo → confirm.
 
 Cmds on /reach/cmd (std_msgs/String):
   start | confirm_reset | abort | clear_lock
@@ -42,7 +42,7 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
-from sensor_msgs.msg import Image, JointState
+from sensor_msgs.msg import CameraInfo, Image, JointState
 from shape_msgs.msg import SolidPrimitive
 from std_msgs.msg import Bool, String
 from std_srvs.srv import SetBool
@@ -58,7 +58,10 @@ from cup_axis_plan import (  # noqa: E402
     blend_pose,
     build_cup_axis_plan,
     facing_z_from_quat,
+    look_at_pose,
+    partial_look_at_pose,
     plant_base_yaw,
+    quat_slerp,
     yaw_face_standoff_pose,
 )
 from align_judge import (  # noqa: E402
@@ -70,12 +73,29 @@ from align_judge import (  # noqa: E402
     norm_angle,
     verify_step,
 )
+from piper_position_ik import (  # noqa: E402
+    aim_uv_ik,
+    approach_axis_ik,
+    approach_axis_ik_chunked,
+    cup_axis_ik,
+    cup_axis_ik_chunked,
+    fk_link6_T,
+    fk_xyz,
+    position_ik_keep_orient,
+    position_ik_keep_orient_chunked,
+)
+from refine_depth_util import (  # noqa: E402
+    apply_mono_chord_scale,
+    z_mono_near_reproject_from_sources,
+)
 
 ARM_JOINTS = ['joint1', 'joint2', 'joint3', 'joint4', 'joint5', 'joint6']
 HOME = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
+# PLANNING/APPROACHING kept for status compatibility; happy path skips open-loop cup_axis.
 STATES = (
-    'IDLE', 'LOCKING', 'ALIGNING', 'REFINING', 'PLANNING', 'APPROACHING',
+    'IDLE', 'LOCKING', 'ALIGNING', 'REFINING', 'REFINING_WAIT_NEAR',
+    'PLANNING', 'APPROACHING',
     'REACHED', 'WAIT_CONFIRM', 'RESETTING', 'ERROR',
 )
 
@@ -97,13 +117,20 @@ def _matrix_from_tf(transform) -> np.ndarray:
 
 def _project_cam_point(
     x: float, y: float, z: float, width: int, height: int, focal: float,
+    *,
+    cx: Optional[float] = None,
+    cy: Optional[float] = None,
+    fx: Optional[float] = None,
+    fy: Optional[float] = None,
 ) -> Optional[Tuple[float, float]]:
     if z <= 1e-6:
         return None
-    cx = width * 0.5
-    cy = height * 0.5
-    u = cx + focal * x / z
-    v = cy + focal * y / z
+    fx_ = float(focal if fx is None else fx)
+    fy_ = float(focal if fy is None else fy)
+    cx_ = float(width * 0.5 if cx is None else cx)
+    cy_ = float(height * 0.5 if cy is None else cy)
+    u = cx_ + fx_ * x / z
+    v = cy_ + fy_ * y / z
     return (float(u), float(v))
 
 
@@ -136,6 +163,15 @@ class ReachFsmNode(Node):
         self._qa_rgb_wrist = None
         self._qa_rgb_global_viz = None
         self._qa_rgb_fine_viz = None
+        self._qa_fixed_gen = 0
+        self._qa_wrist_gen = 0
+        self._qa_global_viz_gen = 0
+        self._qa_fine_viz_gen = 0
+        self._depth_qa_stop_done = False
+        self._last_mono_chord_meta: Optional[Dict] = None
+        self._range_depth_started = False
+        self._await_fresh_optical_until = 0.0
+        self._probe_tri_chord_applied = False
         self._qa_session = ''
         self._align_cycle_idx = 0
         self._align_step_idx = 0
@@ -157,6 +193,64 @@ class ReachFsmNode(Node):
         self._align_enable_deadline = 0.0
         self._align_no_motion_streak = 0
         self._align_commanded_joints: Optional[List[float]] = None
+        self._lock_request_written = False
+        self._lock_wait_log_t = 0.0
+        self._servo_step_idx = 0
+        self._servo_deadline = 0.0
+        self._servo_orient_frac: Optional[float] = None
+        self._servo_step_scale = 1.0
+        self._servo_settle_until = 0.0
+        self._refine_wait_log_t = 0.0
+        # REFINING: no ALIGN joint-anchor soft bands — Cartesian IK owns the path.
+        # Anchors are recorded at entry for QA only.
+        self._refine_j1_anchor = 0.0
+        self._refine_j5_anchor = 0.0
+        self._refine_j2_anchor = 0.0
+        self._refine_j3_anchor = 0.0
+        self._last_berry_base: Optional[Tuple[float, float, float]] = None
+        self._last_z_cam: Optional[float] = None
+        self._last_berry_t = 0.0
+        self._near_mode = False
+        # REFINING: one fruit locked at entry — BoT-SORT track_id for whole phase.
+        self._refine_fruit_anchor: Optional[Tuple[float, float, float]] = None
+        self._refine_locked_track_id: Optional[int] = None
+        self._refine_lock_sync_tid: Optional[int] = None
+        self._refine_lock_sync_streak = 0
+        self._refine_lock_sync_deadline = 0.0
+        # After clear_lock: fine must reset BoT-SORT before we pin a new tid.
+        self._refine_await_tracker_reset = False
+        self._refine_tracker_reset_t = 0.0
+        self._refine_tracker_reset_live_streak = 0
+        self._refine_fine_lost_streak = 0
+        self._refine_lock_snap_pending = False
+        self._near_handoff_written = False
+        self._near_frozen_berry: Optional[Tuple[float, float, float]] = None
+        self._near_oneshot_sent = False
+        self._near_oneshot_attempts = 0
+        # Mono probe + oneshots: range→center_oneshot→range_depth→contact_oneshot.
+        self._mono_probe_done = False
+        self._mono_probe_obs: List[Dict] = []
+        self._mono_probe_purpose = 'center'  # 'center' | 'contact'
+        # Online EE/camera Cartesian ↔ UV from probe/center small steps (not joint Jac).
+        self._ee_uv_jac: Optional[Dict[str, float]] = None
+        self._center_probe_tri_ok = False
+        # Soft depth scale for center aim when short-baseline tri says mono is deep.
+        self._center_z_tri_m: Optional[float] = None
+        self._center_z_mono_m: Optional[float] = None
+        # REFINING: range_center → center_oneshot → [live replan] → range_depth → near
+        self._refine_phase = 'range_center'
+        self._center_ok_streak = 0
+        self._center_oneshot_sent = False
+        self._center_oneshot_attempts = 0
+        self._center_last_cmd: Optional[Dict] = None
+        self._center_live_replan_done = False
+        # Pending REFINING step record → written as servo_XX.json after settle.
+        self._servo_pending_record: Optional[Dict] = None
+        self._servo_motion_frames: List[Dict] = []
+        self._servo_motion_last_t = 0.0
+        self._servo_ik_fail_n = 0
+        self._servo_ik_fail_t = 0.0
+        self._tcp_pose: Optional[PoseStamped] = None
 
         self._status_pub = self.create_publisher(String, '/reach/status', 10)
         self._reached_pub = self.create_publisher(Bool, '/reach/reached', 10)
@@ -176,11 +270,18 @@ class ReachFsmNode(Node):
         self.create_subscription(
             JointState, '/joint_states', self._on_joints, 10, callback_group=self._cb_group)
         self.create_subscription(
+            PoseStamped, '/feedback/tcp_pose', self._on_tcp_pose, 10,
+            callback_group=self._cb_group)
+        self.create_subscription(
             Image, '/camera_fixed/image_raw', self._on_fixed_img, qos_profile_sensor_data,
             callback_group=self._cb_group)
         self.create_subscription(
             Image, '/camera_wrist/color/image_raw', self._on_wrist_img, qos_profile_sensor_data,
             callback_group=self._cb_group)
+        self.create_subscription(
+            CameraInfo, '/camera_wrist/color/camera_info', self._on_wrist_info,
+            qos_profile_sensor_data, callback_group=self._cb_group)
+        self._wrist_K: Optional[Tuple[float, float, float, float]] = None  # fx,fy,cx,cy
         self.create_subscription(
             Image, '/perception/global/detection_viz', self._on_global_viz, qos_profile_sensor_data,
             callback_group=self._cb_group)
@@ -204,7 +305,7 @@ class ReachFsmNode(Node):
         self.create_timer(0.1, self._tick, callback_group=self._cb_group)
         self._publish_status()
         self.get_logger().info(
-            f'reach_fsm ready — ALIGNING via observe/judge/step loop '
+            f'reach_fsm ready — LOCK_REGION(agent) → ALIGNING → wrist servo '
             f'(judge_mode={self._args.align_judge_mode}); '
             f'qa_dir={self._args.qa_dir}')
 
@@ -226,6 +327,9 @@ class ReachFsmNode(Node):
         if all(j in name_to_pos for j in ARM_JOINTS):
             self._joints = [float(name_to_pos[j]) for j in ARM_JOINTS]
 
+    def _on_tcp_pose(self, msg: PoseStamped) -> None:
+        self._tcp_pose = msg
+
     def _image_to_rgb(self, msg: Image) -> Optional[np.ndarray]:
         enc = msg.encoding.lower()
         try:
@@ -246,21 +350,40 @@ class ReachFsmNode(Node):
         rgb = self._image_to_rgb(msg)
         if rgb is not None:
             self._qa_rgb_fixed = rgb
+            self._qa_fixed_gen += 1
 
     def _on_wrist_img(self, msg: Image) -> None:
         rgb = self._image_to_rgb(msg)
         if rgb is not None:
             self._qa_rgb_wrist = rgb
+            self._qa_wrist_gen += 1
+
+    def _on_wrist_info(self, msg: CameraInfo) -> None:
+        if msg.k[0] > 1.0 and msg.k[4] > 1.0:
+            self._wrist_K = (
+                float(msg.k[0]), float(msg.k[4]),
+                float(msg.k[2]), float(msg.k[5]),
+            )
+
+    def _wrist_intrinsics(self) -> Tuple[float, float, float, float]:
+        """fx, fy, cx, cy — prefer live camera_info over CLI focal + image center."""
+        w, h = self._wrist_image_wh()
+        if self._wrist_K is not None:
+            return self._wrist_K
+        f = float(getattr(self._args, 'wrist_focal_px', 488.0))
+        return f, f, 0.5 * w, 0.5 * h
 
     def _on_global_viz(self, msg: Image) -> None:
         rgb = self._image_to_rgb(msg)
         if rgb is not None:
             self._qa_rgb_global_viz = rgb
+            self._qa_global_viz_gen += 1
 
     def _on_fine_viz(self, msg: Image) -> None:
         rgb = self._image_to_rgb(msg)
         if rgb is not None:
             self._qa_rgb_fine_viz = rgb
+            self._qa_fine_viz_gen += 1
 
     def _snap_qa(self, tag: str) -> None:
         """Save raw camera frames for visual A/B (not algorithm overlays as truth)."""
@@ -283,6 +406,98 @@ class ReachFsmNode(Node):
             cv2.imwrite(path, cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
             saved.append(name)
         self.get_logger().info(f'QA snap {self._qa_session}/{tag}: {saved or "no frames yet"}')
+
+    def _snap_servo_motion_frame(self, *, force: bool = False) -> None:
+        """Record motion frames with a 10 Hz cap, skipping writes when no camera updated."""
+        import cv2  # type: ignore
+        if not self._qa_session:
+            return
+        interval = float(getattr(self._args, 'servo_motion_snap_s', 0.10))
+        now = time.time()
+        if not force and (now - self._servo_motion_last_t) < interval:
+            return
+        if (self._qa_rgb_wrist is None and self._qa_rgb_fine_viz is None
+                and self._qa_rgb_fixed is None and self._qa_rgb_global_viz is None):
+            return
+        gens = {
+            'wrist_gen': int(self._qa_wrist_gen),
+            'fine_viz_gen': int(self._qa_fine_viz_gen),
+            'fixed_gen': int(self._qa_fixed_gen),
+            'global_viz_gen': int(self._qa_global_viz_gen),
+        }
+        if not force and self._servo_motion_frames:
+            prev = self._servo_motion_frames[-1]
+            if all(int(prev.get(k, -1)) == v for k, v in gens.items()):
+                return
+        self._servo_motion_last_t = now
+        idx = len(self._servo_motion_frames)
+        tag = f'servo_{self._servo_step_idx:02d}_motion_{idx:02d}'
+        d = os.path.join(self._args.qa_dir, self._qa_session)
+        os.makedirs(d, exist_ok=True)
+        wrist_name = None
+        fine_name = None
+        fixed_name = None
+        global_name = None
+        if self._qa_rgb_wrist is not None:
+            wrist_name = f'{tag}_wrist.png'
+            cv2.imwrite(
+                os.path.join(d, wrist_name),
+                cv2.cvtColor(self._qa_rgb_wrist, cv2.COLOR_RGB2BGR))
+        if self._qa_rgb_fine_viz is not None:
+            fine_name = f'{tag}_fine_viz.png'
+            cv2.imwrite(
+                os.path.join(d, fine_name),
+                cv2.cvtColor(self._qa_rgb_fine_viz, cv2.COLOR_RGB2BGR))
+        if self._qa_rgb_fixed is not None:
+            fixed_name = f'{tag}_fixed.png'
+            cv2.imwrite(
+                os.path.join(d, fixed_name),
+                cv2.cvtColor(self._qa_rgb_fixed, cv2.COLOR_RGB2BGR))
+        if self._qa_rgb_global_viz is not None:
+            global_name = f'{tag}_global_viz.png'
+            cv2.imwrite(
+                os.path.join(d, global_name),
+                cv2.cvtColor(self._qa_rgb_global_viz, cv2.COLOR_RGB2BGR))
+        tcp = self._tcp_or_ee_xyz()
+        frame = {
+            'i': idx,
+            't': now,
+            'tag': tag,
+            'wrist': wrist_name,
+            'fine_viz': fine_name,
+            'fixed': fixed_name,
+            'global_viz': global_name,
+            **gens,
+            'joints_deg': {
+                'j1': math.degrees(self._joints[0]),
+                'j2': math.degrees(self._joints[1]),
+                'j3': math.degrees(self._joints[2]),
+                'j5': math.degrees(self._joints[4]),
+            },
+            'tcp_base': list(tcp) if tcp is not None else None,
+            'refine_phase': str(self._refine_phase),
+        }
+        self._servo_motion_frames.append(frame)
+        if idx == 0 or force or idx % 5 == 0:
+            self.get_logger().info(
+                f'QA motion {self._qa_session}/{tag} '
+                f'(n={len(self._servo_motion_frames)})')
+
+    def _qa_session_dir(self) -> Optional[str]:
+        if not self._qa_session:
+            return None
+        d = os.path.join(self._args.qa_dir, self._qa_session)
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def _write_qa_json(self, name: str, payload: Dict) -> Optional[str]:
+        d = self._qa_session_dir()
+        if d is None:
+            return None
+        path = os.path.join(d, name)
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, indent=2, ensure_ascii=True)
+        return path
 
     def _set_state(self, state: str, err: str = '') -> None:
         if state not in STATES:
@@ -341,37 +556,74 @@ class ReachFsmNode(Node):
             self._plan = None
             self._cancel_move()
             self._reset_align_loop()
+            self._reset_refine_state()
             self._set_state('IDLE')
             return
         if cmd == 'clear_lock':
             self._locked = None
-            if self._state in ('LOCKING', 'ALIGNING', 'REFINING', 'PLANNING'):
+            if self._state in ('LOCKING', 'ALIGNING', 'REFINING', 'REFINING_WAIT_NEAR', 'PLANNING'):
                 self._cancel_move()
                 self._reset_align_loop()
+                self._reset_refine_state()
                 self._set_state('IDLE')
             return
 
-        # Progress in-flight MoveIt / IK-align without blocking the executor.
+        # Progress in-flight MoveIt / IK-align / wrist servo without blocking.
+        # Keep confirm_near even while a premature/in-flight servo is running —
+        # otherwise WAIT_NEAR confirmation is popped and discarded.
         if self._move_phase is not None:
+            if cmd == 'confirm_near' and self._state == 'REFINING_WAIT_NEAR':
+                self._near_mode = True
+                self._freeze_near_berry()
+                self._refine_deadline = time.time() + max(
+                    45.0, float(self._args.refine_timeout_s) * 0.5)
+                self.get_logger().info(
+                    'REFINING near handoff confirmed (during motion) — '
+                    f'will continue after settle '
+                    f'(deadline +{self._refine_deadline - time.time():.0f}s)')
+                self._set_state('REFINING')
             if self._move_phase in ('align', 'align_step', 'align_rollback', 'align_settle'):
                 self._poll_align_motion()
+            elif self._move_phase in ('servo', 'servo_ik', 'servo_settle'):
+                self._poll_wrist_servo()
             else:
                 self._poll_move()
             return
 
         if self._state == 'IDLE':
+            if cmd == 'start_refine':
+                self._plan = None
+                self._cancel_move()
+                self._reset_align_loop()
+                self._servo_step_idx = 0
+                self._servo_orient_frac = None
+                self._servo_step_scale = 1.0
+                if not self._qa_session:
+                    self._qa_session = datetime.now().strftime('%Y%m%d_%H%M%S')
+                self._reached_pub.publish(Bool(data=False))
+                if self._locked is None and self._global is not None and self._global.berries:
+                    self._apply_region_lock(
+                        self._global.berries[0], source='start_refine region fallback')
+                self._refine_j1_anchor = float(self._joints[0])
+                self._refine_j5_anchor = float(self._joints[4])
+                self._enter_fine_after_coarse('start_refine from current (align) pose')
+                return
             if cmd == 'start':
                 self._locked = None
                 self._plan = None
                 self._cancel_move()
                 self._reset_align_loop()
+                self._lock_request_written = False
+                self._servo_step_idx = 0
+                self._servo_orient_frac = None
+                self._servo_step_scale = 1.0
                 self._qa_session = datetime.now().strftime('%Y%m%d_%H%M%S')
                 self._reached_pub.publish(Bool(data=False))
                 self._set_state('LOCKING')
             return
 
         if self._state == 'LOCKING':
-            if self._try_lock_global():
+            if self._tick_lock_region():
                 self._reset_align_loop()
                 self._set_state('ALIGNING')
             return
@@ -379,6 +631,8 @@ class ReachFsmNode(Node):
         if self._state == 'ALIGNING':
             if self._args.dry_run:
                 self.get_logger().info('dry-run: skip ALIGNING loop')
+                self._refine_j1_anchor = float(self._joints[0])
+                self._refine_j5_anchor = float(self._joints[4])
                 self._refine_deadline = time.time() + self._args.refine_timeout_s
                 self._set_state('REFINING')
                 return
@@ -387,45 +641,34 @@ class ReachFsmNode(Node):
             return
 
         if self._state == 'REFINING':
-            berry = self._pick_fine_berry()
-            if berry is not None:
-                self._locked = berry
-                self._lock_pub.publish(berry)
-                self._set_state('PLANNING')
-            elif time.time() > self._refine_deadline:
-                if self._locked is not None:
-                    self.get_logger().warn(
-                        'refine timeout — planning from global/coarse lock')
-                    self._set_state('PLANNING')
-                else:
-                    self._set_state('ERROR', 'refine timeout — no fine berry')
+            self._tick_wrist_servo_refine()
             return
 
-        if self._state == 'PLANNING':
-            if self._locked is None:
-                self._set_state('ERROR', 'no locked berry')
+        if self._state == 'REFINING_WAIT_NEAR':
+            if cmd == 'confirm_near':
+                self._near_mode = True
+                self._freeze_near_berry()
+                # Human confirm may take longer than mid-range servo budget.
+                self._refine_deadline = time.time() + max(
+                    45.0, float(self._args.refine_timeout_s) * 0.5)
+                self.get_logger().info(
+                    'REFINING near handoff confirmed — freeze berry, one-shot cup approach '
+                    f'(deadline +{self._refine_deadline - time.time():.0f}s)')
+                self._set_state('REFINING')
                 return
-            plan = self._build_plan(self._locked)
-            if plan is None:
-                self._set_state('ERROR', 'plan failed')
+            if cmd == 'abort':
+                self._cancel_move()
+                self._reset_refine_state()
+                self._set_state('IDLE')
                 return
-            self._plan = plan
-            self._plan_pub.publish(plan)
-            self._set_state('APPROACHING')
+            # Hold pose; user inspects near_handoff_pending QA snaps.
             return
 
-        if self._state == 'APPROACHING':
-            if self._args.dry_run:
-                self.get_logger().info('dry-run: skip MoveIt, pretend reached')
-                self._reached_pub.publish(Bool(data=True))
-                self._set_state('REACHED')
-                self._set_state('WAIT_CONFIRM')
-                return
-            if self._plan is None:
-                self._set_state('ERROR', 'no plan')
-                return
-            self._approach_step = 0
-            self._start_move(self._build_pose_goal(self._plan.pre_grasp, with_orient=False), 'pre')
+        # Legacy open-loop states: should not be entered on approved path.
+        if self._state in ('PLANNING', 'APPROACHING'):
+            self._set_state(
+                'ERROR',
+                'open-loop PLANNING/APPROACHING disabled — use wrist visual servo in REFINING')
             return
 
         if self._state == 'WAIT_CONFIRM':
@@ -494,14 +737,11 @@ class ReachFsmNode(Node):
                     'enable_agx_arm failed — check e-stop, teaching mode, or re-bringup')
                 return False
             return True
-        if self._align_visible_in_wrist():
-            self.get_logger().info('ALIGNING done: fine/wrist detector already sees target')
-            self._enter_fine_after_coarse('wrist detector already sees target')
-            return True
         if self._align_step_idx >= self._args.align_max_steps:
-            self.get_logger().warn('ALIGNING exhausted max steps without coarse_ok')
-            self._enter_fine_after_coarse('exhausted max align steps')
-            return True
+            self._set_state(
+                'ERROR',
+                'ALIGNING exhausted max steps without coarse_ok (no auto-refine)')
+            return False
 
         obs = self._collect_align_observation()
         phase = self._align_wait_phase
@@ -620,10 +860,701 @@ class ReachFsmNode(Node):
     def _enter_fine_after_coarse(self, reason: str) -> None:
         self.get_logger().info(f'ALIGNING → fine control ({reason})')
         self._refine_deadline = time.time() + self._args.refine_timeout_s
+        self._refine_j1_anchor = float(self._joints[0])
+        self._refine_j5_anchor = float(self._joints[4])
+        self._refine_j2_anchor = float(self._joints[1])
+        self._refine_j3_anchor = float(self._joints[2])
+        self._reset_refine_state(keep_anchors=True)
+        # Do NOT lock in the same tick as clear — fine_detector must reset BoT-SORT first.
+        self._refine_await_tracker_reset = True
+        self._refine_tracker_reset_t = time.time()
+        self._refine_tracker_reset_live_streak = 0
+        self._fine = None  # drop pre-clear cache so we cannot pin a stale tid
+        if 'start_refine' not in reason:
+            self._save_refine_entry_pose(source=reason)
+        self.get_logger().info(
+            f'REFINING anchors j1={math.degrees(self._refine_j1_anchor):.1f}deg '
+            f'j2={math.degrees(self._refine_j2_anchor):.1f}deg '
+            f'j3={math.degrees(self._refine_j3_anchor):.1f}deg '
+            f'j5={math.degrees(self._refine_j5_anchor):.1f}deg; '
+            f'near_handoff_z={float(self._args.servo_near_handoff_z):.2f}m '
+            f'fruit_assoc={float(self._args.refine_fruit_assoc_max_m):.2f}m '
+            f'lock_min_conf={float(self._args.refine_lock_min_conf):.2f} '
+            f'near_confirm={int(self._args.servo_near_confirm)}; '
+            f'await fine tracker reset before fruit lock')
         if self._args.align_only:
             self._set_state('WAIT_CONFIRM')
         else:
             self._set_state('REFINING')
+
+    def _clear_target_lock(self) -> None:
+        """Tell fine_detector to drop BoT-SORT pin / base_coast and reset tracker."""
+        self._refine_locked_track_id = None
+        self._refine_lock_sync_tid = None
+        self._refine_lock_sync_streak = 0
+        self._refine_lock_sync_deadline = 0.0
+        msg = DetectedBerry()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = self._args.base_frame
+        msg.track_id = -1
+        msg.confidence = 0.0
+        self._lock_pub.publish(msg)
+        # Force at least one republish so fine_detector always sees clear even if
+        # the previous lock was already cleared (same -1 payload).
+        self._lock_pub.publish(msg)
+
+    def _reset_refine_state(self, *, keep_anchors: bool = False) -> None:
+        self._servo_step_idx = 0
+        self._near_mode = False
+        self._near_handoff_written = False
+        self._near_frozen_berry = None
+        self._near_oneshot_sent = False
+        self._near_oneshot_attempts = 0
+        self._mono_probe_done = False
+        self._mono_probe_obs = []
+        self._mono_probe_purpose = 'center'
+        self._ee_uv_jac = None
+        self._center_probe_tri_ok = False
+        self._center_z_tri_m = None
+        self._center_z_mono_m = None
+        self._refine_phase = 'range_center'
+        self._depth_qa_stop_done = False
+        self._last_mono_chord_meta = None
+        self._range_depth_started = False
+        self._await_fresh_optical_until = 0.0
+        self._probe_tri_chord_applied = False
+        self._center_ok_streak = 0
+        self._center_oneshot_sent = False
+        self._center_oneshot_attempts = 0
+        self._center_last_cmd = None
+        self._center_live_replan_done = False
+        self._refine_fruit_anchor = None
+        self._refine_locked_track_id = None
+        self._refine_lock_sync_tid = None
+        self._refine_lock_sync_streak = 0
+        self._refine_lock_sync_deadline = 0.0
+        self._refine_await_tracker_reset = False
+        self._refine_tracker_reset_t = 0.0
+        self._refine_tracker_reset_live_streak = 0
+        self._refine_fine_lost_streak = 0
+        self._refine_lock_snap_pending = False
+        self._servo_pending_record = None
+        self._servo_ik_fail_n = 0
+        self._servo_ik_fail_t = 0.0
+        self._last_berry_base = None
+        self._last_z_cam = None
+        self._last_berry_t = 0.0
+        self._lock_wait_rec_t = 0.0
+        self._lock_wait_snap_t = 0.0
+        self._lock_wait_snap_idx = 0
+        self._clear_target_lock()
+        if not keep_anchors:
+            self._refine_j1_anchor = float(self._joints[0])
+            self._refine_j5_anchor = float(self._joints[4])
+            self._refine_j2_anchor = float(self._joints[1])
+            self._refine_j3_anchor = float(self._joints[2])
+
+    def _berry_depth_diag(self, berry: DetectedBerry) -> Dict:
+        mode = str(getattr(berry, 'depth_mode', '') or '')
+        z_d = float(getattr(berry, 'z_depth_m', -1.0))
+        z_m = float(getattr(berry, 'z_mono_m', -1.0))
+        return {
+            'depth_mode': mode,
+            'z_depth_m': z_d if z_d > 0.0 else None,
+            'z_mono_m': z_m if z_m > 0.0 else None,
+        }
+
+    def _berry_has_rgbd(self, berry: DetectedBerry) -> bool:
+        """True only when wrist RGB-D mask depth is valid (mono-only never qualifies)."""
+        return float(getattr(berry, 'z_depth_m', -1.0)) > 1e-4
+
+    def _berry_cam_range(self, berry: DetectedBerry) -> Optional[float]:
+        """Distance from wrist camera optical origin to berry (m)."""
+        cam = self._berry_cam_xyz(berry)
+        if cam is None or cam[2] <= 1e-4:
+            return None
+        return math.sqrt(cam[0] ** 2 + cam[1] ** 2 + cam[2] ** 2)
+
+    def _berry_cup_dist(self, berry: DetectedBerry) -> Optional[float]:
+        base = self._berry_base_xyz(berry)
+        tcp = self._tcp_or_ee_xyz()
+        if base is None or tcp is None:
+            return None
+        return math.sqrt(
+            (base[0] - tcp[0]) ** 2
+            + (base[1] - tcp[1]) ** 2
+            + (base[2] - tcp[2]) ** 2)
+
+    def _pick_nearest_fine_berry_by_cup(self) -> Optional[DetectedBerry]:
+        """REFINING entry lock: among conf≥min, pick nearest to wrist camera.
+
+        Pose Z comes from mono (bbox size); DaBai RGB-D on dark berries is
+        unreliable so we no longer require z_depth_m for lock ranking.
+        """
+        if self._fine is None or not self._fine.berries:
+            return None
+        if not self._fine_is_fresh():
+            self._fine = None
+            return None
+        min_conf = float(self._args.refine_lock_min_conf)
+        ranked: List[Tuple[float, DetectedBerry]] = []
+        skipped_low = 0
+        for b in self._fine.berries:
+            mode = str(getattr(b, 'depth_mode', '') or '')
+            # Never pin a ghost / coast-only ID at entry — wait for live YOLO.
+            if mode == 'base_coast':
+                continue
+            if float(b.confidence) < min_conf:
+                skipped_low += 1
+                continue
+            d_cam = self._berry_cam_range(b)
+            if d_cam is not None:
+                ranked.append((d_cam, b))
+        if not ranked:
+            if skipped_low > 0:
+                self.get_logger().info(
+                    f'REFINING: waiting for mono lock '
+                    f'(low_conf={skipped_low} min_conf={min_conf:.2f})')
+            return None
+        ranked.sort(key=lambda x: x[0])
+        return ranked[0][1]
+
+    def _record_lock_wait_conf(self) -> None:
+        """While waiting for lock: log all track confs + periodic fine_viz for threshold tuning."""
+        if not self._qa_session:
+            return
+        now = time.time()
+        last = float(getattr(self, '_lock_wait_rec_t', 0.0))
+        if now - last < 0.5:
+            return
+        self._lock_wait_rec_t = now
+        berries = []
+        if self._fine is not None and self._fine.berries and self._fine_is_fresh():
+            for b in self._fine.berries:
+                berries.append({
+                    'track_id': int(b.track_id),
+                    'confidence': float(b.confidence),
+                    'depth_mode': str(getattr(b, 'depth_mode', '') or ''),
+                    'z_mono_m': float(getattr(b, 'z_mono_m', -1.0)),
+                    'z_depth_m': float(getattr(b, 'z_depth_m', -1.0)),
+                })
+        berries.sort(key=lambda x: -x['confidence'])
+        best = berries[0]['confidence'] if berries else None
+        gate = float(self._args.refine_lock_min_conf)
+        idx = int(getattr(self, '_lock_wait_snap_idx', 0))
+        rec = {
+            't': now,
+            'iso': datetime.now().isoformat(timespec='seconds'),
+            'lock_min_conf': gate,
+            'n': len(berries),
+            'best_conf': best,
+            'would_lock': bool(best is not None and best >= gate),
+            'berries': berries,
+            'snap_idx': idx,
+        }
+        d = self._qa_session_dir()
+        if d:
+            path = os.path.join(d, 'lock_wait_conf.jsonl')
+            with open(path, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(rec, ensure_ascii=True) + '\n')
+        # Snap ~1 Hz for visual conf readout on overlays.
+        snap_last = float(getattr(self, '_lock_wait_snap_t', 0.0))
+        if now - snap_last >= 1.0:
+            self._lock_wait_snap_t = now
+            self._snap_qa(f'lock_wait_{idx:03d}')
+            self._lock_wait_snap_idx = idx + 1
+            self.get_logger().info(
+                f'REFINING lock_wait[{idx}]: best_conf='
+                f'{best if best is not None else -1:.3f} '
+                f'gate={gate:.2f} n={len(berries)} '
+                f'top={berries[:3]}')
+
+    def _init_refine_fruit_lock(self) -> None:
+        """Lock nearest-to-camera fine berry (mono pose) at REFINING entry."""
+        self._record_lock_wait_conf()
+        berry = self._pick_nearest_fine_berry_by_cup()
+        if berry is None:
+            self.get_logger().info(
+                'REFINING: waiting for fine berries + TCP at entry '
+                f'(min_conf={float(self._args.refine_lock_min_conf):.2f}, mono range)')
+            return
+        base = self._berry_base_xyz(berry)
+        if base is None:
+            return
+        dist_cup = self._berry_cup_dist(berry)
+        dist_cam = self._berry_cam_range(berry)
+        tid = int(berry.track_id)
+        self._refine_locked_track_id = tid if tid >= 0 else None
+        self._refine_fruit_anchor = base
+        self._last_berry_base = base
+        self._last_berry_t = time.time()
+        cam = self._berry_cam_xyz(berry)
+        if cam is not None and cam[2] > 1e-4:
+            self._last_z_cam = float(cam[2])
+        berry.track_id = tid
+        self._lock_pub.publish(berry)
+        self._refine_lock_sync_tid = tid if tid >= 0 else None
+        self._refine_lock_sync_streak = 0
+        self._refine_lock_sync_deadline = time.time() + 3.0
+        self.get_logger().info(
+            f'REFINING fruit lock (nearest cam, mono pose, '
+            f'conf>={float(self._args.refine_lock_min_conf):.2f}): '
+            f'track_id={tid} conf={berry.confidence:.2f} '
+            f'base=({base[0]:.3f},{base[1]:.3f},{base[2]:.3f}) '
+            f'cam_dist={(dist_cam if dist_cam is not None else -1):.3f} '
+            f'cup_dist={(dist_cup if dist_cup is not None else -1):.3f} '
+            f'z_cam={(self._last_z_cam if self._last_z_cam is not None else -1):.3f} '
+            f"mode={getattr(berry, 'depth_mode', '')} "
+            f"z_depth={float(getattr(berry, 'z_depth_m', -1)):.3f} "
+            f"z_mono={float(getattr(berry, 'z_mono_m', -1)):.3f}")
+        # Ensure session dir exists before lock JSON (snap may come one tick later).
+        if not self._qa_session:
+            self._qa_session = datetime.now().strftime('%Y%m%d_%H%M%S')
+        tcp = self._tcp_or_ee_xyz()
+        lock_payload: Dict = {
+            'timestamp': datetime.now().isoformat(timespec='seconds'),
+            'session': self._qa_session,
+            'track_id': tid,
+            'confidence': float(berry.confidence),
+            'lock_min_conf': float(self._args.refine_lock_min_conf),
+            'track_min_conf': float(getattr(self._args, 'refine_track_min_conf', 0.12)),
+            'berry_base': list(base),
+            'cam_dist': float(dist_cam) if dist_cam is not None else None,
+            'cup_dist': float(dist_cup) if dist_cup is not None else None,
+            'z_cam': float(self._last_z_cam) if self._last_z_cam is not None else None,
+            **self._berry_depth_diag(berry),
+            'tcp_base': list(tcp) if tcp is not None else None,
+            'joints_deg': [math.degrees(float(v)) for v in self._joints],
+            'anchors_deg': {
+                'j1': math.degrees(self._refine_j1_anchor),
+                'j2': math.degrees(self._refine_j2_anchor),
+                'j3': math.degrees(self._refine_j3_anchor),
+                'j5': math.degrees(self._refine_j5_anchor),
+            },
+        }
+        # Snapshot all visible tracks at lock (for choosing lock_min_conf).
+        if self._fine is not None and self._fine.berries:
+            lock_payload['candidates'] = [
+                {
+                    'track_id': int(b.track_id),
+                    'confidence': float(b.confidence),
+                    'depth_mode': str(getattr(b, 'depth_mode', '') or ''),
+                }
+                for b in sorted(
+                    self._fine.berries, key=lambda x: -float(x.confidence))
+            ]
+        if tcp is not None:
+            geo = self._cup_berry_geometry(base, tcp, berry_cam=cam)
+            lock_payload.update({
+                'berry_rel_cup': geo.get('berry_rel_cup'),
+                'berry_cam': geo.get('berry_cam'),
+                'cup_cam': geo.get('cup_cam'),
+                'berry_uv': geo.get('berry_uv'),
+                'cup_uv': geo.get('cup_uv'),
+            })
+            self._write_cup_rel_overlay('refine_fruit_lock', geo)
+        self._write_qa_json('refine_fruit_lock.json', lock_payload)
+        self._refine_lock_snap_pending = True
+
+    def _locked_track_live_synced(self) -> bool:
+        """Wait until fine_detector echoes the requested lock as a live non-base_coast track."""
+        tid = self._refine_lock_sync_tid
+        if tid is None or tid < 0:
+            return True
+        live = None
+        for b in self._live_fine_berries():
+            if int(b.track_id) == int(tid):
+                live = b
+                break
+        # Also look at coasted pin (not in _live_fine_berries) — but coast alone
+        # does not complete sync (see below).
+        if live is None and self._fine is not None and self._fine.berries:
+            for b in self._fine.berries:
+                if int(b.track_id) == int(tid):
+                    live = b
+                    break
+        if live is not None:
+            mode = str(getattr(live, 'depth_mode', '') or '')
+            # Ghost pin must not finish sync — probe rejects base_coast and would
+            # hang waiting for UV. Treat coast as not-yet-synced (timeout → re-pin).
+            if mode == 'base_coast':
+                self._refine_lock_sync_streak = 0
+            else:
+                self._refine_lock_sync_streak += 1
+                if self._refine_lock_sync_streak >= 3:
+                    self._refine_lock_sync_tid = None
+                    self._refine_lock_sync_deadline = 0.0
+                    self.get_logger().info(
+                        f'REFINING target_lock synced tid={tid} '
+                        f'mode={mode} '
+                        f'conf={float(live.confidence):.2f}')
+                    return True
+                return False
+        else:
+            self._refine_lock_sync_streak = 0
+        now = time.time()
+        if now - self._refine_wait_log_t > 1.0:
+            self._refine_wait_log_t = now
+            mode_hint = ''
+            if live is not None:
+                mode_hint = f' mode={getattr(live, "depth_mode", "")}'
+            self.get_logger().info(
+                f'REFINING waiting target_lock sync tid={tid}{mode_hint} '
+                f'(need live non-coast fine echo before probe)')
+        if self._refine_lock_sync_deadline > 0.0 and now > self._refine_lock_sync_deadline:
+            # Tracker ID churn: re-pin only near the locked berry / cup-aim.
+            # Never fall back to unconstrained cam-nearest (20260807_142705 latched
+            # a far edge box after fresh center lock).
+            neu = self._pick_sync_repin_candidate(old_tid=int(tid))
+            if neu is not None:
+                old = tid
+                new_tid = int(neu.track_id)
+                self._refine_locked_track_id = new_tid if new_tid >= 0 else None
+                self._lock_pub.publish(neu)
+                self._refine_lock_sync_tid = new_tid if new_tid >= 0 else None
+                self._refine_lock_sync_streak = 0
+                self._refine_lock_sync_deadline = time.time() + 3.0
+                base = self._berry_base_xyz(neu)
+                if base is not None:
+                    self._refine_fruit_anchor = base
+                    self._last_berry_base = base
+                    self._last_berry_t = time.time()
+                self.get_logger().warn(
+                    f'REFINING target_lock re-pin {old}→{new_tid} '
+                    f'(sync timeout; live mode={getattr(neu, "depth_mode", "")} '
+                    f'conf={float(neu.confidence):.2f} '
+                    f'phase={self._refine_phase})')
+                return False
+            # After center / near: keep frozen berry_base rather than ERROR on coast.
+            if self._last_berry_base is not None and (
+                self._refine_phase in ('range_depth', 'near', 'post_center')
+                or self._state == 'REFINING_WAIT_NEAR'
+                or self._near_mode
+                or self._near_frozen_berry is not None
+            ):
+                self.get_logger().warn(
+                    f'REFINING target_lock sync timeout tid={tid} '
+                    f'phase={self._refine_phase}/{self._state} — '
+                    f'keep frozen berry_base, skip live re-pin')
+                self._refine_lock_sync_tid = None
+                self._refine_lock_sync_deadline = 0.0
+                return True
+            why = self._fine_reject_reason()
+            self._set_state('ERROR', f'target_lock sync timeout tid={tid} — {why}')
+        return False
+
+    def _await_fine_tracker_reset_before_lock(self) -> bool:
+        """True when still waiting for fine BoT-SORT reset after clear_lock."""
+        if not self._refine_await_tracker_reset:
+            return False
+        now = time.time()
+        # Give fine_detector time to receive clear and reset_tracker().
+        if now - self._refine_tracker_reset_t < 0.25:
+            return True
+        live = self._live_fine_berries()
+        if live:
+            self._refine_tracker_reset_live_streak += 1
+        else:
+            self._refine_tracker_reset_live_streak = 0
+            self._record_lock_wait_conf()
+            if now - self._refine_wait_log_t > 1.0:
+                self._refine_wait_log_t = now
+                self.get_logger().info(
+                    'REFINING awaiting fine tracker reset '
+                    '(need live YOLO after clear_lock)')
+        if self._refine_tracker_reset_live_streak >= 3:
+            self._refine_await_tracker_reset = False
+            self.get_logger().info(
+                f'REFINING fine tracker reset OK — live_n={len(live)}; fruit lock')
+            self._init_refine_fruit_lock()
+            return self._refine_fruit_anchor is None
+        if now > self._refine_deadline:
+            self._set_state(
+                'ERROR',
+                'refine: fine tracker reset / live berry timeout after clear_lock')
+        return True
+
+    def _annotate_refine_event_wrist(
+        self,
+        rgb: object,
+        *,
+        source: str,
+        geo: Optional[Dict] = None,
+        berry: Optional[DetectedBerry] = None,
+    ) -> object:
+        """Draw control-source markers: YOLO fresh lock vs probe-tri reproject."""
+        import cv2  # type: ignore
+
+        img = rgb.copy()
+        h, w = img.shape[:2]
+        ox, oy = int(w * 0.5), int(h * 0.5)
+        cv2.drawMarker(
+            img, (ox, oy), (160, 160, 160),
+            markerType=cv2.MARKER_TILTED_CROSS, markerSize=20, thickness=2)
+        cv2.putText(
+            img, 'OPTICAL', (ox + 10, oy - 10),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (160, 160, 160), 1, cv2.LINE_AA)
+
+        live_yolo: List[Dict] = []
+        for b in self._live_fine_berries():
+            u, v = float(b.image_u), float(b.image_v)
+            if u < 0.0 or v < 0.0:
+                continue
+            live_yolo.append({
+                'track_id': int(b.track_id),
+                'u': u, 'v': v,
+                'conf': float(b.confidence),
+                'mode': str(getattr(b, 'depth_mode', '') or ''),
+            })
+            cv2.circle(img, (int(u), int(v)), 16, (255, 200, 0), 2, cv2.LINE_AA)
+            cv2.putText(
+                img, f'YOLO T{int(b.track_id)}', (int(u) + 14, int(v) - 6),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 200, 0), 1, cv2.LINE_AA)
+
+        berry_uv_yolo = None
+        if berry is not None and source.startswith('yolo'):
+            u, v = float(berry.image_u), float(berry.image_v)
+            if u >= 0.0 and v >= 0.0:
+                berry_uv_yolo = [u, v]
+                cv2.drawMarker(
+                    img, (int(u), int(v)), (80, 255, 120),
+                    markerType=cv2.MARKER_DIAMOND, markerSize=24, thickness=2)
+                cv2.rectangle(
+                    img, (int(u) - 28, int(v) - 28), (int(u) + 28, int(v) + 28),
+                    (80, 255, 120), 2, cv2.LINE_AA)
+                cv2.putText(
+                    img, f'FSM YOLO LOCK T{int(berry.track_id)}',
+                    (int(u) + 14, int(v) + 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (80, 255, 120), 2, cv2.LINE_AA)
+
+        berry_uv_reproject = None
+        pix_off = None
+        if geo is not None:
+            berry_uv = geo.get('berry_uv')
+            optical = geo.get('optical_uv')
+            if berry_uv is not None:
+                berry_uv_reproject = [float(berry_uv[0]), float(berry_uv[1])]
+                bu, bv = int(berry_uv[0]), int(berry_uv[1])
+                cv2.drawMarker(
+                    img, (bu, bv), (255, 80, 200),
+                    markerType=cv2.MARKER_STAR, markerSize=26, thickness=2)
+                cv2.putText(
+                    img, 'PROBE TRI 3D', (bu + 12, bv + 18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 80, 200), 2, cv2.LINE_AA)
+            if berry_uv is not None and optical is not None:
+                pix_off = math.hypot(
+                    float(berry_uv[0]) - float(optical[0]),
+                    float(berry_uv[1]) - float(optical[1]),
+                )
+                cv2.arrowedLine(
+                    img,
+                    (int(optical[0]), int(optical[1])),
+                    (int(berry_uv[0]), int(berry_uv[1])),
+                    (255, 80, 200), 2, tipLength=0.12)
+
+        z_txt = f'{self._last_z_cam:.3f}' if self._last_z_cam is not None else '?'
+        cv2.putText(
+            img, f'SOURCE: {source}', (8, 28),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (80, 255, 120), 2, cv2.LINE_AA)
+        cv2.putText(
+            img,
+            f'z_cam={z_txt}m  pix_off={(pix_off if pix_off is not None else -1):.1f}px  '
+            f'live_yolo={len(live_yolo)}',
+            (8, 54), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 200, 100), 1, cv2.LINE_AA)
+        cv2.putText(
+            img, 'grey=optical  green=YOLO lock  magenta=probe tri  yellow=live YOLO',
+            (8, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 200, 200), 1, cv2.LINE_AA)
+        return img, {
+            'source': source,
+            'track_id': int(berry.track_id) if berry is not None else None,
+            'berry_uv_yolo': berry_uv_yolo,
+            'berry_uv_reproject': berry_uv_reproject,
+            'optical_uv': [float(w * 0.5), float(h * 0.5)],
+            'pix_off_reproject': pix_off,
+            'live_yolo': live_yolo,
+            'z_cam_m': self._last_z_cam,
+            'fruit_anchor': list(self._refine_fruit_anchor or ()),
+        }
+
+    def _write_refine_event_meta(self, tag: str, meta: Dict) -> None:
+        if not self._qa_session:
+            return
+        meta = dict(meta)
+        meta['timestamp'] = datetime.now().isoformat(timespec='seconds')
+        meta['session'] = self._qa_session
+        meta['tag'] = tag
+        path = os.path.join(self._args.qa_dir, self._qa_session, f'{tag}_meta.json')
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(meta, f, indent=2, ensure_ascii=True)
+        except OSError as exc:
+            self.get_logger().warn(f'REFINING event meta write failed: {exc}')
+
+    def _snap_refine_lock_viz(
+        self, tag: str, *, source: str = '', berry: Optional[DetectedBerry] = None,
+    ) -> str:
+        """Annotated wrist (source markers) + optional fine detection_viz."""
+        import cv2  # type: ignore
+        import numpy as np  # type: ignore
+
+        self._snap_qa(tag)
+        if not self._qa_session:
+            return ''
+        sess_dir = os.path.join(self._args.qa_dir, self._qa_session)
+        tune_dir = os.path.join(os.path.dirname(os.path.abspath(self._args.qa_dir)), 'refine_tune_viz')
+        os.makedirs(tune_dir, exist_ok=True)
+
+        geo = None
+        if berry is not None and source.startswith('yolo'):
+            cam = self._berry_cam_xyz(berry)
+            tcp = self._tcp_or_ee_xyz()
+            if cam is not None and tcp is not None:
+                geo = self._cup_berry_geometry(
+                    (float(berry.pose.pose.position.x),
+                     float(berry.pose.pose.position.y),
+                     float(berry.pose.pose.position.z)),
+                    tcp,
+                )
+        elif 'probe_tri' in source or berry is None:
+            geo = self._reproject_berry_geo()
+
+        panels: List[Tuple[str, object]] = []
+        event_meta: Dict = {'source': source or tag}
+        if self._qa_rgb_wrist is not None:
+            ann, event_meta = self._annotate_refine_event_wrist(
+                self._qa_rgb_wrist, source=source or tag, geo=geo, berry=berry)
+            panels.append(('wrist annotated', ann))
+            cv2.imwrite(
+                os.path.join(sess_dir, f'{tag}_annotated.png'),
+                cv2.cvtColor(ann, cv2.COLOR_RGB2BGR))
+        if self._qa_rgb_fine_viz is not None:
+            panels.append(('BoT-SORT viz', self._qa_rgb_fine_viz))
+
+        if not panels:
+            return ''
+
+        self._write_refine_event_meta(tag, event_meta)
+
+        target_h = 480
+        resized: List[object] = []
+        for _, rgb in panels:
+            img = rgb
+            scale = target_h / float(img.shape[0])
+            w = max(1, int(img.shape[1] * scale))
+            resized.append(cv2.resize(img, (w, target_h)))
+
+        gap = np.ones((target_h, 10, 3), dtype=np.uint8) * 48
+        composite = resized[0]
+        for img in resized[1:]:
+            composite = np.hstack([composite, gap, img])
+
+        for i, (label, _) in enumerate(panels):
+            x0 = 12 if i == 0 else int(composite.shape[1] * i / len(panels)) + 12
+            cv2.putText(
+                composite, label, (x0, target_h - 14),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1, cv2.LINE_AA)
+
+        out_path = os.path.join(sess_dir, f'{tag}_sidebyside.png')
+        latest = os.path.join(tune_dir, 'latest_lock_sidebyside.png')
+        bgr = cv2.cvtColor(composite, cv2.COLOR_RGB2BGR)
+        cv2.imwrite(out_path, bgr)
+        cv2.imwrite(latest, bgr)
+        self.get_logger().info(
+            f'REFINING event viz ({source or tag}) → {out_path} (also {latest})')
+        return out_path
+
+    def _refine_entry_pose_path(self) -> str:
+        return os.path.join(
+            os.path.dirname(os.path.abspath(self._args.qa_dir)),
+            'refine_entry_pose.json')
+
+    def _save_refine_entry_pose(self, *, source: str) -> None:
+        path = self._refine_entry_pose_path()
+        payload = {
+            'timestamp': datetime.now().isoformat(timespec='seconds'),
+            'session': self._qa_session,
+            'source': source,
+            'joints_rad': [float(v) for v in self._joints[:6]],
+            'joints_deg': {
+                ARM_JOINTS[i]: math.degrees(float(self._joints[i]))
+                for i in range(min(6, len(self._joints)))
+            },
+            'fruit_anchor': list(self._refine_fruit_anchor or ()),
+        }
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = path + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, indent=2, ensure_ascii=True)
+            os.replace(tmp, path)
+            self.get_logger().info(
+                f'REFINING saved entry pose → {path} '
+                f'j=({math.degrees(self._joints[0]):.1f},'
+                f'{math.degrees(self._joints[1]):.1f},'
+                f'{math.degrees(self._joints[2]):.1f},'
+                f'{math.degrees(self._joints[4]):.1f})')
+        except Exception as exc:
+            self.get_logger().warn(f'REFINING could not save entry pose: {exc}')
+
+    def _pick_fine_berry_unanchored(self) -> Optional[DetectedBerry]:
+        """Legacy alias — entry lock uses nearest cup distance."""
+        return self._pick_nearest_fine_berry_by_cup()
+
+    def _filter_z_cam(self, z_cam: float) -> float:
+        """Reject single-frame depth spikes (wrong YOLO association)."""
+        last = self._last_z_cam
+        jump = float(self._args.refine_z_cam_max_jump_m)
+        if last is not None and jump > 0 and z_cam > last + jump:
+            self.get_logger().warn(
+                f'REFINING z_cam outlier {z_cam:.3f} vs last {last:.3f} — hold last')
+            return last
+        return z_cam
+
+    def _base_xyz_to_cam(
+        self, xyz: Tuple[float, float, float],
+    ) -> Optional[Tuple[float, float, float]]:
+        cam = self._args.wrist_camera_frame
+        try:
+            tf = self._tf_buffer.lookup_transform(
+                cam, self._args.base_frame, rclpy.time.Time())
+        except Exception:
+            return None
+        T = _matrix_from_tf(tf)
+        v = T @ np.array([xyz[0], xyz[1], xyz[2], 1.0], dtype=np.float64)
+        return float(v[0]), float(v[1]), float(v[2])
+
+    def _write_near_handoff_request(
+        self,
+        *,
+        dist_cup: Optional[float],
+        z_cam: Optional[float],
+        berry_age: float,
+    ) -> None:
+        d = os.path.join(self._args.qa_dir, self._qa_session or 'latest')
+        os.makedirs(d, exist_ok=True)
+        payload = {
+            'timestamp': datetime.now().isoformat(timespec='seconds'),
+            'state': 'REFINING_WAIT_NEAR',
+            'hint': (
+                'Inspect near_handoff_pending QA images. '
+                'If cup/berry geometry looks right for terminal approach, '
+                'run: ros2 topic pub --once /reach/cmd std_msgs/msg/String '
+                '"{data: confirm_near}"'
+            ),
+            'dist_cup_m': dist_cup,
+            'z_cam_m': z_cam,
+            'berry_age_s': berry_age,
+            'fruit_anchor': list(self._refine_fruit_anchor or ()),
+            'joints_deg': {
+                'joint1': math.degrees(self._joints[0]),
+                'joint2': math.degrees(self._joints[1]),
+                'joint3': math.degrees(self._joints[2]),
+                'joint5': math.degrees(self._joints[4]),
+            },
+        }
+        path = os.path.join(d, 'near_handoff_request.json')
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, indent=2, ensure_ascii=True)
 
     def _align_agent_hint(self, phase: str) -> str:
         if phase == 'judge':
@@ -749,9 +1680,10 @@ class ReachFsmNode(Node):
             with open(path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
         except Exception as exc:
-            self.get_logger().warn(f'ALIGNING decision file invalid: {exc}')
+            self.get_logger().error(f'ALIGNING decision file invalid: {exc}')
             self._consume_align_decision_file(path)
-            return {'action': 'coarse_ok', 'reason': 'invalid decision file', 'confidence': 0.0}
+            self._set_state('ERROR', f'invalid align decision file: {exc}')
+            return None
 
         if int(data.get('step_idx', -1)) != int(self._align_step_idx):
             return None
@@ -763,9 +1695,10 @@ class ReachFsmNode(Node):
         action = str(data.get('action', '')).strip().lower()
         allowed = set(ALIGN_ACTIONS) | {'restore_joints'}
         if action not in allowed:
-            self.get_logger().warn(f'ALIGNING decision action unsupported: {action!r}')
+            self.get_logger().error(f'ALIGNING decision action unsupported: {action!r}')
             self._consume_align_decision_file(path)
-            return {'action': 'coarse_ok', 'reason': 'unsupported decision action', 'confidence': 0.0}
+            self._set_state('ERROR', f'unsupported align action: {action}')
+            return None
 
         decision: Dict[str, object] = {
             'action': action,
@@ -822,6 +1755,7 @@ class ReachFsmNode(Node):
                 joint1_limit_deg=self._args.align_joint1_limit_deg,
                 joint5_min_rad=self._args.align_joint5_min_rad,
                 joint5_max_rad=self._args.align_joint5_max_rad,
+                joint6_limit_rad=self._args.align_joint6_limit_rad,
             )
         return apply_action_to_joints(
             action, self._joints, obs,
@@ -830,6 +1764,7 @@ class ReachFsmNode(Node):
             joint1_limit_deg=self._args.align_joint1_limit_deg,
             joint5_min_rad=self._args.align_joint5_min_rad,
             joint5_max_rad=self._args.align_joint5_max_rad,
+            joint6_limit_rad=self._args.align_joint6_limit_rad,
             face_plant_frac=self._args.align_face_plant_frac,
         )
 
@@ -1127,18 +2062,3966 @@ class ReachFsmNode(Node):
             f'full=({full[0]:.3f},{full[1]:.3f},{full[2]:.3f}) ee={self._args.ee_link}')
         return self._pose_xyzq(pose[:3], pose[3:])
 
-    def _try_lock_global(self) -> bool:
+    def _lock_region_decision_path(self) -> str:
+        d = os.path.join(self._args.qa_dir, self._qa_session or 'latest')
+        os.makedirs(d, exist_ok=True)
+        return os.path.join(d, 'lock_region_decision.json')
+
+    def _consume_lock_region_decision(self, path: str) -> None:
+        used = path + f'.used_{self._qa_session or "x"}'
+        try:
+            os.replace(path, used)
+        except Exception:
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+
+    def _global_region_candidates(self) -> List[DetectedBerry]:
         if self._global is None or not self._global.berries:
-            return False
+            return []
         berries = list(self._global.berries)
+        # Display order only — agent picks index; do not auto-swallow max conf.
         berries.sort(key=lambda b: (-float(b.confidence), abs(float(b.pose.pose.position.z))))
-        self._locked = berries[0]
-        self._lock_pub.publish(self._locked)
-        p = self._locked.pose.pose.position
+        return berries
+
+    def _write_lock_region_request(self, berries: List[DetectedBerry]) -> None:
+        d = os.path.join(self._args.qa_dir, self._qa_session or 'latest')
+        os.makedirs(d, exist_ok=True)
+        cands = []
+        for i, b in enumerate(berries):
+            p = b.pose.pose.position
+            cands.append({
+                'index': i,
+                'confidence': float(b.confidence),
+                'xyz': [float(p.x), float(p.y), float(p.z)],
+                'frame': b.pose.header.frame_id or b.header.frame_id,
+            })
+        payload = {
+            'timestamp': datetime.now().isoformat(timespec='seconds'),
+            'state': 'LOCKING',
+            'hint': (
+                'Pick a COLLECTION REGION (plant/cluster), not a single berry. '
+                'Write lock_region_decision.json with action=lock_region and index=N '
+                'from candidates (fixed mono QA image).'
+            ),
+            'candidates': cands,
+        }
+        path = os.path.join(d, 'lock_region_request.json')
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, indent=2, ensure_ascii=True)
+        self._snap_qa('lock_region')
+
+    def _apply_region_lock(self, berry: DetectedBerry, *, source: str) -> None:
+        self._locked = berry
+        self._lock_pub.publish(berry)
+        p = berry.pose.pose.position
         self.get_logger().info(
-            f'locked global berry conf={self._locked.confidence:.2f} '
-            f'pos=({p.x:.3f},{p.y:.3f},{p.z:.3f}) frame={self._locked.pose.header.frame_id}')
+            f'LOCK_REGION via {source}: conf={berry.confidence:.2f} '
+            f'pos=({p.x:.3f},{p.y:.3f},{p.z:.3f}) frame={berry.pose.header.frame_id}')
+
+    def _tick_lock_region(self) -> bool:
+        """Agent (file) or heuristic region lock before ALIGN. Returns True when locked."""
+        berries = self._global_region_candidates()
+        if not berries:
+            now = time.time()
+            if now - self._lock_wait_log_t > 2.0:
+                self._lock_wait_log_t = now
+                self.get_logger().info('LOCKING waiting for /perception/global/berries')
+            return False
+
+        if self._args.align_judge_mode != 'file':
+            self.get_logger().warn(
+                'LOCKING heuristic: auto index=0 (file/agent mode required for approved path)')
+            self._apply_region_lock(berries[0], source='heuristic_auto')
+            return True
+
+        if not self._lock_request_written:
+            self._write_lock_region_request(berries)
+            self._lock_request_written = True
+            self.get_logger().info(
+                f'LOCKING wrote lock_region_request.json n={len(berries)}; '
+                f'waiting for lock_region_decision.json')
+            return False
+
+        path = self._lock_region_decision_path()
+        if not os.path.exists(path):
+            now = time.time()
+            if now - self._lock_wait_log_t > 2.0:
+                self._lock_wait_log_t = now
+                self.get_logger().info(
+                    f'LOCKING waiting for decision file: {path} '
+                    f'(action=lock_region, index=N)')
+            return False
+
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as exc:
+            self._consume_lock_region_decision(path)
+            self._set_state('ERROR', f'invalid lock_region decision: {exc}')
+            return False
+
+        action = str(data.get('action', '')).strip().lower()
+        if action != 'lock_region':
+            self._consume_lock_region_decision(path)
+            self._set_state('ERROR', f'unsupported lock action: {action!r}')
+            return False
+
+        try:
+            idx = int(data.get('index', -1))
+        except (TypeError, ValueError):
+            idx = -1
+        # Refresh candidates in case detector updated.
+        berries = self._global_region_candidates()
+        if idx < 0 or idx >= len(berries):
+            self._consume_lock_region_decision(path)
+            self._set_state(
+                'ERROR',
+                f'lock_region index={idx} out of range n={len(berries)}')
+            return False
+
+        reason = str(data.get('reason', ''))
+        self._consume_lock_region_decision(path)
+        self._apply_region_lock(
+            berries[idx],
+            source=f'agent index={idx} reason={reason[:80]!r}')
         return True
+
+    def _berry_cam_xyz(
+        self, berry: DetectedBerry,
+    ) -> Optional[Tuple[float, float, float]]:
+        """Berry XYZ in wrist optical frame (for z_cam + pixel error)."""
+        p = berry.pose.pose.position
+        bf = (berry.pose.header.frame_id or berry.header.frame_id
+              or self._args.base_frame)
+        cam = self._args.wrist_camera_frame
+        try:
+            tf = self._tf_buffer.lookup_transform(cam, bf, rclpy.time.Time())
+        except Exception:
+            try:
+                tf = self._tf_buffer.lookup_transform(
+                    cam, self._args.base_frame, rclpy.time.Time())
+            except Exception:
+                return None
+        T = _matrix_from_tf(tf)
+        v = T @ np.array([float(p.x), float(p.y), float(p.z), 1.0], dtype=np.float64)
+        return float(v[0]), float(v[1]), float(v[2])
+
+    def _cup_cam_xyz(self) -> Optional[Tuple[float, float, float]]:
+        """Suction cup / TCP in wrist optical frame (image target ≠ optical center)."""
+        tcp = self._tcp_or_ee_xyz()
+        if tcp is None:
+            return None
+        return self._base_xyz_to_cam(tcp)
+
+    def _cup_axis_aim_uv(
+        self,
+        z_cam: Optional[float] = None,
+    ) -> Optional[Tuple[float, float]]:
+        """Image UV where a berry on the *cup axis* appears (not optical center).
+
+        Cup sits ~8 cm below the camera. Projecting the near-field cup point gives
+        an off-image UV; instead project the cup's lateral offset at the berry
+        depth: (u,v) = optical_center + f * cup_cam_xy / z_berry.
+        """
+        cup = self._cup_cam_xyz()
+        if cup is None:
+            return None
+        z = float(z_cam) if z_cam is not None and float(z_cam) > 1e-4 else float(cup[2])
+        if z <= 1e-4:
+            z = float(self._last_z_cam or 0.0)
+        if z <= 1e-4:
+            return None
+        fx, fy, cx, cy = self._wrist_intrinsics()
+        return (
+            cx + fx * float(cup[0]) / z,
+            cy + fy * float(cup[1]) / z,
+        )
+
+    def _aim_uv_for_center(
+        self,
+        z_cam: Optional[float] = None,
+    ) -> Tuple[float, float, str]:
+        """Preferred mid-range aim UV: cup-axis; fallback principal point."""
+        fx, fy, cx, cy = self._wrist_intrinsics()
+        optical = (cx, cy)
+        aim = self._cup_axis_aim_uv(z_cam)
+        if aim is None:
+            return optical[0], optical[1], 'optical_center'
+        return float(aim[0]), float(aim[1]), 'cup_axis'
+
+    def _cup_berry_geometry(
+        self,
+        berry_xyz: Tuple[float, float, float],
+        tcp: Tuple[float, float, float],
+        berry_cam: Optional[Tuple[float, float, float]] = None,
+    ) -> Dict:
+        """Berry relative to suction-cup center (base + cam + image pixels)."""
+        rel = (
+            float(berry_xyz[0] - tcp[0]),
+            float(berry_xyz[1] - tcp[1]),
+            float(berry_xyz[2] - tcp[2]),
+        )
+        dist = math.sqrt(rel[0] ** 2 + rel[1] ** 2 + rel[2] ** 2)
+        cup_cam = self._cup_cam_xyz()
+        if berry_cam is None:
+            berry_cam = self._base_xyz_to_cam(berry_xyz)
+        fx, fy, cx, cy = self._wrist_intrinsics()
+        wh = None
+        if self._qa_rgb_wrist is not None:
+            wh = (int(self._qa_rgb_wrist.shape[1]), int(self._qa_rgb_wrist.shape[0]))
+        w = wh[0] if wh else 640
+        h = wh[1] if wh else 480
+
+        def _uv(cam_xyz: Optional[Tuple[float, float, float]]):
+            if cam_xyz is None or cam_xyz[2] <= 1e-4:
+                return None
+            p = _project_cam_point(
+                cam_xyz[0], cam_xyz[1], cam_xyz[2], w, h, fx,
+                cx=cx, cy=cy, fx=fx, fy=fy)
+            return [float(p[0]), float(p[1])] if p is not None else None
+
+        return {
+            'berry_rel_cup': list(rel),
+            'dist_cup': float(dist),
+            'berry_cam': list(berry_cam) if berry_cam is not None else None,
+            'cup_cam': list(cup_cam) if cup_cam is not None else None,
+            'berry_uv': _uv(berry_cam),
+            'cup_uv': _uv(cup_cam),
+            'optical_uv': [cx, cy],
+            'aim_uv': list(self._aim_uv_for_center(
+                float(berry_cam[2]) if berry_cam is not None else None)[:2]),
+            'image_wh': [w, h],
+        }
+
+    def _write_cup_rel_overlay(self, tag: str, geo: Dict) -> None:
+        """Annotate wrist RGB: optical center / cup / berry + XY/XZ cup-relative sketch."""
+        import cv2  # type: ignore
+
+        if self._qa_rgb_wrist is None or not self._qa_session:
+            return
+        d = os.path.join(self._args.qa_dir, self._qa_session)
+        os.makedirs(d, exist_ok=True)
+        img = self._qa_rgb_wrist.copy()
+        h, w = img.shape[:2]
+        opt = geo.get('optical_uv') or [w * 0.5, h * 0.5]
+        ox, oy = float(opt[0]), float(opt[1])
+        # Principal point (grey)
+        cv2.drawMarker(img, (int(ox), int(oy)), (160, 160, 160),
+                       markerType=cv2.MARKER_TILTED_CROSS, markerSize=18, thickness=1)
+        aim_uv = geo.get('aim_uv')
+        if aim_uv is not None:
+            cv2.drawMarker(
+                img, (int(aim_uv[0]), int(aim_uv[1])), (0, 255, 0),
+                markerType=cv2.MARKER_CROSS, markerSize=22, thickness=2)
+        cup_uv = geo.get('cup_uv')
+        berry_uv = geo.get('berry_uv')
+        if cup_uv is not None:
+            cu, cv_ = int(cup_uv[0]), int(cup_uv[1])
+            cv2.drawMarker(img, (cu, cv_), (0, 220, 255),
+                           markerType=cv2.MARKER_CROSS, markerSize=28, thickness=2)
+            cv2.circle(img, (cu, cv_), 10, (0, 220, 255), 1, cv2.LINE_AA)
+            cv2.putText(img, 'CUP', (cu + 12, cv_ - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 220, 255), 1, cv2.LINE_AA)
+        if berry_uv is not None:
+            bu, bv = int(berry_uv[0]), int(berry_uv[1])
+            cv2.drawMarker(img, (bu, bv), (255, 80, 200),
+                           markerType=cv2.MARKER_DIAMOND, markerSize=22, thickness=2)
+            cv2.putText(img, 'BERRY', (bu + 12, bv + 16),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 80, 200), 1, cv2.LINE_AA)
+        if cup_uv is not None and berry_uv is not None:
+            cv2.arrowedLine(
+                img, (int(cup_uv[0]), int(cup_uv[1])),
+                (int(berry_uv[0]), int(berry_uv[1])),
+                (80, 255, 120), 2, tipLength=0.12)
+        dist = geo.get('dist_cup')
+        rel = geo.get('berry_rel_cup') or [0, 0, 0]
+        z_cam = geo.get('z_cam_m')
+        travel = geo.get('travel_m')
+        depth_src = geo.get('depth_source')
+        line1 = (
+            f'cup->berry dist={dist:.3f}m  rel=({rel[0]:+.3f},{rel[1]:+.3f},{rel[2]:+.3f})'
+            if dist is not None else 'cup->berry ?')
+        cv2.putText(
+            img, line1,
+            (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (80, 255, 120), 2, cv2.LINE_AA)
+        if z_cam is not None or travel is not None or depth_src:
+            line2 = (
+                f'z_cam={(z_cam if z_cam is not None else -1):.3f}m  '
+                f'travel={(travel if travel is not None else -1):.3f}m  '
+                f'src={depth_src or "?"}')
+            cv2.putText(
+                img, line2,
+                (8, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 100), 2, cv2.LINE_AA)
+        cv2.putText(
+            img, 'grey=optical  cyan=CUP  magenta=BERRY',
+            (8, h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
+        path = os.path.join(d, f'{tag}_cup_overlay.png')
+        cv2.imwrite(path, cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+
+        # Schematic: berry in cup frame (cup at origin), XY top + XZ side
+        sketch = np.zeros((360, 520, 3), dtype=np.uint8)
+        sketch[:] = (28, 32, 40)
+        scale = 400.0  # px per meter
+        cx0, cy_xy = 130, 180
+        cx1, cy_xz = 390, 180
+
+        def _draw_panel(cx: int, cy: int, title: str, px: float, py: float, xlab: str, ylab: str):
+            cv2.putText(sketch, title, (cx - 50, 28),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
+            cv2.line(sketch, (cx - 90, cy), (cx + 90, cy), (60, 70, 90), 1)
+            cv2.line(sketch, (cx, cy - 90), (cx, cy + 90), (60, 70, 90), 1)
+            cv2.drawMarker(sketch, (cx, cy), (0, 220, 255),
+                           markerType=cv2.MARKER_CROSS, markerSize=14, thickness=2)
+            cv2.putText(sketch, 'CUP', (cx + 8, cy - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 220, 255), 1, cv2.LINE_AA)
+            bx = int(cx + px * scale)
+            by = int(cy - py * scale)
+            bx = max(cx - 95, min(cx + 95, bx))
+            by = max(cy - 95, min(cy + 95, by))
+            cv2.arrowedLine(sketch, (cx, cy), (bx, by), (80, 255, 120), 2, tipLength=0.15)
+            cv2.drawMarker(sketch, (bx, by), (255, 80, 200),
+                           markerType=cv2.MARKER_DIAMOND, markerSize=12, thickness=2)
+            cv2.putText(sketch, xlab, (cx + 70, cy + 14),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (140, 140, 140), 1, cv2.LINE_AA)
+            cv2.putText(sketch, ylab, (cx + 4, cy - 78),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (140, 140, 140), 1, cv2.LINE_AA)
+
+        _draw_panel(cx0, cy_xy, 'base XY (top)', rel[0], rel[1], '+X', '+Y')
+        _draw_panel(cx1, cy_xz, 'base XZ (side)', rel[0], rel[2], '+X', '+Z')
+        cv2.putText(
+            sketch,
+            f'|r|={dist:.3f}m  r=({rel[0]:+.3f},{rel[1]:+.3f},{rel[2]:+.3f})'
+            if dist is not None else '',
+            (16, 340), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 220, 180), 1, cv2.LINE_AA)
+        cv2.imwrite(
+            os.path.join(d, f'{tag}_cup_rel.png'),
+            cv2.cvtColor(sketch, cv2.COLOR_RGB2BGR))
+
+    def _wrist_image_wh(self) -> Tuple[int, int]:
+        if self._qa_rgb_wrist is not None:
+            h, w = self._qa_rgb_wrist.shape[:2]
+            return int(w), int(h)
+        return 640, 480
+
+    def _center_aim_cam_xy(
+        self, berry_cam: Tuple[float, float, float],
+    ) -> Tuple[float, float, str]:
+        """In-FOV aim for mid-range centering (cam xy at berry depth).
+
+        Cup often projects below the 480p frame (~v=700+). Using that aim makes
+        pix_err stick ~500–600px and falsely looks 'never centered'. Mid-range
+        therefore aims at the optical axis so the berry stays trackable; cup-axis
+        alignment happens naturally as we approach after depth is trusted.
+        """
+        cx, cy, cz = berry_cam
+        if cz <= 1e-4:
+            return 0.0, 0.0, 'optical'
+        cup = self._cup_cam_xyz()
+        if cup is not None and cup[2] > 1e-4:
+            ax = float(cup[0] * cz / cup[2])
+            ay = float(cup[1] * cz / cup[2])
+            f = float(self._args.wrist_focal_px)
+            w, h = self._wrist_image_wh()
+            u = f * ax / cz + 0.5 * w
+            v = f * ay / cz + 0.5 * h
+            margin = 20.0
+            if margin <= u < w - margin and margin <= v < h - margin:
+                return ax, ay, 'cup'
+        return 0.0, 0.0, 'optical'
+
+    def _servo_image_error_px(
+        self, cam_xyz: Tuple[float, float, float],
+    ) -> Optional[float]:
+        """Pixel error of berry vs in-FOV aim (cup if visible, else optical)."""
+        x, y, z = cam_xyz
+        if z <= 1e-4:
+            return None
+        f = float(self._args.wrist_focal_px)
+        w, h = self._wrist_image_wh()
+        bu = f * x / z + 0.5 * w
+        bv = f * y / z + 0.5 * h
+        ax, ay, _ = self._center_aim_cam_xy(cam_xyz)
+        tu = f * ax / z + 0.5 * w
+        tv = f * ay / z + 0.5 * h
+        return math.hypot(bu - tu, bv - tv)
+
+    def _cam_angular_errors(
+        self, cam_xyz: Tuple[float, float, float],
+    ) -> Tuple[float, float]:
+        """Angular error of berry relative to in-FOV aim (cup or optical)."""
+        cx, cy, cz = cam_xyz
+        if cz <= 1e-4:
+            return 0.0, 0.0
+        ax, ay, _ = self._center_aim_cam_xy(cam_xyz)
+        return (
+            math.atan2(cx, cz) - math.atan2(ax, cz),
+            math.atan2(cy, cz) - math.atan2(ay, cz),
+        )
+
+    def _ibvs_reach_scale(
+        self,
+        pix_err: Optional[float],
+        *,
+        lost_streak: int = 0,
+    ) -> float:
+        """Approach scale after centering: 0 while off-center, full when tight."""
+        if self._refine_phase == 'center':
+            return 0.0
+        min_s = float(self._args.servo_ibvs_reach_min_scale)
+        min_s = max(0.0, min(1.0, min_s))
+        if lost_streak >= 5:
+            return 0.5 * min_s
+        pix_tol = float(self._args.servo_ibvs_reach_pix_px)
+        pix_soft = float(self._args.servo_ibvs_reach_pix_soft_px)
+        if pix_err is None:
+            return max(min_s, 0.45)
+        if pix_err <= pix_tol:
+            return 1.0
+        if pix_err >= pix_soft:
+            return min_s
+        t = (pix_err - pix_tol) / max(pix_soft - pix_tol, 1.0)
+        return 1.0 - t * (1.0 - min_s)
+
+    def _cam_delta_to_base(
+        self, d_cam: Tuple[float, float, float],
+    ) -> Optional[Tuple[float, float, float]]:
+        T = self._lookup_T_base_cam()
+        if T is None:
+            return None
+        v = T[:3, :3] @ np.array(
+            [float(d_cam[0]), float(d_cam[1]), float(d_cam[2])], dtype=np.float64)
+        return float(v[0]), float(v[1]), float(v[2])
+
+    def _image_ready_for_near_handoff(
+        self,
+        pix_err: Optional[float],
+        err_yaw: float,
+        err_pitch: float,
+    ) -> bool:
+        """cup + image centered before near handoff."""
+        pix_gate = float(self._args.servo_near_pix_tol_px)
+        ang_gate = math.radians(float(self._args.servo_near_ang_tol_deg))
+        dead = math.radians(float(self._args.servo_ang_deadband_deg))
+        if pix_err is not None and pix_err <= pix_gate:
+            return True
+        if abs(err_yaw) <= max(dead, ang_gate) and abs(err_pitch) <= max(dead, ang_gate):
+            return True
+        return False
+
+    def _tcp_or_ee_xyz(self) -> Optional[Tuple[float, float, float]]:
+        """Suction-cup / TCP position in base (prefer /feedback/tcp_pose)."""
+        if self._tcp_pose is not None:
+            p = self._tcp_pose.pose.position
+            return float(p.x), float(p.y), float(p.z)
+        ee = self._current_ee_pose()
+        if ee is None:
+            return None
+        p = ee.pose.position
+        return float(p.x), float(p.y), float(p.z)
+
+    def _berry_base_xyz(self, berry: DetectedBerry) -> Optional[Tuple[float, float, float]]:
+        """Berry XYZ in base_frame."""
+        p = berry.pose.pose.position
+        bf = (berry.pose.header.frame_id or berry.header.frame_id
+              or self._args.base_frame)
+        if bf == self._args.base_frame or bf.endswith('/' + self._args.base_frame):
+            return float(p.x), float(p.y), float(p.z)
+        try:
+            tf = self._tf_buffer.lookup_transform(
+                self._args.base_frame, bf, rclpy.time.Time())
+        except Exception:
+            return float(p.x), float(p.y), float(p.z)
+        T = _matrix_from_tf(tf)
+        v = T @ np.array([float(p.x), float(p.y), float(p.z), 1.0], dtype=np.float64)
+        return float(v[0]), float(v[1]), float(v[2])
+
+    def _remember_berry(self, berry: DetectedBerry, z_cam: Optional[float]) -> None:
+        base = self._berry_base_xyz(berry)
+        if base is None:
+            return
+        mode = str(getattr(berry, 'depth_mode', '') or '')
+        # Ghost lock after BoT-SORT loss — never update mid-range pose from this.
+        if mode == 'base_coast':
+            return
+        # Pixel-coast without 3D update is still skipped; mono / depth / iou_pin OK.
+        if mode in ('coast',) and not self._berry_has_rgbd(berry):
+            # 'coast' here means prior blend in cam frame without fresh measure —
+            # still allow if z_mono present (mono scheme).
+            if float(getattr(berry, 'z_mono_m', -1.0)) <= 1e-4:
+                self.get_logger().debug(
+                    f'REFINING skip remember mode={mode} '
+                    f'z_d={float(getattr(berry, "z_depth_m", -1)):.3f} '
+                    f'z_m={float(getattr(berry, "z_mono_m", -1)):.3f}')
+                return
+        # Reject ID-swap jumps while a refine lock is active.
+        if self._last_berry_base is not None and self._refine_locked_track_id is not None:
+            jump = math.sqrt(
+                (base[0] - self._last_berry_base[0]) ** 2
+                + (base[1] - self._last_berry_base[1]) ** 2
+                + (base[2] - self._last_berry_base[2]) ** 2)
+            max_jump = float(getattr(self._args, 'refine_track_max_jump_m', 0.08))
+            if jump > max_jump:
+                self.get_logger().warn(
+                    f'REFINING reject track jump {jump:.3f}m > {max_jump:.3f}m '
+                    f'(keep last base; tid={int(berry.track_id)})')
+                return
+        self._last_berry_base = base
+        self._last_berry_t = time.time()
+        if z_cam is not None:
+            self._last_z_cam = float(z_cam)
+
+    def _cup_berry_dist(self) -> Optional[float]:
+        b = self._near_frozen_berry if self._near_mode and self._near_frozen_berry else (
+            self._last_berry_base)
+        if b is None:
+            return None
+        tcp = self._tcp_or_ee_xyz()
+        if tcp is None:
+            return None
+        return math.sqrt(
+            (b[0] - tcp[0]) ** 2 + (b[1] - tcp[1]) ** 2 + (b[2] - tcp[2]) ** 2)
+
+    def _freeze_near_berry(self) -> None:
+        """Pin 3D target for near handoff — no further wrist re-association."""
+        if self._near_frozen_berry is not None:
+            return
+        # Absorb mid-range center residual: rebuild berry on live UV ray first.
+        self._refresh_berry_from_live_for_contact(reason='near_freeze')
+        if self._last_berry_base is None:
+            return
+        self._near_frozen_berry = tuple(self._last_berry_base)
+        self._near_oneshot_sent = False
+        self._near_oneshot_attempts = 0
+        b = self._near_frozen_berry
+        self.get_logger().info(
+            f'REFINING freeze near berry=({b[0]:.3f},{b[1]:.3f},{b[2]:.3f}) '
+            f'tid={self._refine_locked_track_id}')
+
+    def _update_berry_from_live_uv(
+        self,
+        *,
+        uv: Tuple[float, float],
+        z_cam: Optional[float] = None,
+        berry: Optional[DetectedBerry] = None,
+        reason: str = '',
+    ) -> bool:
+        """Replace last_berry_base with cam ray through live UV at z (mono/depth).
+
+        Used after center oneshot residual and before near freeze so contact
+        oneshot aims the *seen* berry, not the wrong-depth probe ray.
+        """
+        fx, fy, cx, cy = self._wrist_intrinsics()
+        z: Optional[float] = float(z_cam) if z_cam is not None else None
+        if z is None or z <= 1e-4:
+            if berry is not None:
+                z = float(getattr(berry, 'z_mono_m', -1.0))
+                if z <= 1e-4:
+                    z = float(getattr(berry, 'z_depth_m', -1.0))
+                if z <= 1e-4:
+                    cam_b = self._berry_cam_xyz(berry)
+                    if cam_b is not None and cam_b[2] > 1e-4:
+                        z = float(cam_b[2])
+            if (z is None or z <= 1e-4) and self._last_z_cam:
+                z = float(self._last_z_cam)
+        if z is None or z <= 1e-4:
+            return False
+        cam = (
+            (float(uv[0]) - cx) / fx * float(z),
+            (float(uv[1]) - cy) / fy * float(z),
+            float(z),
+        )
+        T = self._lookup_T_base_cam()
+        if T is None:
+            return False
+        p = T[:3, :3] @ np.array(cam, dtype=np.float64) + T[:3, 3]
+        base = (float(p[0]), float(p[1]), float(p[2]))
+        self._last_berry_base = base
+        self._refine_fruit_anchor = base
+        self._last_z_cam = float(z)
+        self._last_berry_t = time.time()
+        # Allow a later freeze to pick up the new base.
+        self._near_frozen_berry = None
+        self.get_logger().info(
+            f'REFINING berry←live_uv ({reason}) '
+            f'uv=({float(uv[0]):.0f},{float(uv[1]):.0f}) z={float(z):.3f} '
+            f'base=({base[0]:.3f},{base[1]:.3f},{base[2]:.3f})')
+        return True
+
+    def _correct_berry_3d_from_fresh_lock(
+        self,
+        neu: DetectedBerry,
+        *,
+        reason: str,
+    ) -> Tuple[bool, str]:
+        """Rebuild berry_base from fresh-lock UV — never trust YOLO pose XYZ alone."""
+        uv = self._berry_image_uv(neu)
+        if uv is None:
+            return False, 'no_uv'
+        cam = self._berry_cam_xyz(neu)
+        z_est, z_src = self._reestimate_z_on_live_uv(
+            uv=(float(uv[0]), float(uv[1])),
+            berry=neu,
+            cam=cam,
+        )
+        if z_est is None and cam is not None and cam[2] > 1e-4:
+            z_est, z_src = float(cam[2]), 'fresh_cam'
+        if z_est is None:
+            return False, 'no_z'
+        ok = self._update_berry_from_live_uv(
+            uv=(float(uv[0]), float(uv[1])),
+            z_cam=float(z_est),
+            berry=neu,
+            reason=f'{reason}_{z_src}',
+        )
+        return ok, z_src
+
+    def _refresh_berry_from_live_for_contact(self, *, reason: str) -> bool:
+        """If a live box is near cup-aim, rebuild berry_base on that UV ray."""
+        max_pix = max(
+            float(getattr(self._args, 'servo_center_pix_tol_px', 35.0)),
+            float(getattr(self._args, 'refine_fresh_lock_max_pix_px', 80.0)),
+        )
+        fresh_min = float(getattr(self._args, 'refine_fresh_lock_min_conf', 0.10))
+        live = self._pick_live_nearest_optical(max_pix=max_pix, min_conf=fresh_min)
+        if live is None:
+            return False
+        uv = self._berry_image_uv(live)
+        if uv is None:
+            return False
+        cam = self._berry_cam_xyz(live)
+        z = float(cam[2]) if cam is not None and cam[2] > 1e-4 else None
+        return self._update_berry_from_live_uv(
+            uv=(float(uv[0]), float(uv[1])),
+            z_cam=z,
+            berry=live,
+            reason=reason,
+        )
+
+    def _fixed_mono_yaw_err(self) -> Optional[float]:
+        """Plant/berry yaw − j1 from fixed mono global or last estimate."""
+        plant = None
+        if self._global is not None and self._global.berries:
+            plant = max(self._global.berries, key=lambda b: float(b.confidence))
+        if plant is not None:
+            base = self._berry_base_xyz(plant)
+            if base is not None:
+                return math.atan2(base[1], base[0]) - float(self._joints[0])
+        if self._last_berry_base is not None:
+            bx, by, _ = self._last_berry_base
+            return math.atan2(by, bx) - float(self._joints[0])
+        return None
+
+    def _lookup_T_base_cam(self) -> Optional[np.ndarray]:
+        cam = self._args.wrist_camera_frame
+        try:
+            tf = self._tf_buffer.lookup_transform(
+                self._args.base_frame, cam, rclpy.time.Time())
+        except Exception:
+            return None
+        return _matrix_from_tf(tf)
+
+    def _berry_uv_from_cam(
+        self, cam_xyz: Tuple[float, float, float],
+    ) -> Optional[Tuple[float, float]]:
+        if cam_xyz[2] <= 1e-4:
+            return None
+        fx, fy, cx, cy = self._wrist_intrinsics()
+        w, h = self._wrist_image_wh()
+        p = _project_cam_point(
+            cam_xyz[0], cam_xyz[1], cam_xyz[2], w, h, fx,
+            cx=cx, cy=cy, fx=fx, fy=fy)
+        if p is None:
+            return None
+        return float(p[0]), float(p[1])
+
+    def _berry_image_uv(self, berry: DetectedBerry) -> Optional[Tuple[float, float]]:
+        """Prefer detector bbox center (image_u/v); fallback to mono cam projection."""
+        try:
+            iu = float(getattr(berry, 'image_u', -1.0))
+            iv = float(getattr(berry, 'image_v', -1.0))
+        except (TypeError, ValueError):
+            iu, iv = -1.0, -1.0
+        if iu >= 0.0 and iv >= 0.0:
+            return iu, iv
+        cam = self._berry_cam_xyz(berry)
+        if cam is None:
+            return None
+        return self._berry_uv_from_cam(cam)
+
+    def _capture_mono_probe_obs(self) -> Optional[Dict]:
+        """One view: cam pose + berry ray UV. Live bbox only — never base_coast."""
+        berry = self._pick_probe_live_berry()
+        cam = None
+        z_mono = None
+        mode = ''
+        tid = -1
+        conf = 0.0
+        uv_img: Optional[Tuple[float, float]] = None
+        if berry is not None:
+            tid = int(berry.track_id)
+            conf = float(berry.confidence)
+            mode = str(getattr(berry, 'depth_mode', '') or '')
+            # Probe views: reject ghost / ID swap. After lock, only need a live
+            # box on the locked id — do NOT reuse refine_lock_min_conf (entry gate).
+            if mode == 'base_coast':
+                return None
+            if (
+                self._refine_locked_track_id is not None
+                and tid != int(self._refine_locked_track_id)
+            ):
+                self.get_logger().warn(
+                    f'REFINING mono probe: skip tid={tid} ≠ lock='
+                    f'{self._refine_locked_track_id}')
+                return None
+            track_min = float(getattr(self._args, 'refine_track_min_conf', 0.12))
+            if conf < track_min:
+                now = time.time()
+                if now - self._refine_wait_log_t > 1.0:
+                    self._refine_wait_log_t = now
+                    self.get_logger().warn(
+                        f'REFINING mono probe: skip low conf={conf:.2f} '
+                        f'< track_min={track_min:.2f} (lock gate separate)')
+                return None
+            cam = self._berry_cam_xyz(berry)
+            z_mono = float(getattr(berry, 'z_mono_m', -1.0))
+            uv_img = self._berry_image_uv(berry)
+            if not self._near_mode and cam is not None and cam[2] > 1e-4:
+                self._remember_berry(berry, float(cam[2]))
+        if cam is None or cam[2] <= 1e-4:
+            return None
+        uv = uv_img or self._berry_uv_from_cam(cam)
+        if uv is None:
+            return None
+        # Continuity vs previous probe obs (wrong scene / wrong berry → abort).
+        if self._mono_probe_obs:
+            prev = self._mono_probe_obs[-1]
+            duv = math.hypot(uv[0] - prev['uv'][0], uv[1] - prev['uv'][1])
+            max_duv = float(getattr(self._args, 'servo_mono_probe_max_duv_px', 90.0))
+            if duv > max_duv:
+                self.get_logger().error(
+                    f'REFINING mono probe: UV jump {duv:.0f}px > {max_duv:.0f} '
+                    f'(prev={prev["uv"]} now={list(uv)}) — likely wrong detection, abort')
+                self._mono_probe_done = True
+                self._set_state(
+                    'ERROR',
+                    f'mono probe UV jump {duv:.0f}px — keep camera on plant')
+                return None
+        T = self._lookup_T_base_cam()
+        if T is None:
+            return None
+        tcp = self._tcp_or_ee_xyz()
+        ee = self._current_ee_pose()
+        ee_xyz = None
+        if ee is not None:
+            ee_xyz = [
+                float(ee.pose.position.x),
+                float(ee.pose.position.y),
+                float(ee.pose.position.z),
+            ]
+        # Explicit mono-ray base point matching this UV+cam (not a stale freeze).
+        cam_v = np.array(
+            [float(cam[0]), float(cam[1]), float(cam[2])], dtype=np.float64)
+        p_base = T[:3, :3] @ cam_v + T[:3, 3]
+        berry_base_est = [float(p_base[0]), float(p_base[1]), float(p_base[2])]
+        return {
+            'uv': [float(uv[0]), float(uv[1])],
+            'uv_from_bbox': bool(uv_img is not None),
+            'cam_xyz': [float(cam[0]), float(cam[1]), float(cam[2])],
+            'z_mono': float(z_mono) if z_mono is not None and z_mono > 0 else float(cam[2]),
+            'mode': mode,
+            'track_id': tid,
+            'confidence': conf,
+            'T_base_cam': T.tolist(),
+            'tcp_base': list(tcp) if tcp is not None else None,
+            'ee_xyz': ee_xyz,
+            'berry_base_est': berry_base_est,
+            'joints_rad': [float(v) for v in self._joints[:6]],
+            't': time.time(),
+        }
+
+    def _update_ee_uv_jac_from_delta(
+        self,
+        uv0,
+        T0,
+        uv1,
+        T1,
+        *,
+        tag: str = 'probe',
+        merge: bool = True,
+    ) -> Optional[Dict[str, float]]:
+        """Online calib: small-step camera/EE Cartesian move → ΔUV.
+
+        Records how cam-frame translation (dx,dy) moved the berry in the image.
+        Center oneshot uses aim_uv_ik (5-DOF UV+depth); Jac remains for QA.
+        """
+        if uv0 is None or uv1 is None or T0 is None or T1 is None:
+            return None
+        T0a = np.asarray(T0, dtype=np.float64)
+        T1a = np.asarray(T1, dtype=np.float64)
+        if T0a.shape != (4, 4) or T1a.shape != (4, 4):
+            return None
+        R0 = T0a[:3, :3]
+        dp_base = T1a[:3, 3] - T0a[:3, 3]
+        dp_cam = R0.T @ dp_base
+        dx, dy, dz = float(dp_cam[0]), float(dp_cam[1]), float(dp_cam[2])
+        du = float(uv1[0]) - float(uv0[0])
+        dv = float(uv1[1]) - float(uv0[1])
+        min_d = 0.0025
+        min_duv = 2.5
+        jac: Dict[str, float] = {
+            'du': du, 'dv': dv,
+            'dx_cam': dx, 'dy_cam': dy, 'dz_cam': dz,
+            'dp_base': [float(dp_base[0]), float(dp_base[1]), float(dp_base[2])],
+            'uv0': [float(uv0[0]), float(uv0[1])],
+            'uv1': [float(uv1[0]), float(uv1[1])],
+            'tag': tag,
+        }
+        if abs(dx) >= min_d and abs(du) >= min_duv:
+            jac['du_dx'] = du / dx
+        elif abs(dx) >= 0.008:
+            jac['du_dx'] = du / dx
+        if abs(dy) >= min_d and abs(dv) >= min_duv:
+            jac['dv_dy'] = dv / dy
+        elif abs(dy) >= 0.008:
+            jac['dv_dy'] = dv / dy
+        if abs(dx) >= min_d and abs(dv) >= min_duv:
+            jac['dv_dx'] = dv / dx
+        if abs(dy) >= min_d and abs(du) >= min_duv:
+            jac['du_dy'] = du / dy
+        # Isotropic fallback from whichever axis responded.
+        if 'du_dx' in jac and 'dv_dy' not in jac:
+            jac['dv_dy_mag'] = abs(float(jac['du_dx']))
+        if 'dv_dy' in jac and 'du_dx' not in jac:
+            jac['du_dx_mag'] = abs(float(jac['dv_dy']))
+
+        prev = self._ee_uv_jac if merge and self._ee_uv_jac else {}
+        for k in ('du_dx', 'dv_dy', 'du_dx_mag', 'dv_dy_mag', 'dv_dx', 'du_dy'):
+            if k not in jac and k in prev:
+                jac[k] = prev[k]
+
+        if (
+            'du_dx' not in jac and 'dv_dy' not in jac
+            and 'du_dx_mag' not in jac and 'dv_dy_mag' not in jac
+        ):
+            self.get_logger().warn(
+                f'REFINING ee-uv jac ({tag}): weak cam response '
+                f'dcam=({dx*1000:+.1f},{dy*1000:+.1f},{dz*1000:+.1f})mm '
+                f'duv=({du:+.1f},{dv:+.1f})')
+            if not prev:
+                self._ee_uv_jac = None
+                return None
+            return self._ee_uv_jac
+
+        self._ee_uv_jac = jac
+        self.get_logger().info(
+            f'REFINING ee-uv jac from {tag}: '
+            f'du/dx={jac.get("du_dx", float("nan")):.0f}px/m '
+            f'dv/dy={jac.get("dv_dy", float("nan")):.0f}px/m '
+            f'(Δcam=({dx*1000:+.1f},{dy*1000:+.1f})mm Δuv=({du:+.1f},{dv:+.1f})px)')
+        self._write_qa_json('ee_uv_jac.json', {
+            'timestamp': datetime.now().isoformat(timespec='seconds'),
+            'session': self._qa_session,
+            **{k: (list(v) if isinstance(v, list) else v) for k, v in jac.items()},
+        })
+        return jac
+
+    def _update_ee_uv_jac_from_probe(self) -> Optional[Dict[str, float]]:
+        """Calibrate from mono-probe obs0→obs1 camera pose + UV."""
+        obs = self._mono_probe_obs
+        if len(obs) < 2:
+            return None
+        a, b = obs[0], obs[-1]
+        return self._update_ee_uv_jac_from_delta(
+            a.get('uv'), a.get('T_base_cam'),
+            b.get('uv'), b.get('T_base_cam'),
+            tag='probe', merge=False,
+        )
+
+    # Back-compat aliases used by older call sites during transition.
+    def _update_lookat_jac_from_probe(self) -> Optional[Dict[str, float]]:
+        return self._update_ee_uv_jac_from_probe()
+
+    def _update_lookat_jac_from_delta(self, *args, **kwargs):
+        # Old joint-space signature ignored — prefer pose form via finish_center.
+        return self._ee_uv_jac
+
+    def _start_mono_probe_step(self) -> bool:
+        """Small orbit around locked berry + j1 yaw so wrist keeps facing the plant."""
+        if not self._arm.server_is_ready():
+            return False
+        berry = self._last_berry_base
+        tcp = self._tcp_or_ee_xyz()
+        ee = self._current_ee_pose()
+        T = self._lookup_T_base_cam()
+        if berry is None or tcp is None or ee is None or T is None:
+            return False
+        step = float(self._args.servo_mono_probe_step_m)
+        if step < 0.008:
+            self.get_logger().warn(
+                f'REFINING mono probe: step too small ({step:.4f}m) — finish early')
+            self._finish_mono_probe()
+            return False
+
+        cam_o = T[:3, 3].copy()
+        bx, by, bz = float(berry[0]), float(berry[1]), float(berry[2])
+        vx, vy, vz = float(cam_o[0] - bx), float(cam_o[1] - by), float(cam_o[2] - bz)
+        r_xy = math.hypot(vx, vy)
+        # Orbit about vertical through berry (keeps range ≈const, plant stays in FOV).
+        if r_xy >= 0.05:
+            alpha = step / r_xy  # rad ≈ arc length / radius
+            # Alternate sign by purpose index for baseline diversity.
+            if int(len(self._mono_probe_obs)) % 2 == 1:
+                alpha = -alpha
+            ca, sa = math.cos(alpha), math.sin(alpha)
+            vx2 = ca * vx - sa * vy
+            vy2 = sa * vx + ca * vy
+            cam_new = np.array([bx + vx2, by + vy2, bz + vz], dtype=np.float64)
+            d_base = (
+                float(cam_new[0] - cam_o[0]),
+                float(cam_new[1] - cam_o[1]),
+                float(cam_new[2] - cam_o[2]),
+            )
+            # Only partially yaw-cancel: intentional ΔUV from the same small step
+            # is the look-at Jacobian sample (du/dj1, dv/dj5). Full cancel → Δu≈0.
+            yaw_frac = float(getattr(self._args, 'servo_mono_probe_yaw_frac', 0.25))
+            yaw_frac = max(0.0, min(1.0, yaw_frac))
+            dj1 = yaw_frac * alpha
+        else:
+            # Too close on XY: small approach along cup→berry (still facing fruit).
+            dx, dy, dz = bx - tcp[0], by - tcp[1], bz - tcp[2]
+            dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+            if dist < 1e-4:
+                return False
+            step = min(step, max(0.0, dist - 0.05))
+            if step < 0.008:
+                self._finish_mono_probe()
+                return False
+            d_base = (dx / dist * step, dy / dist * step, dz / dist * step)
+            dj1 = 0.0
+            alpha = 0.0
+
+        ex = float(ee.pose.position.x)
+        ey = float(ee.pose.position.y)
+        ez = float(ee.pose.position.z)
+        tgt = (ex + d_base[0], ey + d_base[1], ez + d_base[2])
+        # Seed IK with yaw already aimed at berry after the orbit.
+        seed = list(self._joints)
+        seed[0] = float(self._joints[0] + dj1)
+        seed[5] = 0.0
+        joints = position_ik_keep_orient(tgt, seed)
+        if joints is None:
+            self.get_logger().warn('REFINING mono probe: keep_orient IK failed')
+            return False
+        target = list(joints)
+        # Explicitly keep yaw facing plant (orbit dj1).
+        target[0] = float(self._joints[0] + dj1)
+        target[5] = 0.0
+        target = self._clamp_servo_target(target)
+        # Limit per-step joint change (still allow meaningful yaw).
+        max_dj = [
+            math.radians(8.0),
+            math.radians(float(self._args.servo_max_dj2_deg)),
+            math.radians(float(self._args.servo_max_dj3_deg)),
+            math.radians(5.0),
+            math.radians(float(self._args.servo_max_dj5_deg)),
+            0.0,
+        ]
+        for i in range(6):
+            d = target[i] - self._joints[i]
+            d = max(-max_dj[i], min(max_dj[i], d))
+            target[i] = float(self._joints[i] + d)
+        target[5] = 0.0
+
+        travel = math.sqrt(d_base[0] ** 2 + d_base[1] ** 2 + d_base[2] ** 2)
+        dist = math.sqrt(
+            (bx - tcp[0]) ** 2 + (by - tcp[1]) ** 2 + (bz - tcp[2]) ** 2)
+        self._servo_pending_record = {
+            'step': int(self._servo_step_idx),
+            'control': 'mono_probe_orbit',
+            'probe_idx': len(self._mono_probe_obs),
+            'purpose': str(self._mono_probe_purpose),
+            'travel_m': float(travel),
+            'orbit_alpha_deg': math.degrees(alpha) if r_xy >= 0.05 else 0.0,
+            'dj1_deg': math.degrees(dj1),
+            'dist_cup': float(dist),
+            'berry_base': list(berry),
+            'tcp_base': list(tcp),
+            'target_xyz': list(tgt),
+            'cmd_dxyz': list(d_base),
+            'qa_tag': f'servo_{self._servo_step_idx:02d}_mono_probe',
+            'source': 'step_json',
+        }
+        ok = self._send_joint_servo_goal(
+            target,
+            tag='servo',
+            traj_s=max(float(self._args.servo_traj_s), 2.2),
+            extra=(
+                f'mono_probe_orbit travel={travel:.3f} α={math.degrees(alpha):+.1f}deg '
+                f'dj1={math.degrees(dj1):+.1f}deg lock={self._refine_locked_track_id}'
+            ),
+        )
+        return bool(ok)
+
+    @staticmethod
+    def _triangulate_rays(
+        o0: np.ndarray, d0: np.ndarray, o1: np.ndarray, d1: np.ndarray,
+    ) -> Optional[np.ndarray]:
+        """Midpoint of closest approach between two skew rays."""
+        d0 = d0 / (np.linalg.norm(d0) + 1e-12)
+        d1 = d1 / (np.linalg.norm(d1) + 1e-12)
+        w0 = o0 - o1
+        a = float(np.dot(d0, d0))
+        b = float(np.dot(d0, d1))
+        c = float(np.dot(d1, d1))
+        d = float(np.dot(d0, w0))
+        e = float(np.dot(d1, w0))
+        denom = a * c - b * b
+        if abs(denom) < 1e-10:
+            return None
+        t = (b * e - c * d) / denom
+        s = (a * e - b * d) / denom
+        p0 = o0 + t * d0
+        p1 = o1 + s * d1
+        return 0.5 * (p0 + p1)
+
+    def _obs_to_ray_base(self, obs: Dict) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        """Back-project probe UV to a base-frame ray using live wrist intrinsics.
+
+        Do NOT assume principal point = image center — Orbbec cy≈213 on 480p,
+        which biases short-baseline triangulation depth if ignored.
+        """
+        T = np.array(obs['T_base_cam'], dtype=np.float64)
+        u, v = obs['uv']
+        fx, fy, cx, cy = self._wrist_intrinsics()
+        ray_cam = np.array(
+            [(float(u) - cx) / fx, (float(v) - cy) / fy, 1.0], dtype=np.float64)
+        ray_cam = ray_cam / (np.linalg.norm(ray_cam) + 1e-12)
+        R = T[:3, :3]
+        o = T[:3, 3].copy()
+        d = R @ ray_cam
+        return o, d
+
+    def _apply_triangulation(self, tag: str) -> bool:
+        """Update berry pose from mono_probe_obs. Returns True if triangulated OK."""
+        obs = self._mono_probe_obs
+        if len(obs) < 2:
+            self.get_logger().warn(f'REFINING {tag}: <2 views — keep mono estimate')
+            return False
+        r0 = self._obs_to_ray_base(obs[0])
+        r1 = self._obs_to_ray_base(obs[-1])
+        if r0 is None or r1 is None:
+            self.get_logger().warn(f'REFINING {tag}: ray build failed — keep mono')
+            return False
+        o0, d0 = r0
+        o1, d1 = r1
+        baseline = float(np.linalg.norm(o1 - o0))
+        xyz = self._triangulate_rays(o0, d0, o1, d1)
+        payload: Dict = {
+            'timestamp': datetime.now().isoformat(timespec='seconds'),
+            'session': self._qa_session,
+            'purpose': self._mono_probe_purpose,
+            'n_obs': len(obs),
+            'baseline_m': baseline,
+            'obs': [
+                {k: v for k, v in o.items() if k != 'T_base_cam'} | {
+                    'T_base_cam_t': list(np.array(o['T_base_cam'])[:3, 3]),
+                    'T_base_cam_R': np.array(o['T_base_cam'], dtype=np.float64)[:3, :3].reshape(-1).tolist(),
+                }
+                for o in obs
+            ],
+        }
+        ok = xyz is not None and baseline >= 0.008
+        reject_reason = ''
+        if not ok:
+            reject_reason = (
+                'xyz_none' if xyz is None else f'baseline_short_{baseline:.4f}m')
+        if ok:
+            z_tri_chk = float(np.linalg.norm(xyz - np.array(obs[0]['T_base_cam'], dtype=np.float64)[:3, 3]))
+            z_mono_chk = float(obs[0].get('z_mono') or 0.0)
+            payload['z_tri_from_cam0'] = z_tri_chk
+            payload['z_mono_cam0'] = z_mono_chk
+            self._center_z_tri_m = float(z_tri_chk)
+            self._center_z_mono_m = float(z_mono_chk) if z_mono_chk > 1e-4 else None
+            if z_mono_chk > 1e-4:
+                payload['scale_tri_over_mono'] = z_tri_chk / z_mono_chk
+            if z_tri_chk < 0.08 or z_tri_chk > 1.5:
+                self.get_logger().warn(
+                    f'REFINING {tag}: z_tri={z_tri_chk:.3f}m out of range — reject')
+                ok = False
+                reject_reason = f'z_tri_oor_{z_tri_chk:.3f}'
+            elif z_mono_chk > 0.05:
+                ratio = z_tri_chk / z_mono_chk
+                # Short-baseline tri often collapses depth; reject unless close to mono.
+                lo, hi = (0.85, 1.15) if str(self._mono_probe_purpose or '') == 'center' else (0.4, 2.5)
+                if not (lo <= ratio <= hi):
+                    self.get_logger().warn(
+                        f'REFINING {tag}: z_tri/z_mono={ratio:.2f} outside '
+                        f'[{lo:.2f},{hi:.2f}] — reject')
+                    ok = False
+                    reject_reason = f'scale_{ratio:.2f}_outside_[{lo:.2f},{hi:.2f}]'
+        if not ok:
+            self.get_logger().warn(
+                f'REFINING {tag}: triangulation weak (baseline={baseline:.4f}m '
+                f'reason={reject_reason or "unknown"})')
+            payload['rejected'] = True
+            payload['reject_reason'] = reject_reason or 'unknown'
+            self._write_qa_json(f'{tag}.json', payload)
+            return False
+        corrected = (float(xyz[0]), float(xyz[1]), float(xyz[2]))
+        T0 = np.array(obs[0]['T_base_cam'], dtype=np.float64)
+        cam_o = T0[:3, 3]
+        z_tri = float(np.linalg.norm(xyz - cam_o))
+        z_mono = float(obs[0].get('z_mono') or 0.0)
+        scale = (z_tri / z_mono) if z_mono > 1e-4 else None
+        payload['berry_base_tri'] = list(corrected)
+        payload['z_tri_from_cam0'] = z_tri
+        payload['scale_tri_over_mono'] = scale
+        self._last_berry_base = corrected
+        self._refine_fruit_anchor = corrected
+        self._last_berry_t = time.time()
+        self._near_frozen_berry = None
+        cam = self._base_xyz_to_cam(corrected)
+        if cam is not None and cam[2] > 1e-4:
+            self._last_z_cam = float(cam[2])
+        self.get_logger().info(
+            f'REFINING {tag} OK: berry=({corrected[0]:.3f},{corrected[1]:.3f},'
+            f'{corrected[2]:.3f}) baseline={baseline:.3f}m '
+            f'z_tri={z_tri:.3f} scale_tri/mono='
+            f'{(scale if scale is not None else -1):.3f}')
+        if str(self._mono_probe_purpose or '') == 'center':
+            self._center_probe_tri_ok = True
+        self._write_qa_json(f'{tag}.json', payload)
+        return True
+
+    def _scale_berry_along_cam_ray(
+        self,
+        berry: Tuple[float, float, float],
+        scale: float,
+        T_base_cam: Optional[np.ndarray] = None,
+    ) -> Optional[Tuple[float, float, float]]:
+        """Move berry along its camera ray (same UV, new depth). scale multiplies cam XYZ."""
+        if scale <= 1e-4:
+            return None
+        T = T_base_cam
+        if T is None:
+            T = self._lookup_T_base_cam()
+        if T is None:
+            return None
+        Tm = np.array(T, dtype=np.float64)
+        try:
+            T_inv = np.linalg.inv(Tm)
+        except Exception:
+            return None
+        pb = np.array([berry[0], berry[1], berry[2], 1.0], dtype=np.float64)
+        cam = (T_inv @ pb)[:3]
+        if float(cam[2]) <= 1e-4:
+            return None
+        cam_s = cam * float(scale)
+        p = Tm[:3, :3] @ cam_s + Tm[:3, 3]
+        return (float(p[0]), float(p[1]), float(p[2]))
+
+    def _berry_base_for_center_aim(
+        self,
+    ) -> Tuple[Optional[Tuple[float, float, float]], str]:
+        """3D point for aim_uv_ik: must match the UV we are centering.
+
+        Prefer last probe mono-ray back-project (berry_base_est). Short-baseline
+        triangulation is often rejected — keep the mono ray as-is (no soft-scale).
+        """
+        if self._mono_probe_obs:
+            last = self._mono_probe_obs[-1]
+            est = last.get('berry_base_est')
+            if isinstance(est, (list, tuple)) and len(est) >= 3:
+                return (float(est[0]), float(est[1]), float(est[2])), 'probe_mono_ray'
+            cam = last.get('cam_xyz')
+            T = last.get('T_base_cam')
+            if cam is not None and T is not None and float(cam[2]) > 1e-4:
+                Tm = np.array(T, dtype=np.float64)
+                cam_v = np.array(
+                    [float(cam[0]), float(cam[1]), float(cam[2])], dtype=np.float64)
+                p = Tm[:3, :3] @ cam_v + Tm[:3, 3]
+                return (float(p[0]), float(p[1]), float(p[2])), 'probe_cam_backproject'
+        if self._last_berry_base is not None:
+            return tuple(self._last_berry_base), 'last_berry_base'
+        return None, 'none'
+
+    def _center_plan_uv_from_calib(
+        self,
+    ) -> Tuple[Optional[Tuple[float, float, float]], Optional[List[float]], str]:
+        """Open-loop center plan uses last calib probe UV — not tracking/coast."""
+        if self._mono_probe_obs:
+            last = self._mono_probe_obs[-1]
+            uv = last.get('uv')
+            c = last.get('cam_xyz')
+            if uv is not None and len(uv) >= 2:
+                cam = None
+                if c is not None and len(c) >= 3 and float(c[2]) > 1e-4:
+                    cam = (float(c[0]), float(c[1]), float(c[2]))
+                return cam, [float(uv[0]), float(uv[1])], 'probe_calib'
+        return None, None, 'none'
+
+    def _center_oneshot_measure(
+        self,
+    ) -> Tuple[Optional[Tuple[float, float, float]], Optional[List[float]], str]:
+        """Read-only berry UV for QA. Never re-pin lock (fresh lock comes later)."""
+        berry = None
+        if self._fine is not None and self._fine.berries and self._fine_is_fresh():
+            live = self._pick_live_nearest_optical(
+                max_pix=float(getattr(self._args, 'refine_fresh_lock_max_pix_px', 120.0)))
+            if live is not None:
+                berry = live
+            else:
+                lock_tid = self._refine_locked_track_id
+                for b in self._fine.berries:
+                    if lock_tid is not None and int(b.track_id) == int(lock_tid):
+                        mode = str(getattr(b, 'depth_mode', '') or '')
+                        if mode != 'base_coast':
+                            berry = b
+                        break
+        if berry is not None:
+            mode = str(getattr(berry, 'depth_mode', '') or '')
+            uv = self._berry_image_uv(berry)
+            cam = self._berry_cam_xyz(berry)
+            if uv is not None:
+                if cam is None or cam[2] <= 1e-4:
+                    fx, fy, cx, cy = self._wrist_intrinsics()
+                    z = float(getattr(berry, 'z_mono_m', -1.0))
+                    if z <= 1e-4 and self._last_z_cam:
+                        z = float(self._last_z_cam)
+                    if z > 1e-4:
+                        cam = (
+                            (float(uv[0]) - cx) / fx * z,
+                            (float(uv[1]) - cy) / fy * z,
+                            z,
+                        )
+                src = 'live_bbox' if mode != 'base_coast' else 'coast_bbox'
+                if src == 'coast_bbox' and (uv[0] < 0 or uv[1] < 0):
+                    pass
+                else:
+                    return cam, [float(uv[0]), float(uv[1])], src
+            if mode != 'base_coast' and cam is not None and cam[2] > 1e-4:
+                uv2 = self._berry_uv_from_cam(cam)
+                return cam, ([float(uv2[0]), float(uv2[1])] if uv2 else None), 'live'
+        if int(getattr(self, '_center_oneshot_attempts', 0)) >= 1:
+            return None, None, 'none'
+        if self._mono_probe_obs:
+            last = self._mono_probe_obs[-1]
+            c = last.get('cam_xyz')
+            uv = last.get('uv')
+            cam = None
+            if c is not None and len(c) >= 3 and float(c[2]) > 1e-4:
+                cam = (float(c[0]), float(c[1]), float(c[2]))
+            uvl = [float(uv[0]), float(uv[1])] if uv is not None and len(uv) >= 2 else None
+            if cam is not None or uvl is not None:
+                return cam, uvl, 'probe_obs'
+        if self._last_berry_base is not None:
+            cam = self._base_xyz_to_cam(self._last_berry_base)
+            if cam is not None and cam[2] > 1e-4:
+                uv = self._berry_uv_from_cam(cam)
+                return cam, ([float(uv[0]), float(uv[1])] if uv else None), 'reproject'
+        return None, None, 'none'
+
+    def _lookup_T_link6_cam(self) -> Optional[np.ndarray]:
+        """Fixed mount: camera pose in link6 (for 5-DOF aim IK)."""
+        cam = self._args.wrist_camera_frame
+        ee = self._args.ee_link
+        try:
+            tf = self._tf_buffer.lookup_transform(
+                ee, cam, rclpy.time.Time())
+        except Exception:
+            return None
+        return _matrix_from_tf(tf)
+
+    def _start_center_oneshot(self) -> bool:
+        """After probe calib: one 5-DOF aim_uv_ik to cup-axis (or optical) UV.
+
+        Endpoint is image constraint + soft depth — not a free SE(3) translate.
+        """
+        if not self._arm.server_is_ready():
+            return False
+        max_att = max(1, int(getattr(self._args, 'servo_center_oneshot_max', 1)))
+        if int(getattr(self, '_center_oneshot_attempts', 0)) >= max_att:
+            self.get_logger().info(
+                f'REFINING center oneshot: already sent ({max_att})')
+            return False
+
+        cam, uv, cam_src = self._center_plan_uv_from_calib()
+        if uv is None:
+            self.get_logger().warn('REFINING center oneshot: no calib probe UV')
+            return False
+        u, v = float(uv[0]), float(uv[1])
+        berry, berry_src = self._berry_base_for_center_aim()
+        if berry is None:
+            self.get_logger().warn('REFINING center oneshot: no berry_base')
+            return False
+        # Depth for cup-aim UV + IK from probe mono ray / cam.
+        z_aim = float(cam[2]) if cam is not None and cam[2] > 1e-4 else float(
+            self._last_z_cam or 0.35)
+        if self._mono_probe_obs and self._mono_probe_obs[-1].get('T_base_cam') is not None:
+            T_obs = np.array(self._mono_probe_obs[-1]['T_base_cam'], dtype=np.float64)
+            try:
+                pb = np.array([berry[0], berry[1], berry[2], 1.0], dtype=np.float64)
+                cam_b = (np.linalg.inv(T_obs) @ pb)[:3]
+                if float(cam_b[2]) > 1e-4:
+                    z_aim = float(cam_b[2])
+            except Exception:
+                pass
+        self._last_z_cam = float(z_aim)
+        cx_img, cy_img, aim_src = self._aim_uv_for_center(z_aim)
+        du_des = cx_img - u
+        dv_des = cy_img - v
+        pix_off = math.hypot(du_des, dv_des)
+        pix_tol = float(getattr(self._args, 'servo_center_pix_tol_px', 35.0))
+        if pix_off <= pix_tol:
+            self.get_logger().info(
+                f'REFINING center oneshot skip: probe already near {aim_src} '
+                f'pix_off={pix_off:.1f}')
+            return False
+
+        # Keep freeze consistent with the point aim_uv_ik uses (for after reproject).
+        self._last_berry_base = berry
+        self._last_berry_t = time.time()
+        T_l6c = self._lookup_T_link6_cam()
+        if T_l6c is None:
+            self.get_logger().warn('REFINING center oneshot: no T_link6_cam')
+            return False
+
+        w, h = self._wrist_image_wh()
+        fx, fy, cx0, cy0 = self._wrist_intrinsics()
+        seed = list(self._joints)
+        seed[5] = 0.0
+        tol_pix = max(8.0, pix_tol * 0.5)
+        joints = aim_uv_ik(
+            berry,
+            (cx_img, cy_img),
+            seed,
+            T_l6c,
+            focal_px=0.5 * (fx + fy),
+            fx=fx,
+            fy=fy,
+            cx=cx0,
+            cy=cy0,
+            image_wh=(float(w), float(h)),
+            z_ref=z_aim,
+            tol_pix=tol_pix,
+        )
+        if joints is None:
+            self.get_logger().error(
+                f'REFINING center oneshot: aim_uv_ik failed '
+                f'uv=({u:.1f},{v:.1f})→({cx_img:.0f},{cy_img:.0f}) '
+                f'aim={aim_src} berry_src={berry_src}')
+            self._set_state(
+                'ERROR',
+                f'center aim_uv_ik failed ({aim_src} '
+                f'pix_off={pix_off:.0f})')
+            return False
+
+        target = self._clamp_servo_target(list(joints))
+        target[5] = 0.0
+        # Approximate travel for traj timing / QA.
+        ee = self._current_ee_pose()
+        if ee is None:
+            return False
+        ee0 = np.array([
+            float(ee.pose.position.x),
+            float(ee.pose.position.y),
+            float(ee.pose.position.z),
+        ], dtype=np.float64)
+        ee1 = fk_xyz(target)
+        d_base = ee1 - ee0
+        lat = float(np.linalg.norm(d_base))
+        traj_s = max(
+            float(getattr(self._args, 'servo_center_oneshot_traj_s', 2.0)),
+            min(8.0, 1.5 + lat / 0.03),
+        )
+        tcp = self._tcp_or_ee_xyz()
+        cup = self._cup_cam_xyz()
+        T_bc = self._lookup_T_base_cam()
+        d_cam = None
+        if T_bc is not None:
+            d_cam = (T_bc[:3, :3].T @ d_base).tolist()
+        method = f'aim_uv_ik/{aim_src}'
+        self._servo_pending_record = {
+            'step': int(self._servo_step_idx),
+            'track_id': self._refine_locked_track_id,
+            'refine_phase': 'center_oneshot',
+            'berry_base': list(berry),
+            'berry_base_src': berry_src,
+            'tcp_base': list(tcp) if tcp else None,
+            'ee_xyz_before': ee0.tolist(),
+            'ee_xyz_cmd': ee1.tolist(),
+            'cmd_dcam_m': d_cam,
+            'cmd_d_base_m': d_base.tolist(),
+            'berry_cam': list(cam) if cam else None,
+            'cup_cam': list(cup) if cup is not None else None,
+            'cam_src': cam_src,
+            'aim_src': aim_src,
+            'method': method,
+            'pix_off': float(pix_off),
+            'du_des': float(du_des),
+            'dv_des': float(dv_des),
+            'control': 'center_oneshot_cart',
+            'berry_uv': [u, v],
+            'aim_uv': [cx_img, cy_img],
+            'optical_uv': [cx0, cy0],
+            'attempt': 1,
+            'joints_cmd_rad': [float(v) for v in target],
+            'z_aim_m': float(z_aim),
+            'qa_tag': f'servo_{self._servo_step_idx:02d}_center_oneshot',
+            'source': 'step_json',
+        }
+        self._refine_phase = 'center_oneshot'
+        # Drop probe-era lock so post-center can re-pin on a fresh YOLO box.
+        self._clear_target_lock()
+        self._center_oneshot_sent = True
+        self._center_last_cmd = {
+            'joints_cmd_rad': [float(v) for v in target],
+            'ee_xyz_cmd': ee1.tolist(),
+            'aim_uv': [cx_img, cy_img],
+            'berry_uv': [u, v],
+            'berry_base': list(berry),
+            'z_aim_m': float(z_aim),
+            'ee_xyz_before': ee0.tolist(),
+            'tcp_before': list(tcp) if tcp else None,
+            'cmd_d_base_m': d_base.tolist(),
+            'berry_src': berry_src,
+            'cam_src': cam_src,
+            'aim_src': aim_src,
+            'pix_off': float(pix_off),
+        }
+        self._write_center_climb_diag(
+            phase='before_center',
+            berry=berry,
+            berry_src=berry_src,
+            tcp=tcp,
+            ee=ee0.tolist(),
+            ee_cmd=ee1.tolist(),
+            z_aim=float(z_aim),
+            aim_uv=(cx_img, cy_img),
+            berry_uv=(u, v),
+            cmd_d_base=d_base.tolist(),
+            extra={
+                'cam_src': cam_src,
+                'aim_src': aim_src,
+                'pix_off': float(pix_off),
+                'method': method,
+            },
+        )
+        ok = self._send_joint_servo_goal(
+            target,
+            tag='center',
+            traj_s=traj_s,
+            extra=(
+                f'center_arrive method={method} pix_off={pix_off:.1f} '
+                f'uv=({u:.1f},{v:.1f})→({cx_img:.0f},{cy_img:.0f}) '
+                f'dbase=({d_base[0]*1000:+.1f},{d_base[1]*1000:+.1f},'
+                f'{d_base[2]*1000:+.1f})mm tip_above_berry_z='
+                f'{((tcp[2] - berry[2]) * 1000.0) if tcp is not None else float("nan"):+.1f}mm '
+                f'from={cam_src}'
+            ),
+        )
+        if ok:
+            self._center_oneshot_attempts = int(
+                getattr(self, '_center_oneshot_attempts', 0)) + 1
+            self.get_logger().info(
+                f'REFINING center arrive[{self._servo_step_idx}]: method={method} '
+                f'pix_off={pix_off:.1f} uv=({u:.1f},{v:.1f})→({cx_img:.0f},{cy_img:.0f}) '
+                f'dbase=({d_base[0]*1000:+.1f},{d_base[1]*1000:+.1f},'
+                f'{d_base[2]*1000:+.1f})mm from={cam_src} berry={berry_src}')
+        else:
+            self._servo_pending_record = None
+            self._center_oneshot_sent = False
+        return ok
+
+    def _write_center_climb_diag(
+        self,
+        *,
+        phase: str,
+        berry: Optional[Tuple[float, float, float]] = None,
+        berry_src: str = '',
+        tcp: Optional[object] = None,
+        ee: Optional[object] = None,
+        ee_cmd: Optional[object] = None,
+        z_aim: Optional[float] = None,
+        aim_uv: Optional[Tuple[float, float]] = None,
+        berry_uv: Optional[Tuple[float, float]] = None,
+        cmd_d_base: Optional[object] = None,
+        extra: Optional[Dict] = None,
+    ) -> None:
+        """Height / climb QA: tip vs berry Z in base — explains fixed-cam 'too high'.
+
+        Wrist reproject on fruit + tip high on fixed cam usually means mono depth
+        too deep → aim_uv_ik plans a large +Δz to put that 3D point on the cup axis.
+        """
+        import cv2  # type: ignore
+
+        # Fresh fixed/wrist frames before climb overlay.
+        self._snap_qa(f'center_climb_{phase}')
+        if berry is None:
+            berry = self._last_berry_base
+        if tcp is None:
+            tcp = self._tcp_or_ee_xyz()
+        if ee is None:
+            pose = self._current_ee_pose()
+            if pose is not None:
+                ee = [
+                    float(pose.pose.position.x),
+                    float(pose.pose.position.y),
+                    float(pose.pose.position.z),
+                ]
+        tip = tcp if tcp is not None else ee
+        tip_above_z_mm = None
+        tip_above_xy_mm = None
+        if berry is not None and tip is not None:
+            tip_above_z_mm = (float(tip[2]) - float(berry[2])) * 1000.0
+            tip_above_xy_mm = math.hypot(
+                float(tip[0]) - float(berry[0]),
+                float(tip[1]) - float(berry[1]),
+            ) * 1000.0
+        geo = None
+        if berry is not None and tip is not None:
+            geo = self._cup_berry_geometry(
+                (float(berry[0]), float(berry[1]), float(berry[2])),
+                (float(tip[0]), float(tip[1]), float(tip[2])),
+            )
+        last_cmd = getattr(self, '_center_last_cmd', None) or {}
+        if ee_cmd is None and last_cmd.get('ee_xyz_cmd') is not None:
+            ee_cmd = list(last_cmd['ee_xyz_cmd'])
+        if cmd_d_base is None and last_cmd.get('cmd_d_base_m') is not None:
+            cmd_d_base = list(last_cmd['cmd_d_base_m'])
+        if z_aim is None and last_cmd.get('z_aim_m') is not None:
+            z_aim = float(last_cmd['z_aim_m'])
+        ee_err_mm = None
+        if ee_cmd is not None and ee is not None:
+            ee_err_mm = float(np.linalg.norm(
+                np.array(ee, dtype=np.float64)
+                - np.array(ee_cmd, dtype=np.float64)) * 1000.0)
+        planned_dz_mm = (
+            float(cmd_d_base[2]) * 1000.0
+            if cmd_d_base is not None and len(cmd_d_base) >= 3 else None)
+        payload: Dict = {
+            'phase': phase,
+            'timestamp': datetime.now().isoformat(timespec='seconds'),
+            'session': self._qa_session,
+            'berry_base': list(berry) if berry is not None else None,
+            'berry_src': berry_src or last_cmd.get('berry_src'),
+            'tcp_base': list(tcp) if tcp is not None else None,
+            'ee_xyz': list(ee) if ee is not None else None,
+            'ee_xyz_cmd': list(ee_cmd) if ee_cmd is not None else None,
+            'ee_err_mm': ee_err_mm,
+            'cmd_d_base_m': list(cmd_d_base) if cmd_d_base is not None else None,
+            'planned_dz_mm': planned_dz_mm,
+            'tip_above_berry_z_mm': tip_above_z_mm,
+            'tip_above_berry_xy_mm': tip_above_xy_mm,
+            'z_aim_m': z_aim,
+            'aim_uv': list(aim_uv) if aim_uv is not None else last_cmd.get('aim_uv'),
+            'berry_uv': list(berry_uv) if berry_uv is not None else last_cmd.get('berry_uv'),
+            'z_cam_m': self._last_z_cam,
+            'dist_cup_m': geo.get('dist_cup') if geo else None,
+            'berry_rel_cup': geo.get('berry_rel_cup') if geo else None,
+            'note': (
+                'tip_above_berry_z>0 means tip higher than model berry in base Z; '
+                'large planned_dz with wrist reproject-on-fruit → mono depth too deep '
+                '(IK climbs), not joint tracking shortfall'
+            ),
+        }
+        if extra:
+            payload.update(extra)
+        tag = f'center_climb_{phase}'
+        self._write_qa_json(f'{tag}.json', payload)
+        self.get_logger().info(
+            f'REFINING climb[{phase}]: tip_above_berry_z='
+            f'{(tip_above_z_mm if tip_above_z_mm is not None else float("nan")):+.1f}mm '
+            f'xy={(tip_above_xy_mm if tip_above_xy_mm is not None else float("nan")):.1f}mm '
+            f'planned_dz={(planned_dz_mm if planned_dz_mm is not None else float("nan")):+.1f}mm '
+            f'ee_err={(ee_err_mm if ee_err_mm is not None else float("nan")):.2f}mm '
+            f'z_aim={(z_aim if z_aim is not None else -1):.3f}m '
+)
+
+        # Annotate fixed cam with climb numbers (side view of tip height).
+        if self._qa_rgb_fixed is not None and self._qa_session:
+            img = self._qa_rgb_fixed.copy()
+            h, _w = img.shape[:2]
+            lines = [
+                f'CLIMB {phase}',
+                f'tip_above_berry_z='
+                f'{(tip_above_z_mm if tip_above_z_mm is not None else float("nan")):+.1f}mm',
+                f'planned_dz='
+                f'{(planned_dz_mm if planned_dz_mm is not None else float("nan")):+.1f}mm',
+                f'|EE_fb-cmd|='
+                f'{(ee_err_mm if ee_err_mm is not None else float("nan")):.2f}mm',
+                f'z_aim={(z_aim if z_aim is not None else -1):.3f}m '
+            ]
+            y = 28
+            for line in lines:
+                cv2.putText(
+                    img, line, (8, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 80), 2, cv2.LINE_AA)
+                y += 26
+            d = os.path.join(self._args.qa_dir, self._qa_session)
+            os.makedirs(d, exist_ok=True)
+            cv2.imwrite(
+                os.path.join(d, f'{tag}_fixed.png'),
+                cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+
+    def _refresh_berry_cam_from_tri(self) -> None:
+        """Refresh z_cam / berry age from frozen base_link triangulation (post-center)."""
+        if self._last_berry_base is None:
+            return
+        cam = self._base_xyz_to_cam(self._last_berry_base)
+        if cam is not None and cam[2] > 1e-4:
+            self._last_z_cam = float(cam[2])
+        self._last_berry_t = time.time()
+
+    def _reproject_berry_geo(self) -> Optional[Dict]:
+        """Cup/berry geometry from probe tri 3D + current TCP (no YOLO)."""
+        if self._last_berry_base is None:
+            return None
+        tcp = self._tcp_or_ee_xyz()
+        if tcp is None:
+            return None
+        return self._cup_berry_geometry(self._last_berry_base, tcp)
+
+    def _reproject_pix_off(self) -> Optional[float]:
+        """Optical-center error of probe-tri 3D reprojected to current wrist view."""
+        geo = self._reproject_berry_geo()
+        if geo is None:
+            return None
+        berry_uv = geo.get('berry_uv')
+        optical = geo.get('optical_uv')
+        if berry_uv is None or optical is None:
+            return None
+        return math.hypot(
+            float(berry_uv[0]) - float(optical[0]),
+            float(berry_uv[1]) - float(optical[1]),
+        )
+
+    def _apply_probe_tri_mono_chord_scale(self) -> Optional[str]:
+        """Scheme G: frozen tri 3D + reproject-UV neighborhood min-mono chord scale."""
+        if self._probe_tri_chord_applied:
+            return 'probe_tri_mono_chord'
+        if not bool(getattr(self._args, 'refine_probe_tri_mono_chord', True)):
+            return None
+        if not self._center_probe_tri_ok or self._last_berry_base is None:
+            return None
+        self._refresh_berry_cam_from_tri()
+        tcp = self._tcp_or_ee_xyz()
+        z_cam = self._last_z_cam
+        if tcp is None or z_cam is None or z_cam <= 1e-4:
+            return None
+        geo = self._reproject_berry_geo()
+        if geo is None or geo.get('berry_uv') is None:
+            return None
+        berry_uv = geo['berry_uv']
+        max_pix = float(getattr(self._args, 'refine_reproject_mono_max_pix_px', 120.0))
+        berry_d = float(getattr(self._args, 'berry_diameter_m', 0.015))
+        focal = float(self._args.wrist_focal_px)
+        scale_min = float(getattr(self._args, 'refine_mono_chord_scale_min', 0.45))
+        scale_max = float(getattr(self._args, 'refine_mono_chord_scale_max', 1.05))
+
+        candidates: List[Tuple[float, Dict]] = []
+
+        rgb_sources: List[Tuple[str, object]] = []
+        if self._qa_rgb_wrist is not None:
+            rgb_sources.append(('wrist', self._qa_rgb_wrist))
+        if self._qa_rgb_fine_viz is not None:
+            rgb_sources.append(('fine_viz', self._qa_rgb_fine_viz))
+        if rgb_sources:
+            zm, meta = z_mono_near_reproject_from_sources(
+                rgb_sources,
+                float(berry_uv[0]),
+                float(berry_uv[1]),
+                focal_px=focal,
+                berry_diameter_m=berry_d,
+                max_pick_pix=max_pix,
+            )
+            if zm is not None and zm > 1e-4:
+                meta['source'] = meta.get('rgb_source', 'yolo_near_uv')
+                candidates.append((float(zm), meta))
+
+        live = self._pick_live_near_uv(berry_uv)
+        if live is not None:
+            uv = self._berry_image_uv(live)
+            zm = float(getattr(live, 'z_mono_m', -1.0))
+            if (
+                uv is not None
+                and zm > 1e-4
+                and math.hypot(uv[0] - float(berry_uv[0]), uv[1] - float(berry_uv[1]))
+                <= max_pix
+            ):
+                candidates.append((zm, {
+                    'source': 'live_z_mono',
+                    'pix_off_px': math.hypot(
+                        uv[0] - float(berry_uv[0]), uv[1] - float(berry_uv[1])),
+                    'yolo_conf': float(live.confidence),
+                }))
+
+        relax_pix = max(max_pix, 200.0)
+        ranked_live: List[Tuple[float, float, float]] = []
+        for b in self._live_fine_berries():
+            uv = self._berry_image_uv(b)
+            zm = float(getattr(b, 'z_mono_m', -1.0))
+            if uv is None or zm <= 1e-4:
+                continue
+            d = math.hypot(uv[0] - float(berry_uv[0]), uv[1] - float(berry_uv[1]))
+            if d <= relax_pix:
+                ranked_live.append((d, zm, float(b.confidence)))
+        if ranked_live:
+            ranked_live.sort(key=lambda x: x[0])
+            d, zm, conf = ranked_live[0]
+            candidates.append((zm, {
+                'source': 'live_z_mono_relaxed',
+                'pix_off_px': d,
+                'yolo_conf': conf,
+            }))
+
+        if self._mono_probe_obs:
+            zm = float(self._mono_probe_obs[-1].get('z_mono') or 0.0)
+            if zm > 1e-4:
+                candidates.append((zm, {
+                    'source': 'probe_obs_z_mono',
+                    'z_mono_m': zm,
+                    'n_obs': len(self._mono_probe_obs),
+                }))
+
+        if not candidates:
+            self.get_logger().warn(
+                'REFINING probe tri mono chord: no z_mono candidates — keep tri')
+            return None
+
+        reject_log: List[str] = []
+        for z_mono, mono_meta in candidates:
+            berry_new, scale_meta = apply_mono_chord_scale(
+                self._last_berry_base,
+                tcp,
+                z_cam_m=float(z_cam),
+                z_mono_m=float(z_mono),
+                scale_min=scale_min,
+                scale_max=scale_max,
+            )
+            if berry_new is None:
+                reject_log.append(
+                    f'{mono_meta.get("source", "?")}: {scale_meta.get("rejected", "?")} '
+                    f'scale={scale_meta.get("scale", -1):.3f}')
+                continue
+            old = self._last_berry_base
+            self._last_berry_base = berry_new
+            self._refine_fruit_anchor = berry_new
+            self._near_frozen_berry = None
+            self._refresh_berry_cam_from_tri()
+            self._last_mono_chord_meta = mono_meta | scale_meta
+            self._probe_tri_chord_applied = True
+            dist = self._cup_berry_dist()
+            self.get_logger().info(
+                f'REFINING probe tri mono chord: '
+                f'berry=({old[0]:.3f},{old[1]:.3f},{old[2]:.3f})→'
+                f'({berry_new[0]:.3f},{berry_new[1]:.3f},{berry_new[2]:.3f}) '
+                f'scale={scale_meta.get("scale", -1):.3f} '
+                f'z_mono={z_mono:.3f} z_cam={z_cam:.3f} '
+                f'dist_cup={(dist if dist is not None else -1):.3f}m '
+                f'src={mono_meta.get("source", "?")}')
+            return 'probe_tri_mono_chord'
+
+        self.get_logger().warn(
+            f'REFINING probe tri mono chord rejected all candidates: {"; ".join(reject_log)}')
+        return None
+
+    def _contact_from_probe_tri(self, *, reason: str) -> bool:
+        """YOLO miss after center: probe tri 3D (+ optional mono chord) → contact oneshot."""
+        if self._near_handoff_written or self._state == 'REFINING_WAIT_NEAR':
+            return True
+        if not self._center_probe_tri_ok or self._last_berry_base is None:
+            return False
+        self._apply_probe_tri_mono_chord_scale()
+        self._refresh_berry_cam_from_tri()
+        b = self._last_berry_base
+        pix = self._reproject_pix_off()
+        self.get_logger().info(
+            f'REFINING contact from probe tri ({reason}): '
+            f'berry=({b[0]:.3f},{b[1]:.3f},{b[2]:.3f}) '
+            f'z_cam={(self._last_z_cam if self._last_z_cam is not None else -1):.3f} '
+            f'reproject_pix_off={(pix if pix is not None else -1):.1f}')
+        ds = (
+            'probe_tri_mono_chord' if self._probe_tri_chord_applied
+            else 'probe_tri_reproject')
+        self._snap_refine_lock_viz('probe_tri_contact', source=ds)
+        self._enter_contact_oneshot(reason=reason)
+        return True
+
+    def _snap_center_oneshot_arrive_analysis(self, *, reason: str = '') -> str:
+        """Always dump after-center wrist analysis: AIM / REPROJECT / LIVE.
+
+        Reproject of frozen berry_base landing on aim only proves IK consistency
+        in the model — NOT that the real fruit is there. When YOLO misses,
+        berry_uv_after is often that same reproject (circular). This frame must
+        still be written on ERROR so failures stay diagnosable.
+        """
+        import cv2  # type: ignore
+
+        tag = 'center_oneshot_arrive'
+        self._snap_qa(tag)
+        if not self._qa_session or self._qa_rgb_wrist is None:
+            return ''
+        sess_dir = os.path.join(self._args.qa_dir, self._qa_session)
+        os.makedirs(sess_dir, exist_ok=True)
+
+        z_guess = float(self._last_z_cam or 0.35)
+        au, av, aim_src = self._aim_uv_for_center(z_guess)
+        fx, fy, cx, cy = self._wrist_intrinsics()
+        geo = self._reproject_berry_geo()
+        reproject_uv = None
+        if geo is not None and geo.get('berry_uv') is not None:
+            reproject_uv = [
+                float(geo['berry_uv'][0]), float(geo['berry_uv'][1])]
+            if geo.get('berry_cam') is not None and float(geo['berry_cam'][2]) > 1e-4:
+                z_guess = float(geo['berry_cam'][2])
+                au, av, aim_src = self._aim_uv_for_center(z_guess)
+
+        live_max = max(
+            float(getattr(self._args, 'servo_center_pix_tol_px', 35.0)),
+            float(getattr(self._args, 'refine_fresh_lock_max_pix_px', 80.0)),
+        )
+        _cam_live, live_uv, live_src = self._center_arrive_measure_near_aim(
+            aim_uv=(au, av), max_pix=live_max)
+        # QA-only: also record optical-nearest live (may differ from cup-aim gate).
+        _cam_qa, uv_qa, src_qa = self._center_oneshot_measure()
+
+        img = self._qa_rgb_wrist.copy()
+        h, w = img.shape[:2]
+        # optical / principal
+        cv2.drawMarker(
+            img, (int(cx), int(cy)), (160, 160, 160),
+            markerType=cv2.MARKER_TILTED_CROSS, markerSize=18, thickness=1)
+        cv2.putText(
+            img, 'PRINCIPAL', (int(cx) + 8, int(cy) - 8),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (160, 160, 160), 1, cv2.LINE_AA)
+        # AIM
+        cv2.drawMarker(
+            img, (int(au), int(av)), (0, 255, 0),
+            markerType=cv2.MARKER_CROSS, markerSize=26, thickness=2)
+        cv2.putText(
+            img, f'AIM/{aim_src}', (int(au) + 10, int(av) - 10),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2, cv2.LINE_AA)
+        # REPROJECT (model berry_base — circular if no live)
+        if reproject_uv is not None:
+            ru, rv = int(reproject_uv[0]), int(reproject_uv[1])
+            cv2.drawMarker(
+                img, (ru, rv), (255, 80, 200),
+                markerType=cv2.MARKER_STAR, markerSize=24, thickness=2)
+            cv2.putText(
+                img, 'REPROJECT(model)', (ru + 10, rv + 18),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 80, 200), 2, cv2.LINE_AA)
+            cv2.arrowedLine(
+                img, (int(au), int(av)), (ru, rv),
+                (255, 80, 200), 1, tipLength=0.15)
+        # All live YOLO
+        live_all: List[Dict] = []
+        for b in self._live_fine_berries():
+            uv_b = self._berry_image_uv(b)
+            if uv_b is None:
+                continue
+            live_all.append({
+                'track_id': int(b.track_id),
+                'u': float(uv_b[0]), 'v': float(uv_b[1]),
+                'conf': float(b.confidence),
+                'mode': str(getattr(b, 'depth_mode', '') or ''),
+            })
+            cv2.circle(
+                img, (int(uv_b[0]), int(uv_b[1])), 14, (255, 200, 0), 2, cv2.LINE_AA)
+        # LIVE near cup-aim (control-relevant)
+        if live_uv is not None:
+            lu, lv = int(live_uv[0]), int(live_uv[1])
+            cv2.drawMarker(
+                img, (lu, lv), (80, 255, 255),
+                markerType=cv2.MARKER_DIAMOND, markerSize=28, thickness=2)
+            cv2.putText(
+                img, f'LIVE/{live_src}', (lu + 10, lv - 12),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (80, 255, 255), 2, cv2.LINE_AA)
+            cv2.arrowedLine(
+                img, (int(au), int(av)), (lu, lv),
+                (80, 255, 255), 2, tipLength=0.15)
+
+        pix_repro = (
+            math.hypot(reproject_uv[0] - au, reproject_uv[1] - av)
+            if reproject_uv is not None else None)
+        pix_live = (
+            math.hypot(float(live_uv[0]) - au, float(live_uv[1]) - av)
+            if live_uv is not None else None)
+        joints_fb = [float(v) for v in self._joints[:6]]
+        ee_fb = None
+        try:
+            ee_fk = fk_xyz(joints_fb)
+            ee_fb = [float(ee_fk[0]), float(ee_fk[1]), float(ee_fk[2])]
+        except Exception:
+            ee_now = self._current_ee_pose()
+            if ee_now is not None:
+                ee_fb = [
+                    float(ee_now.pose.position.x),
+                    float(ee_now.pose.position.y),
+                    float(ee_now.pose.position.z),
+                ]
+
+        circular = live_uv is None
+        last_cmd = getattr(self, '_center_last_cmd', None) or {}
+        ee_cmd = (
+            [float(v) for v in last_cmd['ee_xyz_cmd']]
+            if last_cmd.get('ee_xyz_cmd') is not None else None)
+        joints_cmd = (
+            [float(v) for v in last_cmd['joints_cmd_rad']]
+            if last_cmd.get('joints_cmd_rad') is not None else None)
+        ee_err_mm = None
+        if ee_cmd is not None and ee_fb is not None:
+            ee_err_mm = float(np.linalg.norm(
+                np.array(ee_fb, dtype=np.float64)
+                - np.array(ee_cmd, dtype=np.float64)) * 1000.0)
+        joint_err_deg = None
+        if joints_cmd is not None and len(joints_fb) >= 6:
+            joint_err_deg = [
+                math.degrees(float(joints_fb[i]) - float(joints_cmd[i]))
+                for i in range(6)
+            ]
+
+        line0 = (
+            f'CENTER ARRIVE  reason={reason or "finish"}  '
+            f'circular_reproject={"YES" if circular else "no"}  '
+            f'|EE_fb-cmd|={(ee_err_mm if ee_err_mm is not None else -1):.2f}mm')
+        cv2.putText(
+            img, line0, (8, 24),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (80, 255, 120), 2, cv2.LINE_AA)
+        cv2.putText(
+            img,
+            f'aim=({au:.0f},{av:.0f}) repro_pix='
+            f'{(pix_repro if pix_repro is not None else -1):.1f} '
+            f'live_pix={(pix_live if pix_live is not None else -1):.1f} '
+            f'n_yolo={len(live_all)}',
+            (8, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 200, 100), 1, cv2.LINE_AA)
+        cv2.putText(
+            img,
+            'green=AIM  magenta=REPROJECT(model)  cyan=LIVE@aim  yellow=all YOLO  '
+            'grey=principal',
+            (8, h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 200, 200), 1, cv2.LINE_AA)
+        if circular:
+            cv2.putText(
+                img,
+                'WARN: no LIVE near aim — reproject~aim only proves IK model, '
+                'not real fruit',
+                (8, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 80, 80), 2, cv2.LINE_AA)
+
+        out_path = os.path.join(sess_dir, f'{tag}_annotated.png')
+        cv2.imwrite(out_path, cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+        # Keep fixed-cam snap next to it for climb diagnosis.
+        if self._qa_rgb_fixed is not None:
+            cv2.imwrite(
+                os.path.join(sess_dir, f'{tag}_fixed.png'),
+                cv2.cvtColor(self._qa_rgb_fixed, cv2.COLOR_RGB2BGR))
+        if self._qa_rgb_fine_viz is not None:
+            cv2.imwrite(
+                os.path.join(sess_dir, f'{tag}_fine_viz.png'),
+                cv2.cvtColor(self._qa_rgb_fine_viz, cv2.COLOR_RGB2BGR))
+
+        meta = {
+            'reason': reason or 'finish',
+            'aim_uv': [float(au), float(av)],
+            'aim_src': aim_src,
+            'reproject_uv': reproject_uv,
+            'reproject_pix_off': pix_repro,
+            'live_uv_near_aim': (
+                [float(live_uv[0]), float(live_uv[1])] if live_uv else None),
+            'live_src_near_aim': live_src,
+            'live_pix_off': pix_live,
+            'qa_optical_live_uv': (
+                [float(uv_qa[0]), float(uv_qa[1])] if uv_qa else None),
+            'qa_optical_live_src': src_qa,
+            'live_yolo': live_all,
+            'circular_reproject_only': circular,
+            'intrinsics_fx_fy_cx_cy': [fx, fy, cx, cy],
+            'berry_base': list(self._last_berry_base or ()),
+            'ee_xyz_cmd': ee_cmd,
+            'ee_xyz_fb': ee_fb,
+            'ee_err_mm': ee_err_mm,
+            'joints_cmd_rad': joints_cmd,
+            'joints_fb_rad': joints_fb,
+            'joint_err_deg': joint_err_deg,
+            'z_cam_m': self._last_z_cam,
+        }
+        self._write_refine_event_meta(tag, meta)
+        self.get_logger().info(
+            f'REFINING center arrive viz → {out_path} '
+            f'repro_pix={(pix_repro if pix_repro is not None else -1):.1f} '
+            f'live_pix={(pix_live if pix_live is not None else -1):.1f} '
+            f'circular={circular} ee_err_mm='
+            f'{(ee_err_mm if ee_err_mm is not None else -1):.2f}')
+        return out_path
+
+    def _reestimate_z_on_live_uv(
+        self,
+        *,
+        uv: Tuple[float, float],
+        berry: Optional[DetectedBerry] = None,
+        cam: Optional[Tuple[float, float, float]] = None,
+    ) -> Tuple[Optional[float], str]:
+        """Fresh depth on the live UV ray after center oneshot (arrive pose).
+
+        Prefer RGB-D, else live mono/cam at the *current* pose.
+        """
+        del uv  # ray built by caller; z only here
+        if berry is not None:
+            zd = float(getattr(berry, 'z_depth_m', -1.0))
+            # Orbbec often returns far background / hole fills as "depth" on
+            # small berries (155633 z=1.14m poisoned live-replan). Cap to
+            # mid-range picking workspace.
+            if 0.08 < zd < 0.55:
+                return zd, 'live_rgbd'
+            zm = float(getattr(berry, 'z_mono_m', -1.0))
+            if 0.08 < zm < 1.2:
+                return zm, 'live_mono'
+        if cam is not None and 0.08 < float(cam[2]) < 1.2:
+            return float(cam[2]), 'live_cam'
+        if self._last_z_cam is not None and 0.08 < float(self._last_z_cam) < 1.2:
+            return float(self._last_z_cam), 'last_z_cam'
+        return None, 'none'
+
+    def _pick_live_berry_near_aim(
+        self,
+        *,
+        aim_uv: Tuple[float, float],
+        max_pix: float,
+        min_conf: Optional[float] = None,
+    ) -> Optional[DetectedBerry]:
+        track_min = float(
+            min_conf
+            if min_conf is not None
+            else getattr(self._args, 'refine_track_min_conf', 0.12))
+        au, av = float(aim_uv[0]), float(aim_uv[1])
+        ranked: List[Tuple[float, DetectedBerry]] = []
+        for b in self._live_fine_berries():
+            if float(b.confidence) < track_min:
+                continue
+            uv = self._berry_image_uv(b)
+            if uv is None:
+                continue
+            e = math.hypot(float(uv[0]) - au, float(uv[1]) - av)
+            if e <= float(max_pix):
+                ranked.append((e, b))
+        if not ranked:
+            return None
+        ranked.sort(key=lambda x: x[0])
+        return ranked[0][1]
+
+    def _start_center_live_replan(
+        self,
+        *,
+        uv: Tuple[float, float],
+        berry: Tuple[float, float, float],
+        z_aim: float,
+        z_src: str,
+    ) -> bool:
+        """Second center oneshot: put live-UV berry on cup-aim with reestimated z."""
+        if self._center_live_replan_done:
+            return False
+        if not self._arm.server_is_ready():
+            return False
+        max_att = max(2, int(getattr(self._args, 'servo_center_oneshot_max', 2)))
+        # Fresh-lock UV correction may need one extra oneshot after climb replan.
+        if 'fresh_lock' in str(z_src):
+            max_att = max_att + 1
+        if int(getattr(self, '_center_oneshot_attempts', 0)) >= max_att:
+            self.get_logger().warn(
+                f'REFINING center live-replan skipped: attempts≥{max_att}')
+            return False
+
+        u, v = float(uv[0]), float(uv[1])
+        cx_img, cy_img, aim_src = self._aim_uv_for_center(float(z_aim))
+        pix_off = math.hypot(cx_img - u, cy_img - v)
+        pix_tol = float(getattr(self._args, 'servo_center_pix_tol_px', 35.0))
+        # Even if already near aim, allow a small depth-driven tip correction.
+        min_pix = max(6.0, pix_tol * 0.25)
+
+        self._last_berry_base = berry
+        self._last_berry_t = time.time()
+        self._last_z_cam = float(z_aim)
+        T_l6c = self._lookup_T_link6_cam()
+        if T_l6c is None:
+            self.get_logger().warn('REFINING center live-replan: no T_link6_cam')
+            return False
+
+        w, h = self._wrist_image_wh()
+        fx, fy, cx0, cy0 = self._wrist_intrinsics()
+        seed = list(self._joints)
+        seed[5] = 0.0
+        tol_pix = max(8.0, pix_tol * 0.5)
+        joints = aim_uv_ik(
+            berry,
+            (cx_img, cy_img),
+            seed,
+            T_l6c,
+            focal_px=0.5 * (fx + fy),
+            fx=fx,
+            fy=fy,
+            cx=cx0,
+            cy=cy0,
+            image_wh=(float(w), float(h)),
+            z_ref=float(z_aim),
+            tol_pix=tol_pix,
+        )
+        if joints is None:
+            self._center_live_replan_done = True
+            self.get_logger().error(
+                f'REFINING center live-replan: aim_uv_ik failed '
+                f'uv=({u:.1f},{v:.1f})→({cx_img:.0f},{cy_img:.0f}) z={z_aim:.3f}')
+            return False
+
+        target = self._clamp_servo_target(list(joints))
+        target[5] = 0.0
+        ee = self._current_ee_pose()
+        if ee is None:
+            return False
+        ee0 = np.array([
+            float(ee.pose.position.x),
+            float(ee.pose.position.y),
+            float(ee.pose.position.z),
+        ], dtype=np.float64)
+        ee1 = fk_xyz(target)
+        d_base = ee1 - ee0
+        lat = float(np.linalg.norm(d_base))
+        # Skip tiny no-op if already on target in image and Cartesian.
+        if pix_off < min_pix and lat < 0.008:
+            self.get_logger().info(
+                f'REFINING center live-replan skip: already near '
+                f'pix_off={pix_off:.1f} |d|={lat*1000:.1f}mm')
+            self._center_live_replan_done = True
+            return False
+
+        traj_s = max(
+            float(getattr(self._args, 'servo_center_oneshot_traj_s', 2.0)),
+            min(6.0, 1.2 + lat / 0.03),
+        )
+        tcp = self._tcp_or_ee_xyz()
+        cup = self._cup_cam_xyz()
+        T_bc = self._lookup_T_base_cam()
+        d_cam = None
+        if T_bc is not None:
+            d_cam = (T_bc[:3, :3].T @ d_base).tolist()
+        cam_xyz = self._base_xyz_to_cam(berry)
+
+        self._write_qa_json('center_live_replan.json', {
+            'timestamp': datetime.now().isoformat(timespec='seconds'),
+            'session': self._qa_session,
+            'uv': [u, v],
+            'aim_uv': [cx_img, cy_img],
+            'aim_src': aim_src,
+            'z_aim_m': float(z_aim),
+            'z_src': z_src,
+            'berry_base': list(berry),
+            'pix_off': float(pix_off),
+            'cmd_d_base_m': d_base.tolist(),
+            'planned_dz_mm': float(d_base[2]) * 1000.0,
+            'ee_xyz_before': ee0.tolist(),
+            'ee_xyz_cmd': ee1.tolist(),
+            'tip_above_berry_z_mm': (
+                (float(tcp[2]) - float(berry[2])) * 1000.0
+                if tcp is not None else None),
+        })
+
+        self._servo_pending_record = {
+            'step': int(self._servo_step_idx),
+            'track_id': self._refine_locked_track_id,
+            'refine_phase': 'center_oneshot',
+            'control': 'center_live_replan',
+            'berry_base': list(berry),
+            'berry_base_src': f'live_uv_{z_src}',
+            'tcp_base': list(tcp) if tcp else None,
+            'ee_xyz_before': ee0.tolist(),
+            'ee_xyz_cmd': ee1.tolist(),
+            'cmd_dcam_m': d_cam,
+            'cmd_d_base_m': d_base.tolist(),
+            'berry_cam': list(cam_xyz) if cam_xyz else None,
+            'cup_cam': list(cup) if cup is not None else None,
+            'cam_src': z_src,
+            'aim_src': aim_src,
+            'method': f'aim_uv_ik/live_replan/{z_src}',
+            'pix_off': float(pix_off),
+            'du_des': float(cx_img - u),
+            'dv_des': float(cy_img - v),
+            'berry_uv': [u, v],
+            'aim_uv': [cx_img, cy_img],
+            'optical_uv': [cx0, cy0],
+            'attempt': int(getattr(self, '_center_oneshot_attempts', 0)) + 1,
+            'joints_cmd_rad': [float(v) for v in target],
+            'z_aim_m': float(z_aim),
+            'qa_tag': f'servo_{self._servo_step_idx:02d}_center_live_replan',
+            'source': 'step_json',
+        }
+        self._refine_phase = 'center_oneshot'
+        self._center_oneshot_sent = True
+        self._center_live_replan_done = True
+        self._center_last_cmd = {
+            'joints_cmd_rad': [float(v) for v in target],
+            'ee_xyz_cmd': ee1.tolist(),
+            'aim_uv': [cx_img, cy_img],
+            'berry_uv': [u, v],
+            'berry_base': list(berry),
+            'z_aim_m': float(z_aim),
+            'ee_xyz_before': ee0.tolist(),
+            'tcp_before': list(tcp) if tcp else None,
+            'cmd_d_base_m': d_base.tolist(),
+            'berry_src': f'live_uv_{z_src}',
+            'cam_src': z_src,
+            'aim_src': aim_src,
+            'pix_off': float(pix_off),
+            'live_replan': True,
+            'fresh_lock_replan': 'fresh_lock' in str(z_src),
+        }
+        self._write_center_climb_diag(
+            phase='before_live_replan',
+            berry=berry,
+            berry_src=f'live_uv_{z_src}',
+            tcp=tcp,
+            ee=ee0.tolist(),
+            ee_cmd=ee1.tolist(),
+            z_aim=float(z_aim),
+            aim_uv=(cx_img, cy_img),
+            berry_uv=(u, v),
+            cmd_d_base=d_base.tolist(),
+            extra={'z_src': z_src, 'pix_off': float(pix_off)},
+        )
+        ok = self._send_joint_servo_goal(
+            target,
+            tag='center_replan',
+            traj_s=traj_s,
+            extra=(
+                f'live_replan z={z_aim:.3f}/{z_src} pix_off={pix_off:.1f} '
+                f'uv=({u:.1f},{v:.1f})→({cx_img:.0f},{cy_img:.0f}) '
+                f'dbase=({d_base[0]*1000:+.1f},{d_base[1]*1000:+.1f},'
+                f'{d_base[2]*1000:+.1f})mm'
+            ),
+        )
+        if ok:
+            self._center_oneshot_attempts = int(
+                getattr(self, '_center_oneshot_attempts', 0)) + 1
+            self.get_logger().info(
+                f'REFINING center live-replan[{self._servo_step_idx}]: '
+                f'z={z_aim:.3f}({z_src}) pix_off={pix_off:.1f} '
+                f'dz={d_base[2]*1000:+.1f}mm')
+        else:
+            self._servo_pending_record = None
+            self._center_oneshot_sent = False
+            # Keep replan_done True to avoid retry loops on send failure.
+        return ok
+
+    def _finish_center_oneshot(self) -> None:
+        """After center arrive: live UV depth re-estimate → optional replan → near.
+
+        First oneshot uses probe mono (often wrong depth → tip climb). On arrive,
+        rebuild berry on the *live* UV ray with fresh depth and, if residual or
+        depth change warrants it, fire one more aim_uv_ik before contact.
+        """
+        # Always dump analysis frame first (including paths that ERROR below).
+        self._snap_center_oneshot_arrive_analysis(reason='finish_center_oneshot')
+        self._write_center_climb_diag(phase='after_center')
+        self._center_oneshot_sent = False
+        pix_tol = float(getattr(self._args, 'servo_center_pix_tol_px', 35.0))
+        # Only accept live detections inside this radius of cup-aim.
+        live_max = max(
+            pix_tol,
+            float(getattr(self._args, 'refine_fresh_lock_max_pix_px', 80.0)),
+        )
+        z_guess = float(self._last_z_cam or 0.35)
+        au, av, aim_src = self._aim_uv_for_center(z_guess)
+
+        cam, uv, src = self._center_arrive_measure_near_aim(
+            aim_uv=(au, av), max_pix=live_max)
+        live_berry = self._pick_live_berry_near_aim(
+            aim_uv=(au, av), max_pix=live_max) if src.startswith('live') else None
+        if uv is None:
+            # Prefer mono-ray / last berry reproject (geometry of the oneshot).
+            geo = self._reproject_berry_geo()
+            if geo is not None and geo.get('berry_uv') is not None:
+                uv = [float(geo['berry_uv'][0]), float(geo['berry_uv'][1])]
+                bc = geo.get('berry_cam')
+                cam = (
+                    (float(bc[0]), float(bc[1]), float(bc[2]))
+                    if bc is not None else None)
+                src = 'reproject_aim'
+            else:
+                uv = [float(au), float(av)]
+                cam = None
+                src = 'aim_assumed'
+                self.get_logger().warn(
+                    f'REFINING center arrive: no live within {live_max:.0f}px of '
+                    f'{aim_src} and no reproject — continue using aim UV')
+
+        z_old = float(self._last_z_cam) if self._last_z_cam else z_guess
+        if src.startswith('live'):
+            z_est, z_src = self._reestimate_z_on_live_uv(
+                uv=(float(uv[0]), float(uv[1])),
+                berry=live_berry,
+                cam=cam,
+            )
+            if z_est is None:
+                z_est = float(cam[2]) if cam is not None and cam[2] > 1e-4 else z_guess
+                z_src = 'fallback'
+            self._update_berry_from_live_uv(
+                uv=(float(uv[0]), float(uv[1])),
+                z_cam=float(z_est),
+                berry=live_berry,
+                reason=f'center_arrive_live_{z_src}',
+            )
+            au, av, aim_src = self._aim_uv_for_center(float(z_est))
+            pix = math.hypot(float(uv[0]) - au, float(uv[1]) - av)
+            dz = abs(float(z_est) - float(z_old))
+            if pix > pix_tol:
+                self.get_logger().warn(
+                    f'REFINING center arrive residual: live pix_off={pix:.1f}>'
+                    f'{pix_tol:.0f} to {aim_src} '
+                    f'uv=({float(uv[0]):.0f},{float(uv[1]):.0f})→'
+                    f'({au:.0f},{av:.0f}) z={float(z_est):.3f}({z_src})')
+            else:
+                self.get_logger().info(
+                    f'REFINING center arrive ok: pix_off={pix:.1f} to {aim_src} '
+                    f'src={src} z={float(z_est):.3f}({z_src}) '
+                    f'uv=({float(uv[0]):.0f},{float(uv[1]):.0f})')
+
+            # One live-UV depth replan before handing off to contact.
+            enable_replan = bool(
+                getattr(self._args, 'servo_center_live_replan', True))
+            last_cmd = getattr(self, '_center_last_cmd', None) or {}
+            last_was_replan = bool(last_cmd.get('live_replan'))
+            planned_dz = 0.0
+            cmd_d = last_cmd.get('cmd_d_base_m')
+            if isinstance(cmd_d, (list, tuple)) and len(cmd_d) >= 3:
+                planned_dz = abs(float(cmd_d[2]))
+            need_replan = (
+                enable_replan
+                and not self._center_live_replan_done
+                and not last_was_replan
+                and (
+                    pix > max(8.0, pix_tol * 0.5)
+                    or dz > 0.025
+                    or planned_dz > 0.04
+                )
+            )
+            if last_was_replan:
+                self.get_logger().info(
+                    'REFINING center live-replan arrive done — hand off to depth/near')
+            if need_replan and self._last_berry_base is not None:
+                if self._start_center_live_replan(
+                    uv=(float(uv[0]), float(uv[1])),
+                    berry=tuple(self._last_berry_base),
+                    z_aim=float(z_est),
+                    z_src=z_src,
+                ):
+                    return
+        elif src.startswith('reproject'):
+            z = float(cam[2]) if cam is not None and cam[2] > 1e-4 else z_guess
+            au, av, aim_src = self._aim_uv_for_center(z)
+            pix = math.hypot(float(uv[0]) - au, float(uv[1]) - av)
+            if pix > max(pix_tol, live_max):
+                self.get_logger().error(
+                    f'REFINING center arrive miss: reproject pix_off={pix:.1f} '
+                    f'to {aim_src} — geometry off')
+                self._set_state(
+                    'ERROR',
+                    f'center arrive reproject miss pix_off={pix:.1f}px')
+                return
+            self.get_logger().info(
+                f'REFINING center arrive ok: pix_off={pix:.1f} to {aim_src} '
+                f'src={src} uv=({float(uv[0]):.0f},{float(uv[1]):.0f}) '
+                f'live_max={live_max:.0f}px')
+        else:
+            z = float(cam[2]) if cam is not None and cam[2] > 1e-4 else z_guess
+            au, av, aim_src = self._aim_uv_for_center(z)
+            pix = math.hypot(float(uv[0]) - au, float(uv[1]) - av)
+            self.get_logger().info(
+                f'REFINING center arrive ok: pix_off={pix:.1f} to {aim_src} '
+                f'src={src} uv=({float(uv[0]):.0f},{float(uv[1]):.0f}) '
+                f'live_max={live_max:.0f}px')
+
+        # Clear old probe lock → wait for fresh YOLO near cup-aim → re-pin.
+        # Empty 1–2 frames after clear are normal; await covers that.
+        self._clear_target_lock()
+        self._await_fresh_optical_until = time.time() + float(
+            getattr(self._args, 'refine_post_center_live_wait_s', 1.0))
+        self._range_depth_started = False
+        self._refine_phase = 'post_center'
+        self._refresh_berry_cam_from_tri()
+        qa_max = float(getattr(self._args, 'refine_fresh_lock_max_pix_px', 80.0)) * 1.5
+        pix_live = self._optical_live_pix_off(max_pix=qa_max)
+        pix_tri = self._reproject_pix_off()
+        wait_s = float(getattr(self._args, 'refine_post_center_live_wait_s', 1.0))
+        self.get_logger().info(
+            f'REFINING center arrive done: live_pix_off='
+            f'{(pix_live if pix_live is not None else -1):.1f}px '
+            f'reproject_pix_off={(pix_tri if pix_tri is not None else -1):.1f}px '
+            f'(lock cleared; await live@cup-aim ≤{wait_s:.1f}s then re-pin)')
+        self._begin_range_depth()
+
+    def _center_arrive_measure_near_aim(
+        self,
+        *,
+        aim_uv: Tuple[float, float],
+        max_pix: float,
+    ) -> Tuple[Optional[Tuple[float, float, float]], Optional[List[float]], str]:
+        """Live YOLO whose *bbox* UV is within max_pix of cup-aim — else none."""
+        au, av = float(aim_uv[0]), float(aim_uv[1])
+        track_min = float(getattr(self._args, 'refine_track_min_conf', 0.12))
+        ranked: List[Tuple[float, DetectedBerry]] = []
+        for b in self._live_fine_berries():
+            if float(b.confidence) < track_min:
+                continue
+            uv = self._berry_image_uv(b)
+            if uv is None:
+                continue
+            e = math.hypot(float(uv[0]) - au, float(uv[1]) - av)
+            if e <= float(max_pix):
+                ranked.append((e, b))
+        if not ranked:
+            return None, None, 'none'
+        ranked.sort(key=lambda x: x[0])
+        live = ranked[0][1]
+        uv = self._berry_image_uv(live)
+        cam = self._berry_cam_xyz(live)
+        if uv is None:
+            return None, None, 'none'
+        if cam is None or cam[2] <= 1e-4:
+            fx, fy, cx, cy = self._wrist_intrinsics()
+            z = float(getattr(live, 'z_mono_m', -1.0))
+            if z <= 1e-4 and self._last_z_cam:
+                z = float(self._last_z_cam)
+            if z > 1e-4:
+                cam = (
+                    (float(uv[0]) - cx) / fx * z,
+                    (float(uv[1]) - cy) / fy * z,
+                    z,
+                )
+        return cam, [float(uv[0]), float(uv[1])], 'live_near_aim'
+
+    def _center_arrive_measure(
+        self,
+    ) -> Tuple[Optional[Tuple[float, float, float]], Optional[List[float]], str]:
+        """Compat: live near cup-aim only (no unlimited fallback)."""
+        z = float(self._last_z_cam or 0.35)
+        au, av, _ = self._aim_uv_for_center(z)
+        max_pix = max(
+            float(getattr(self._args, 'servo_center_pix_tol_px', 35.0)),
+            float(getattr(self._args, 'refine_fresh_lock_max_pix_px', 80.0)),
+        )
+        return self._center_arrive_measure_near_aim(
+            aim_uv=(au, av), max_pix=max_pix)
+
+    def _center_oneshot_measure_for_residual(
+        self,
+    ) -> Tuple[Optional[Tuple[float, float, float]], Optional[List[float]], str]:
+        """Deprecated alias — residual center path removed."""
+        return self._center_arrive_measure()
+
+    def _optical_live_pix_off(self, max_pix: Optional[float] = None) -> Optional[float]:
+        """Live berry nearest optical center — for QA after center, not control."""
+        b = self._pick_live_nearest_optical(max_pix=max_pix)
+        if b is None:
+            return None
+        return self._berry_optical_pix_err(b)
+
+    def _center_live_pix_off(self) -> Optional[float]:
+        return self._optical_live_pix_off()
+
+    def _fresh_lock_optical_center(self, *, reason: str) -> Optional[DetectedBerry]:
+        """After center: pick live YOLO near cup-aim and rebuild 3D on its UV.
+
+        Called after clear_lock: old probe ID is gone; re-pin the YOLO box near
+        cup-aim (not optical center) and re-estimate depth on that UV.
+        """
+        old = self._refine_locked_track_id
+        max_pix = float(getattr(self._args, 'refine_fresh_lock_max_pix_px', 80.0))
+        fresh_min = float(getattr(self._args, 'refine_fresh_lock_min_conf', 0.10))
+        z_g = float(self._last_z_cam or 0.35)
+        au, av, _ = self._aim_uv_for_center(z_g)
+        # Cup-aim first; optical-nearest only as last resort inside radius.
+        neu = self._pick_live_berry_near_aim(
+            aim_uv=(au, av), max_pix=max_pix, min_conf=fresh_min)
+        if neu is None:
+            neu = self._pick_live_nearest_optical(max_pix=max_pix, min_conf=fresh_min)
+        if neu is None:
+            return None
+        tid = int(neu.track_id)
+        self._refine_locked_track_id = tid
+        self._lock_pub.publish(neu)
+        self._refine_lock_sync_tid = tid if tid >= 0 else None
+        self._refine_lock_sync_streak = 0
+        self._refine_lock_sync_deadline = time.time() + 3.0
+
+        ok3d, z_src = self._correct_berry_3d_from_fresh_lock(
+            neu, reason=f'fresh_lock_{reason}')
+        if not ok3d:
+            # Last resort: published pose (may be wrong depth — logged).
+            bx = float(neu.pose.pose.position.x)
+            by = float(neu.pose.pose.position.y)
+            bz = float(neu.pose.pose.position.z)
+            self._last_berry_base = (bx, by, bz)
+            self._refine_fruit_anchor = (bx, by, bz)
+            cam = self._berry_cam_xyz(neu)
+            if cam is not None and cam[2] > 1e-4:
+                self._last_z_cam = float(cam[2])
+            self._last_berry_t = time.time()
+            self.get_logger().warn(
+                f'REFINING fresh optical lock {old}→{tid}: 3D rebuild failed '
+                f'({z_src}) — fell back to YOLO pose XYZ')
+
+        pix = self._berry_optical_pix_err(neu)
+        uv = self._berry_image_uv(neu)
+        aim_pix = None
+        if uv is not None:
+            aim_pix = math.hypot(float(uv[0]) - au, float(uv[1]) - av)
+        b = self._last_berry_base
+        base_s = (
+            f'base=({b[0]:.3f},{b[1]:.3f},{b[2]:.3f})' if b is not None else 'base=None')
+        self.get_logger().info(
+            f'REFINING fresh lock {old}→{tid} ({reason}) '
+            f'cup_aim_pix={(aim_pix if aim_pix is not None else -1):.1f} '
+            f'opt_pix={(pix if pix is not None else -1):.1f} '
+            f'conf={float(neu.confidence):.2f} min_conf={fresh_min:.2f} '
+            f'mode={getattr(neu, "depth_mode", "")} '
+            f'3d={z_src if ok3d else "yolo_pose_fallback"} {base_s}')
+        self._snap_refine_lock_viz('optical_fresh_lock', source='yolo_fresh_lock', berry=neu)
+        return neu
+
+    def _finish_depth_qa_stop(self, *, depth_source: str) -> None:
+        """Stop-after-center: record approach depth (YOLO depth probe or probe-tri reproject)."""
+        if self._depth_qa_stop_done:
+            return
+        self._depth_qa_stop_done = True
+        self._clear_target_lock()
+        if depth_source == 'probe_tri_reproject':
+            self._refresh_berry_cam_from_tri()
+        elif depth_source == 'probe_tri_mono_chord':
+            self._refresh_berry_cam_from_tri()
+        berry = self._last_berry_base
+        tcp = self._tcp_or_ee_xyz()
+        contact = float(self._args.cup_contact_offset)
+        dist_cup = self._cup_berry_dist()
+        travel = (
+            float(dist_cup - contact)
+            if dist_cup is not None and dist_cup > contact
+            else None)
+        geo: Dict = {}
+        if berry is not None and tcp is not None:
+            geo = self._cup_berry_geometry(berry, tcp)
+            geo['z_cam_m'] = self._last_z_cam
+            geo['travel_m'] = travel
+            geo['depth_source'] = depth_source
+            self._write_cup_rel_overlay('center_depth_qa', geo)
+        pix_tri = self._reproject_pix_off()
+        pix_live = self._optical_live_pix_off()
+        payload = {
+            'timestamp': datetime.now().isoformat(timespec='seconds'),
+            'session': self._qa_session,
+            'depth_source': depth_source,
+            'berry_base': list(berry) if berry else None,
+            'tcp_base': list(tcp) if tcp else None,
+            'z_cam_m': self._last_z_cam,
+            'dist_cup_m': dist_cup,
+            'cup_contact_offset_m': contact,
+            'travel_to_contact_m': travel,
+            'reproject_pix_off_px': pix_tri,
+            'live_pix_off_px': pix_live,
+            'berry_uv': geo.get('berry_uv'),
+            'cup_uv': geo.get('cup_uv'),
+            'berry_rel_cup': geo.get('berry_rel_cup'),
+            'center_probe_tri_ok': bool(self._center_probe_tri_ok),
+        }
+        mono_meta = getattr(self, '_last_mono_chord_meta', None)
+        if mono_meta:
+            payload['mono_chord'] = mono_meta
+        if depth_source == 'yolo_depth_probe':
+            mp = self._qa_session_dir()
+            if mp:
+                dp = os.path.join(mp, 'mono_probe_depth.json')
+                if os.path.isfile(dp):
+                    try:
+                        with open(dp, encoding='utf-8') as f:
+                            payload['mono_probe_depth'] = json.load(f)
+                    except Exception:
+                        pass
+        self._write_qa_json('center_depth_qa.json', payload)
+        self._snap_qa('center_depth_qa')
+        self._refine_phase = 'center_done'
+        self._snap_refine_lock_viz('center_done')
+        self.get_logger().info(
+            f'REFINING depth QA stop ({depth_source}): '
+            f'z_cam={(self._last_z_cam if self._last_z_cam is not None else -1):.3f}m '
+            f'dist_cup={(dist_cup if dist_cup is not None else -1):.3f}m '
+            f'travel={(travel if travel is not None else -1):.3f}m '
+            f'reproject_pix_off={(pix_tri if pix_tri is not None else -1):.1f}px '
+            f'— measure travel_to_contact in replay')
+        self._set_state('WAIT_CONFIRM')
+
+    def _begin_range_depth(self) -> None:
+        """After open-loop center: depth QA (stop) or full contact pipeline."""
+        if (
+            self._depth_qa_stop_done
+            or self._refine_phase == 'center_done'
+            or self._range_depth_started
+            or self._near_handoff_written
+            or self._state == 'REFINING_WAIT_NEAR'
+        ):
+            return
+        self._refresh_berry_cam_from_tri()
+        stop_after = bool(getattr(self._args, 'refine_stop_after_center', False))
+        fresh_min = float(getattr(self._args, 'refine_fresh_lock_min_conf', 0.10))
+        max_pix = float(getattr(self._args, 'refine_fresh_lock_max_pix_px', 80.0))
+
+        if stop_after:
+            neu = self._fresh_lock_optical_center(reason='stop_after_center_yolo')
+            if neu is not None:
+                self._range_depth_started = True
+                self._await_fresh_optical_until = 0.0
+                self.get_logger().info(
+                    'REFINING stop-after-center: fresh YOLO near cup-aim '
+                    '→ depth QA (skip orbit probe)')
+                self._finish_depth_qa_stop(depth_source='yolo_fresh_lock')
+                return
+            if time.time() < float(self._await_fresh_optical_until or 0.0):
+                now = time.time()
+                if now - self._refine_wait_log_t > 0.4:
+                    self._refine_wait_log_t = now
+                    self.get_logger().info(
+                        f'REFINING awaiting live@cup-aim after center '
+                        f'(min_conf={fresh_min:.2f} max_pix={max_pix:.0f})')
+                return
+            self._range_depth_started = True
+            if self._center_probe_tri_ok and self._last_berry_base is not None:
+                ds = self._apply_probe_tri_mono_chord_scale()
+                self._finish_depth_qa_stop(
+                    depth_source=ds or 'probe_tri_reproject')
+                return
+            self._set_state(
+                'ERROR',
+                'refine: no live YOLO at center and center probe tri unavailable')
+            return
+
+        neu = self._fresh_lock_optical_center(reason='after_center_openloop')
+        if neu is not None:
+            self._await_fresh_optical_until = 0.0
+            # Fresh lock already rebuilt 3D (UV ray + probe gate). Optionally
+            # one more aim_uv_ik if cup-aim residual is still large — even when
+            # an earlier live-replan already ran (162251: replan used wrong UV,
+            # then fresh ID was right but 3D was skipped because replan_done).
+            uv_n = self._berry_image_uv(neu)
+            if (
+                uv_n is not None
+                and self._last_berry_base is not None
+                and bool(getattr(self._args, 'servo_center_live_replan', True))
+            ):
+                z_now = float(self._last_z_cam or 0.35)
+                au, av, _ = self._aim_uv_for_center(z_now)
+                pix_n = math.hypot(float(uv_n[0]) - au, float(uv_n[1]) - av)
+                pix_tol = float(
+                    getattr(self._args, 'servo_center_pix_tol_px', 35.0))
+                need_fresh_replan = pix_n > max(8.0, pix_tol * 0.5)
+                # Allow one fresh-lock-driven replan even if climb replan ran.
+                already = bool(getattr(self, '_center_live_replan_done', False))
+                last_cmd = getattr(self, '_center_last_cmd', None) or {}
+                last_was_fresh = bool(last_cmd.get('fresh_lock_replan'))
+                if need_fresh_replan and not last_was_fresh:
+                    if already:
+                        # Permit a second oneshot attempt for fresh-lock UV.
+                        self._center_live_replan_done = False
+                    if self._start_center_live_replan(
+                        uv=(float(uv_n[0]), float(uv_n[1])),
+                        berry=tuple(self._last_berry_base),
+                        z_aim=float(z_now),
+                        z_src='fresh_lock_3d',
+                    ):
+                        return
+
+            self._range_depth_started = True
+            # Fresh YOLO at center already carries a base pose (mono and/or prior
+            # probe-tri). A second contact mono probe often coasts the lock and
+            # re-pins to a far box (20260807_142705). Skip that probe whenever we
+            # already have berry_base — tri_ok is nice-to-have, not required.
+            if self._last_berry_base is not None:
+                why = (
+                    'after_center_yolo_fresh_lock'
+                    if self._center_probe_tri_ok
+                    else 'after_center_yolo_fresh_lock_mono'
+                )
+                self.get_logger().info(
+                    f'REFINING → contact: fresh optical YOLO + berry_base '
+                    f'(skip contact mono probe; tri_ok={self._center_probe_tri_ok})')
+                self._enter_contact_oneshot(reason=why)
+                return
+            self._mono_probe_done = False
+            self._mono_probe_obs = []
+            self._mono_probe_purpose = 'contact'
+            self._refine_phase = 'range_depth'
+            self.get_logger().info(
+                'REFINING → range_depth: fresh optical lock without berry_base '
+                '→ live depth probe → contact oneshot')
+            return
+
+        if time.time() < float(self._await_fresh_optical_until or 0.0):
+            now = time.time()
+            if now - self._refine_wait_log_t > 0.4:
+                self._refine_wait_log_t = now
+                n_live = len(self._live_fine_berries())
+                z_g = float(self._last_z_cam or 0.35)
+                au, av, _ = self._aim_uv_for_center(z_g)
+                near_aim = self._pick_live_berry_near_aim(
+                    aim_uv=(au, av), max_pix=max_pix)
+                self.get_logger().info(
+                    f'REFINING awaiting live@cup-aim after center '
+                    f'(live_n={n_live} near_aim={int(near_aim is not None)} '
+                    f'min_conf={fresh_min:.2f} max_pix={max_pix:.0f})')
+            return
+
+        self.get_logger().warn(
+            f'REFINING fresh lock timeout after center '
+            f'(min_conf={fresh_min:.2f} max_pix={max_pix:.0f}) — try live@aim 3D')
+        # Timeout: if a live box near cup-aim appeared, rebuild 3D on it (no fake
+        # deepen). Optional oneshot only when residual still large.
+        if bool(getattr(self._args, 'servo_center_live_replan', True)):
+            z_g = float(self._last_z_cam or 0.35)
+            au, av, _ = self._aim_uv_for_center(z_g)
+            live_max = max(
+                float(getattr(self._args, 'servo_center_pix_tol_px', 35.0)),
+                float(max_pix),
+            )
+            live_b = self._pick_live_berry_near_aim(
+                aim_uv=(au, av), max_pix=live_max)
+            if live_b is not None and float(live_b.confidence) >= fresh_min:
+                uv_a = self._berry_image_uv(live_b)
+                cam_a = self._berry_cam_xyz(live_b)
+                if uv_a is not None:
+                    z_est, z_src = self._reestimate_z_on_live_uv(
+                        uv=(float(uv_a[0]), float(uv_a[1])),
+                        berry=live_b,
+                        cam=cam_a,
+                    )
+                    if z_est is None and cam_a is not None and cam_a[2] > 1e-4:
+                        z_est, z_src = float(cam_a[2]), 'live_cam'
+                    if z_est is not None:
+                        self._update_berry_from_live_uv(
+                            uv=(float(uv_a[0]), float(uv_a[1])),
+                            z_cam=float(z_est),
+                            berry=live_b,
+                            reason=f'post_center_live_aim_{z_src}',
+                        )
+                        tid = int(live_b.track_id)
+                        self._refine_locked_track_id = tid
+                        self._lock_pub.publish(live_b)
+                        pix_n = math.hypot(float(uv_a[0]) - au, float(uv_a[1]) - av)
+                        pix_tol = float(
+                            getattr(self._args, 'servo_center_pix_tol_px', 35.0))
+                        if (
+                            pix_n > max(8.0, pix_tol * 0.5)
+                            and self._last_berry_base is not None
+                            and not self._center_live_replan_done
+                        ):
+                            if self._start_center_live_replan(
+                                uv=(float(uv_a[0]), float(uv_a[1])),
+                                berry=tuple(self._last_berry_base),
+                                z_aim=float(z_est),
+                                z_src=z_src,
+                            ):
+                                return
+                        # Live 3D updated — contact without inventing depth.
+                        self._range_depth_started = True
+                        self._enter_contact_oneshot(
+                            reason='after_center_live_aim_timeout')
+                        return
+
+        self._range_depth_started = True
+        use_tri = bool(getattr(self._args, 'refine_contact_from_probe_tri', True))
+        if use_tri and self._contact_from_probe_tri(reason='center_probe_tri_no_yolo'):
+            return
+
+        # No usable live near cup-aim: keep probe mono-ray berry (no deepen).
+        if self._last_berry_base is not None:
+            self.get_logger().warn(
+                'REFINING → contact: no live@cup-aim after center wait — '
+                'use existing probe_mono_ray berry_base')
+            self._enter_contact_oneshot(reason='after_center_probe_mono_ray_no_yolo')
+            return
+
+        self._set_state(
+            'ERROR',
+            'refine: no live berry near cup-aim after center and probe tri unavailable')
+
+    def _enter_contact_oneshot(self, *, reason: str) -> None:
+        """After depth is known: freeze berry → one planned traj to cup contact."""
+        self._refine_phase = 'near'
+        self._near_frozen_berry = None
+        self._freeze_near_berry()
+        dist_cup = self._cup_berry_dist()
+        if self._args.servo_near_confirm:
+            # Enter WAIT_NEAR BEFORE slow QA snaps so a concurrent refine tick
+            # cannot auto-start near oneshot (phase==near used to enable it).
+            self._near_mode = False
+            self.get_logger().info(
+                f'REFINING → WAIT_NEAR ({reason}): oneshot to contact '
+                f'dist_cup={(dist_cup if dist_cup is not None else -1):.3f} '
+                f'— publish confirm_near')
+            self._set_state('REFINING_WAIT_NEAR')
+            self._refine_deadline = time.time() + 600.0
+            if not self._near_handoff_written:
+                nh_src = 'near_handoff_yolo_lock'
+                if self._refine_locked_track_id is None:
+                    nh_src = (
+                        'near_handoff_probe_tri_mono_chord'
+                        if self._probe_tri_chord_applied
+                        else 'near_handoff_probe_tri')
+                berry = None
+                if self._refine_locked_track_id is not None:
+                    for b in self._live_fine_berries():
+                        if int(b.track_id) == int(self._refine_locked_track_id):
+                            berry = b
+                            break
+                self._snap_refine_lock_viz(
+                    'near_handoff_pending', source=nh_src, berry=berry)
+                self._write_near_handoff_request(
+                    dist_cup=dist_cup, z_cam=self._last_z_cam, berry_age=0.0)
+                self._near_handoff_written = True
+            return
+        self._near_mode = True
+        self.get_logger().info(
+            f'REFINING → near oneshot ({reason}): freeze berry, single traj to contact '
+            f'dist_cup={(dist_cup if dist_cup is not None else -1):.3f}')
+
+    def _pin_berry_from_probe_for_direct_contact(self) -> str:
+        """Freeze berry for probe→near skip-center.
+
+        Prefer accepted probe triangulation; else last probe mono-ray back-project.
+        """
+        if bool(getattr(self, '_center_probe_tri_ok', False)) and self._last_berry_base is not None:
+            b = self._last_berry_base
+            self.get_logger().info(
+                f'REFINING skip-center: use probe_tri '
+                f'base=({b[0]:.3f},{b[1]:.3f},{b[2]:.3f})')
+            return 'probe_tri'
+        berry, src = self._berry_base_for_center_aim()
+        if berry is None:
+            self.get_logger().warn(
+                'REFINING skip-center: no probe berry to freeze')
+            return 'none'
+        self._last_berry_base = berry
+        self._refine_fruit_anchor = berry
+        self._last_berry_t = time.time()
+        self._near_frozen_berry = None
+        cam = self._base_xyz_to_cam(berry)
+        if cam is not None and cam[2] > 1e-4:
+            self._last_z_cam = float(cam[2])
+        self.get_logger().info(
+            f'REFINING skip-center: freeze berry from {src} '
+            f'base=({berry[0]:.3f},{berry[1]:.3f},{berry[2]:.3f})')
+        return src
+
+    def _finish_mono_probe(self) -> None:
+        """End of a small-step range: triangulate then center-oneshot or contact-oneshot."""
+        self._mono_probe_done = True
+        purpose = str(self._mono_probe_purpose or 'contact')
+        tag = 'mono_probe_center' if purpose == 'center' else 'mono_probe_depth'
+        self._apply_triangulation(tag)
+        # Ranging motion itself calibrates look-at Jac (Δq → ΔUV).
+        if purpose == 'center':
+            self._update_ee_uv_jac_from_probe()
+            # Experiment: probe lock+depth → one open-loop push to berry (no center).
+            if bool(getattr(self._args, 'refine_skip_center', False)):
+                src = self._pin_berry_from_probe_for_direct_contact()
+                if self._last_berry_base is None:
+                    self._set_state(
+                        'ERROR',
+                        f'refine skip-center: no berry after probe ({src})')
+                    return
+                self._enter_contact_oneshot(reason=f'probe_skip_center_{src}')
+                return
+            if not self._start_center_oneshot():
+                # Already centered or IK fail → still proceed to depth range.
+                if self._refine_phase != 'range_depth':
+                    self._begin_range_depth()
+            return
+        if bool(getattr(self._args, 'refine_stop_after_center', False)):
+            self._finish_depth_qa_stop(depth_source='yolo_depth_probe')
+            return
+        self._enter_contact_oneshot(reason='probe_depth_done')
+
+    def _tick_mono_probe(self) -> None:
+        """Known orbit move + track UV → triangulate mono range."""
+        n_move = max(1, int(getattr(self._args, 'servo_mono_probe_steps', 2)))
+        # Need one obs before each move, then one after last move.
+        if len(self._mono_probe_obs) == 0:
+            obs = self._capture_mono_probe_obs()
+            if obs is None:
+                now = time.time()
+                if now - self._refine_wait_log_t > 1.0:
+                    self._refine_wait_log_t = now
+                    self.get_logger().info('REFINING mono probe: waiting for berry UV')
+                return
+            self._mono_probe_obs.append(obs)
+            self.get_logger().info(
+                f'REFINING mono probe obs0 uv=({obs["uv"][0]:.1f},{obs["uv"][1]:.1f}) '
+                f'z_mono={obs["z_mono"]:.3f}')
+            if not self._start_mono_probe_step():
+                return
+            return
+
+        # After a settle, move_phase is None and we land here again.
+        need_obs = n_move + 1
+        if len(self._mono_probe_obs) < need_obs:
+            obs = self._capture_mono_probe_obs()
+            if obs is None:
+                return
+            # Skip near-duplicate UV if arm hasn't moved yet.
+            prev = self._mono_probe_obs[-1]
+            du = abs(obs['uv'][0] - prev['uv'][0]) + abs(obs['uv'][1] - prev['uv'][1])
+            tcp0 = prev.get('tcp_base')
+            tcp1 = obs.get('tcp_base')
+            tcp_move = 0.0
+            if tcp0 and tcp1:
+                tcp_move = math.sqrt(
+                    (tcp1[0] - tcp0[0]) ** 2
+                    + (tcp1[1] - tcp0[1]) ** 2
+                    + (tcp1[2] - tcp0[2]) ** 2)
+            if tcp_move < 0.005 and du < 2.0 and len(self._mono_probe_obs) >= 1:
+                # Still starting first move — wait.
+                if not self._arm.server_is_ready():
+                    return
+                return
+            self._mono_probe_obs.append(obs)
+            self.get_logger().info(
+                f'REFINING mono probe obs{len(self._mono_probe_obs)-1} '
+                f'uv=({obs["uv"][0]:.1f},{obs["uv"][1]:.1f}) '
+                f'tcp_move={tcp_move:.3f}m duv={du:.1f}px')
+            if len(self._mono_probe_obs) >= need_obs:
+                self._finish_mono_probe()
+                return
+            self._start_mono_probe_step()
+            return
+
+        self._finish_mono_probe()
+
+    def _tick_wrist_servo_refine(self) -> None:
+        """range_center → center_oneshot → range_depth → contact oneshot."""
+        if self._refine_lock_snap_pending:
+            self._refine_lock_snap_pending = False
+            self._snap_refine_lock_viz('refine_fruit_lock')
+        if self._await_fine_tracker_reset_before_lock():
+            return
+        if self._refine_fruit_anchor is None:
+            self._init_refine_fruit_lock()
+            if self._refine_fruit_anchor is None:
+                if time.time() > self._refine_deadline:
+                    self._set_state(
+                        'ERROR', 'refine: no fruit lock at REFINING entry')
+                return
+
+        if self._args.dry_run:
+            berry = self._pick_fine_berry()
+            if berry is not None or time.time() > self._refine_deadline:
+                self.get_logger().info('dry-run: skip wrist servo, pretend reached')
+                self._reached_pub.publish(Bool(data=True))
+                self._set_state('REACHED')
+                self._set_state('WAIT_CONFIRM')
+            return
+
+        if time.time() > self._refine_deadline:
+            why = self._fine_reject_reason()
+            self._set_state(
+                'ERROR',
+                f'refine/servo timeout — need wrist fine berry + contact; {why}')
+            return
+
+        if not self._locked_track_live_synced():
+            return
+
+        # No small-step range: plan center oneshot from current mono lock immediately.
+        if (
+            not bool(getattr(self._args, 'servo_mono_probe', True))
+            and self._refine_phase == 'range_center'
+            and not self._near_mode
+        ):
+            if not self._start_center_oneshot():
+                self._enter_contact_oneshot(reason='no_probe_skip_center')
+            return
+
+        # Small-step tracking ranges (measure only — not incremental centering).
+        if (
+            bool(getattr(self._args, 'servo_mono_probe', True))
+            and self._refine_phase in ('range_center', 'range_depth', 'probe')
+            and not self._mono_probe_done
+            and not self._near_mode
+        ):
+            self._tick_mono_probe()
+            return
+
+        # Waiting for center oneshot traj / settle.
+        if self._refine_phase == 'center_oneshot':
+            if self._move_phase is not None:
+                return
+            if not self._center_oneshot_sent:
+                if not self._start_center_oneshot():
+                    self._refine_phase = 'post_center'
+                    self._begin_range_depth()
+            return
+
+        # After center arrive: await live YOLO / live-replan / contact — never
+        # re-fire open-loop center oneshot (153728 bug: phase stuck on
+        # center_oneshot with sent=False → spurious second start).
+        if self._refine_phase == 'post_center':
+            if self._move_phase is not None:
+                return
+            self._begin_range_depth()
+            return
+
+        berry = self._pick_fine_berry()
+        z_cam: Optional[float] = None
+        pix_err: Optional[float] = None
+        using_estimate = False
+
+        # Legacy mid PBVS removed.
+        if self._refine_phase in ('approach', 'center') and not self._near_mode:
+            if self._last_berry_base is not None:
+                self._start_center_oneshot()
+            else:
+                self._refine_phase = 'range_center'
+                self._mono_probe_purpose = 'center'
+                self._mono_probe_done = False
+            return
+
+        if berry is not None:
+            self._refine_fine_lost_streak = 0
+            self._lock_pub.publish(berry)
+            cam = self._berry_cam_xyz(berry)
+            if cam is not None and cam[2] > 1e-4:
+                z_cam = self._filter_z_cam(float(cam[2]))
+                pix_err = self._servo_image_error_px((cam[0], cam[1], z_cam))
+                if not self._near_mode:
+                    self._remember_berry(berry, z_cam)
+        else:
+            self._refine_fine_lost_streak += 1
+            berry_age = (
+                time.time() - self._last_berry_t if self._last_berry_t > 0 else 1e9)
+            if self._refine_phase in ('range_center', 'range_depth', 'center_oneshot'):
+                now = time.time()
+                if now - self._refine_wait_log_t > 1.0:
+                    self._refine_wait_log_t = now
+                    self.get_logger().info(
+                        f'REFINING {self._refine_phase}: lost live track '
+                        f'(streak={self._refine_fine_lost_streak}) — hold')
+                return
+            if (
+                not self._near_mode
+                and self._refine_phase == 'near'
+                and self._last_berry_base is not None
+                and berry_age <= float(self._args.servo_estimate_max_age_s)
+            ):
+                self._last_berry_t = time.time()
+                cam = self._base_xyz_to_cam(self._last_berry_base)
+                if cam is not None and cam[2] > 1e-4:
+                    z_cam = self._filter_z_cam(float(cam[2]))
+                    pix_err = self._servo_image_error_px((cam[0], cam[1], z_cam))
+                    using_estimate = True
+                elif self._last_z_cam is not None and self._last_z_cam > 1e-4:
+                    z_cam = float(self._last_z_cam)
+                    using_estimate = True
+
+        contact = float(self._args.cup_contact_offset)
+        dist_cup = self._cup_berry_dist()
+        contact_tol = contact + 0.005
+        if dist_cup is not None and dist_cup <= contact_tol:
+            self.get_logger().info(
+                f'REFINING contact (cup↔berry): dist={dist_cup:.3f}m <= {contact_tol:.3f}m '
+                f'(offset={contact:.3f}m) '
+                f'z_cam={(z_cam if z_cam is not None else -1.0):.3f} near={int(self._near_mode)}')
+            self._snap_qa(f'servo_{self._servo_step_idx:02d}_contact')
+            self._reached_pub.publish(Bool(data=True))
+            self._set_state('REACHED')
+            self._set_state('WAIT_CONFIRM')
+            return
+
+        # Contact oneshot only after human confirm sets _near_mode (or auto path).
+        # refine_phase=='near' alone is NOT enough — WAIT_NEAR sets phase first.
+        if not self._near_mode:
+            now = time.time()
+            if now - self._refine_wait_log_t > 2.0:
+                self._refine_wait_log_t = now
+                self.get_logger().info(
+                    f'REFINING idle in phase={self._refine_phase} '
+                    f'(waiting range/oneshot pipeline or confirm_near)')
+            return
+
+        berry_age = time.time() - self._last_berry_t if self._last_berry_t > 0 else 1e9
+        estimate_fresh = (
+            (self._near_frozen_berry is not None)
+            or (
+                self._last_berry_base is not None
+                and berry_age <= float(self._args.servo_estimate_max_age_s)))
+        if not estimate_fresh:
+            now = time.time()
+            if now - self._refine_wait_log_t > 2.0:
+                self._refine_wait_log_t = now
+                self.get_logger().warn('REFINING near: no frozen berry pose')
+            return
+
+        self._freeze_near_berry()
+        if self._near_oneshot_sent or self._move_phase is not None:
+            return
+        if not self._start_near_oneshot_step(dist_cup):
+            now = time.time()
+            if now - self._refine_wait_log_t > 2.0:
+                self._refine_wait_log_t = now
+                dist_now = self._cup_berry_dist()
+                contact = float(self._args.cup_contact_offset)
+                soft = contact + 0.008
+                if dist_now is not None and dist_now <= soft:
+                    self.get_logger().info(
+                        f'REFINING near oneshot: close enough dist={dist_now:.3f}m '
+                        f'≤ {soft:.3f}m — contact')
+                    self._snap_qa(f'servo_{self._servo_step_idx:02d}_contact')
+                    self._reached_pub.publish(Bool(data=True))
+                    self._set_state('REACHED')
+                    self._set_state('WAIT_CONFIRM')
+                    return
+                self.get_logger().warn(
+                    f'REFINING near oneshot: waiting '
+                    f'(attempts={self._near_oneshot_attempts} '
+                    f'dist={(dist_now if dist_now is not None else -1):.3f})')
+
+    def _send_joint_servo_goal(
+        self,
+        target: List[float],
+        *,
+        tag: str,
+        extra: str = '',
+        traj_s: Optional[float] = None,
+    ) -> bool:
+        max_dj = max(abs(target[i] - self._joints[i]) for i in range(6))
+        if max_dj < math.radians(0.12):
+            self.get_logger().info(f'REFINING {tag}: joint delta tiny — waiting')
+            if tag == 'servo':
+                self._servo_pending_record = None
+            return False
+        if self._arm_goal_handle is not None:
+            try:
+                self._arm_goal_handle.cancel_goal_async()
+            except Exception:
+                pass
+            self._arm_goal_handle = None
+
+        goal = FollowJointTrajectory.Goal()
+        goal.trajectory.joint_names = list(ARM_JOINTS)
+        pt = JointTrajectoryPoint()
+        pt.positions = [float(v) for v in target]
+        dt = float(self._args.servo_traj_s if traj_s is None else traj_s)
+        pt.time_from_start.sec = int(dt)
+        pt.time_from_start.nanosec = int((dt - int(dt)) * 1e9)
+        goal.trajectory.points = [pt]
+
+        settle = float(self._args.servo_settle_s)
+        # Deadline BEFORE move_phase — MultiThreadedExecutor can poll between
+        # these assignments; deadline==0 would instant-timeout.
+        self._servo_deadline = time.time() + max(
+            float(self._args.servo_timeout_s), dt + settle + 2.0)
+        self._servo_settle_until = time.time() + dt + settle
+        self._move_phase = 'servo'
+        self._ik_fut = None
+        self._traj_goal_fut = self._arm.send_goal_async(goal)
+        self._traj_result_fut = None
+        self._servo_motion_frames = []
+        self._servo_motion_last_t = 0.0
+        # First frame at command start (pre-motion / early motion).
+        self._snap_servo_motion_frame(force=True)
+        self.get_logger().info(
+            f'REFINING {tag}[{self._servo_step_idx}]: {extra} '
+            f'Δj1={math.degrees(target[0]-self._joints[0]):+.1f}deg '
+            f'Δj2={math.degrees(target[1]-self._joints[1]):+.1f}deg '
+            f'Δj3={math.degrees(target[2]-self._joints[2]):+.1f}deg '
+            f'Δj5={math.degrees(target[4]-self._joints[4]):+.1f}deg '
+            f'→ j=({math.degrees(target[0]):.1f},{math.degrees(target[1]):.1f},'
+            f'{math.degrees(target[2]):.1f},{math.degrees(target[4]):.1f})')
+        return True
+
+    def _clamp_servo_target(self, target: List[float]) -> List[float]:
+        """URDF / suction soft limits — j6 locked; j4 free within URDF.
+
+        Historically target[3]=0 forced a planar wrist. That strips the j4
+        compensation keep_orient needs when j2 lifts → tip dives. Only j6
+        (suction roll) stays locked at 0 (REACH_PIPELINE).
+        """
+        j1_lim = math.radians(float(self._args.align_joint1_limit_deg))
+        target[0] = max(-j1_lim, min(j1_lim, target[0]))
+        target[1] = max(0.0, min(math.pi, target[1]))
+        target[2] = max(-math.pi, min(0.0, target[2]))
+        # joint4 URDF ±1.553343 rad (~±89°)
+        j4_lim = 1.553343
+        target[3] = max(-j4_lim, min(j4_lim, float(target[3])))
+        target[4] = max(
+            float(self._args.align_joint5_min_rad),
+            min(float(self._args.align_joint5_max_rad), target[4]))
+        target[5] = 0.0
+        return target
+
+    def _clamp_oneshot_joints_from_ik(
+        self,
+        joints: List[float],
+        *,
+        profile: str,
+        step_m: float = 0.02,
+    ) -> List[float]:
+        """Soft per-step joint cap after IK — legacy IBVS path only."""
+        if profile == 'center':
+            max_dj = [
+                math.radians(10.0),
+                math.radians(float(self._args.servo_max_dj2_deg) + 2.0),
+                math.radians(float(self._args.servo_max_dj3_deg) + 2.0),
+                math.radians(5.0),
+                math.radians(float(self._args.servo_max_dj5_deg) + 4.0),
+                0.0,
+            ]
+        else:
+            # Near full oneshot uses URDF-only clamp in _start_near_oneshot_step.
+            # This branch is unused for contact; keep a generous residual path.
+            j1_cap = min(45.0, 12.0 + step_m * 120.0)
+            max_dj = [
+                math.radians(j1_cap),
+                math.radians(min(60.0, float(self._args.servo_max_dj2_deg) + 40.0)),
+                math.radians(min(60.0, float(self._args.servo_max_dj3_deg) + 40.0)),
+                math.radians(45.0),
+                math.radians(min(60.0, float(self._args.servo_max_dj5_deg) + 40.0)),
+                0.0,
+            ]
+        target = list(self._joints)
+        for i in range(6):
+            d = float(joints[i]) - float(self._joints[i])
+            d = max(-max_dj[i], min(max_dj[i], d))
+            target[i] = float(self._joints[i] + d)
+        target[5] = 0.0
+        return self._clamp_servo_target(target)
+
+    def _plan_near_oneshot_delta(
+        self,
+        berry: Tuple[float, float, float],
+        tcp: Tuple[float, float, float],
+        step_m: float,
+    ) -> Optional[Tuple[np.ndarray, np.ndarray, str, Dict]]:
+        """Plan near oneshot: translate EE along cup→berry (keep_orient).
+
+        Mid-range aims the berry onto the *cup axis* (image UV below optical
+        center). Terminal contact then follows (berry − tcp). If mid-range still
+        left the berry on the optical axis, cup→berry includes the ~8 cm mount
+        climb — that is expected parallax, not a separate height bug.
+        """
+        T = self._lookup_T_base_cam()
+        berry_cam = self._base_xyz_to_cam(berry)
+        cup_cam = self._cup_cam_xyz()
+        if berry_cam is None or cup_cam is None:
+            return None
+        bc = np.array(berry_cam, dtype=np.float64)
+        cc = np.array(cup_cam, dtype=np.float64)
+        rel = np.array(
+            [berry[0] - tcp[0], berry[1] - tcp[1], berry[2] - tcp[2]],
+            dtype=np.float64,
+        )
+        dist = float(np.linalg.norm(rel))
+        if dist < 1e-4 or step_m < 1e-4:
+            return None
+        d_base = rel * (float(step_m) / dist)
+        if T is not None:
+            R_c_b = T[:3, :3].T  # base → cam
+            d_cam = R_c_b @ d_base
+        else:
+            d_cam = np.array([0.0, 0.0, float(step_m)], dtype=np.float64)
+        chord_cam = bc - cc
+        chord_n = float(np.linalg.norm(chord_cam))
+        z_frac = float(abs(chord_cam[2]) / chord_n) if chord_n > 1e-6 else 0.0
+        ang_optical_deg = 0.0
+        if chord_n > 1e-6:
+            ang_optical_deg = float(math.degrees(math.acos(
+                max(-1.0, min(1.0, float(chord_cam[2]) / chord_n)))))
+        meta = {
+            'berry_cam': bc.tolist(),
+            'cup_cam': cc.tolist(),
+            'cup_to_berry_base': rel.tolist(),
+            'cam_axis_frac': z_frac,
+            'angle_optical_deg': ang_optical_deg,
+        }
+        return d_cam, d_base, 'cup_to_berry', meta
+
+    def _approach_axis_ik_for_tcp_goal(
+        self,
+        *,
+        tcp_goal: np.ndarray,
+        berry: Tuple[float, float, float],
+        T_l6c: np.ndarray,
+        seed: List[float],
+        d_base: np.ndarray,
+        contact_m: float,
+    ) -> Optional[List[float]]:
+        """Near contact: cup axis aimed at berry, tip to contact.
+
+        Primary: chunked ``cup_axis_ik`` (link6 +Z from tip → berry). Camera
+        ``approach_axis`` is only a fallback — cam is ~8 cm off tip so cam-look
+        ≠ cup-look near contact. keep_orient_chunked drifts R_des (161209).
+        """
+        tcp_now = self._tcp_or_ee_xyz()
+        ee_now = self._current_ee_pose()
+        if tcp_now is None or ee_now is None:
+            return None
+        T0 = fk_link6_T(seed)
+        tcp0 = np.array(
+            [float(tcp_now[0]), float(tcp_now[1]), float(tcp_now[2])],
+            dtype=np.float64)
+        off_l6 = T0[:3, :3].T @ (tcp0 - T0[:3, 3])
+        ee0 = np.array([
+            float(ee_now.pose.position.x),
+            float(ee_now.pose.position.y),
+            float(ee_now.pose.position.z),
+        ], dtype=np.float64)
+        # EE target that would put tip at contact if attitude held.
+        ee_tgt = ee0 + np.asarray(d_base, dtype=np.float64)
+        berry_a = np.asarray(berry, dtype=np.float64)
+
+        joints = cup_axis_ik_chunked(
+            tuple(ee_tgt.tolist()), berry, seed, tip_offset_link6=off_l6)
+        method = 'cup_axis_chunked'
+        if joints is None:
+            joints = cup_axis_ik(
+                tuple(ee_tgt.tolist()), berry, seed, tip_offset_link6=off_l6)
+            method = 'cup_axis'
+        if joints is None:
+            joints = approach_axis_ik_chunked(
+                tuple(ee_tgt.tolist()), berry, seed, T_l6c)
+            method = 'approach_axis_chunked'
+        if joints is None:
+            joints = approach_axis_ik(
+                tuple(ee_tgt.tolist()), berry, seed, T_l6c)
+            method = 'approach_axis'
+        if joints is None:
+            return None
+
+        T_m = fk_link6_T(joints)
+        tcp_m = T_m[:3, 3] + T_m[:3, :3] @ off_l6
+        dist_m = float(np.linalg.norm(berry_a - tcp_m))
+        self.get_logger().info(
+            f'REFINING near lookat[{method}]: tcp-berry={dist_m*1000:.1f}mm '
+            f'(contact={contact_m*1000:.0f}mm)')
+
+        if dist_m <= contact_m + 0.008:
+            return list(joints)
+
+        # Tip still short: one more cup_axis (or keep_orient) residual.
+        travel2 = dist_m - float(contact_m)
+        if travel2 < 0.002:
+            return list(joints)
+        direction = (berry_a - tcp_m) / dist_m
+        ee_final = tuple((fk_xyz(joints) + direction * travel2).tolist())
+        joints_f = cup_axis_ik(
+            ee_final, berry, joints, tip_offset_link6=off_l6)
+        if joints_f is None:
+            joints_f = position_ik_keep_orient(ee_final, joints)
+        if joints_f is None:
+            joints_f = position_ik_keep_orient_chunked(ee_final, joints)
+        if joints_f is None:
+            self.get_logger().warn(
+                'REFINING near lookat mid OK but tip residual failed — '
+                'using mid (may finish short; near oneshot max≥2)')
+            return list(joints)
+
+        T_f = fk_link6_T(joints_f)
+        tcp_f = T_f[:3, 3] + T_f[:3, :3] @ off_l6
+        dist_f = float(np.linalg.norm(berry_a - tcp_f))
+        self.get_logger().info(
+            f'REFINING near tip residual: '
+            f'tcp-berry {dist_m*1000:.1f}→{dist_f*1000:.1f}mm')
+        return list(joints_f)
+
+    def _start_near_oneshot_step(self, dist_cup: Optional[float]) -> bool:
+        """Near terminal: one open-loop traj along cup→berry to contact.
+
+        Frozen 3D sets travel = dist_cup − cup_contact_offset (0 → tip on berry).
+        IK may use chunked cup_axis / keep_orient for long Cartesian moves.
+        """
+        if not self._arm.server_is_ready():
+            return False
+        berry = self._near_frozen_berry or self._last_berry_base
+        if berry is None:
+            return False
+        if self._near_frozen_berry is None:
+            self._freeze_near_berry()
+            berry = self._near_frozen_berry
+            if berry is None:
+                return False
+
+        # True oneshot: at most one trajectory (default max=1).
+        max_attempts = max(1, int(getattr(self._args, 'servo_near_oneshot_max', 1)))
+        if self._near_oneshot_attempts >= max_attempts:
+            self.get_logger().warn(
+                f'REFINING near oneshot: already sent {self._near_oneshot_attempts}/'
+                f'{max_attempts} dist={(dist_cup if dist_cup is not None else -1):.3f}')
+            return False
+
+        tcp = self._tcp_or_ee_xyz()
+        ee = self._current_ee_pose()
+        if tcp is None or ee is None:
+            return False
+
+        bx, by, bz = berry
+        if dist_cup is None:
+            dist_cup = math.sqrt(
+                (bx - tcp[0]) ** 2 + (by - tcp[1]) ** 2 + (bz - tcp[2]) ** 2)
+        contact = float(self._args.cup_contact_offset)
+        if dist_cup <= contact + 1e-4:
+            return False
+        if dist_cup < 1e-4:
+            return False
+
+        travel_total = dist_cup - contact
+        # Optional legacy cap (≤0 or unset → full remaining travel).
+        step_cap = float(getattr(self._args, 'servo_near_oneshot_step_m', 0.0))
+        if step_cap > 1e-6:
+            step_m = min(travel_total, step_cap)
+        else:
+            step_m = travel_total
+        if step_m < 0.002:
+            return False
+
+        planned = self._plan_near_oneshot_delta(berry, tcp, step_m)
+        if planned is None:
+            self.get_logger().warn('REFINING near oneshot: cup→berry plan failed')
+            return False
+        d_cam, d_base, method, plan_meta = planned
+
+        ex = float(ee.pose.position.x)
+        ey = float(ee.pose.position.y)
+        ez = float(ee.pose.position.z)
+        ee0 = np.array([ex, ey, ez], dtype=np.float64)
+        # keep_orient: same translation on EE moves TCP by the same vector.
+        tgt_xyz = tuple((ee0 + d_base).tolist())
+        # Desired TCP after contact move (plan assumes pure translate).
+        tcp0 = np.array(
+            [float(tcp[0]), float(tcp[1]), float(tcp[2])], dtype=np.float64)
+        tcp_goal = tcp0 + d_base
+
+        # Near contact: cup axis (link6+Z) aimed tip→berry. Pure keep_orient
+        # chunking drifts attitude (161209). Camera approach_axis is fallback.
+        ik_method = 'keep_orient'
+        joints = None
+        T_l6c = self._lookup_T_link6_cam()
+        # Always prefer lookat for contact moves ≥3cm; T_l6c only needed for
+        # camera fallback inside the helper.
+        use_lookat = float(step_m) >= 0.03
+        if use_lookat:
+            if T_l6c is None:
+                # Fallback matches CAMERA_MOUNT_* (Rx≈-23.5deg optical pitch down).
+                T_l6c = np.eye(4, dtype=np.float64)
+                a = -0.410152
+                ca, sa = math.cos(a), math.sin(a)
+                T_l6c[:3, :3] = np.array(
+                    [[1.0, 0.0, 0.0], [0.0, ca, -sa], [0.0, sa, ca]],
+                    dtype=np.float64)
+                T_l6c[:3, 3] = [0.0, -0.08, -0.04]
+            joints = self._approach_axis_ik_for_tcp_goal(
+                tcp_goal=tcp_goal,
+                berry=berry,
+                T_l6c=T_l6c,
+                seed=list(self._joints),
+                d_base=d_base,
+                contact_m=contact,
+            )
+            if joints is not None:
+                ik_method = 'cup_axis_lookat'
+                tgt_xyz = tuple(fk_xyz(joints).tolist())
+                self.get_logger().info(
+                    'REFINING near oneshot: cup_axis look-at berry → tip contact')
+        if joints is None:
+            joints = position_ik_keep_orient(tgt_xyz, self._joints)
+            if joints is None:
+                joints = position_ik_keep_orient_chunked(tgt_xyz, self._joints)
+                if joints is not None:
+                    ik_method = 'keep_orient_chunked'
+                    self.get_logger().warn(
+                        'REFINING near oneshot: cup_axis lookat failed — '
+                        'fallback keep_orient_chunked (attitude may drift)')
+            if joints is None:
+                self._servo_ik_fail_n = int(getattr(self, '_servo_ik_fail_n', 0)) + 1
+                self.get_logger().warn(
+                    f'REFINING near oneshot: IK failed '
+                    f'tcp_goal=({tcp_goal[0]:.3f},{tcp_goal[1]:.3f},{tcp_goal[2]:.3f})')
+                if self._servo_ik_fail_n >= 8:
+                    self._set_state(
+                        'ERROR',
+                        f'near oneshot IK failed tcp_goal='
+                        f'({tcp_goal[0]:.3f},{tcp_goal[1]:.3f},{tcp_goal[2]:.3f})')
+                return False
+        self._servo_ik_fail_n = 0
+
+        # Full contact move needs the IK Δq; soft per-step Δj caps would truncate it.
+        target = self._clamp_servo_target(list(joints))
+
+        # ~3 cm/s class: 0.25 m → ~8–10 s (still within servo timeout budget).
+        traj_s = max(
+            float(self._args.servo_traj_s),
+            min(12.0, 2.0 + step_m / 0.03),
+        )
+
+        geo = self._cup_berry_geometry(berry, tcp)
+        ang_opt = plan_meta.get('angle_optical_deg')
+        method_full = f'{method}+{ik_method}'
+        self._servo_pending_record = {
+            'step': int(self._servo_step_idx),
+            'track_id': self._refine_locked_track_id,
+            'refine_phase': 'near',
+            'berry_base': list(berry),
+            'tcp_base': list(tcp),
+            'ee_base': [ex, ey, ez],
+            'ee_xyz_before': [ex, ey, ez],
+            'ee_xyz_cmd': list(tgt_xyz),
+            'target_xyz': list(tgt_xyz),
+            'cmd_dxyz': list(d_base),
+            'cmd_d_base_m': list(d_base),
+            'cmd_dcam_m': list(d_cam),
+            'berry_cam': plan_meta.get('berry_cam'),
+            'cup_cam': plan_meta.get('cup_cam'),
+            'cup_to_berry_base': plan_meta.get('cup_to_berry_base'),
+            'angle_optical_deg': ang_opt,
+            'berry_rel_cup': geo.get('berry_rel_cup'),
+            'dist_cup': float(dist_cup),
+            'travel_m': float(step_m),
+            'travel_total_m': float(travel_total),
+            'tcp_goal': tcp_goal.tolist(),
+            'ik_method': ik_method,
+            'control': 'near_oneshot_cart',
+            'method': method_full,
+            'near_attempt': int(self._near_oneshot_attempts) + 1,
+            'delta_j_deg': {
+                'j1': math.degrees(target[0] - self._joints[0]),
+                'j2': math.degrees(target[1] - self._joints[1]),
+                'j3': math.degrees(target[2] - self._joints[2]),
+                'j4': math.degrees(target[3] - self._joints[3]),
+                'j5': math.degrees(target[4] - self._joints[4]),
+            },
+            'target_j_deg': {
+                'j1': math.degrees(target[0]),
+                'j2': math.degrees(target[1]),
+                'j3': math.degrees(target[2]),
+                'j4': math.degrees(target[3]),
+                'j5': math.degrees(target[4]),
+            },
+            'qa_tag': f'servo_{self._servo_step_idx:02d}_near_oneshot',
+            'source': 'step_json',
+        }
+
+        ok = self._send_joint_servo_goal(
+            target,
+            tag='near',
+            traj_s=traj_s,
+            extra=(
+                f'oneshot {method_full} travel={step_m:.3f}m '
+                f'dbase=({float(d_base[0])*1000:+.1f},{float(d_base[1])*1000:+.1f},'
+                f'{float(d_base[2])*1000:+.1f})mm dist_cup={dist_cup:.3f}'
+                + (f' ∠opt={float(ang_opt):.1f}deg' if ang_opt is not None else '')
+            ),
+        )
+        if ok:
+            self._near_oneshot_attempts += 1
+            self._near_oneshot_sent = True
+            self.get_logger().info(
+                f'REFINING near oneshot[{self._servo_step_idx}]: '
+                f'{method_full} travel={step_m:.3f}m traj={traj_s:.1f}s '
+                f'tgt_ee=({tgt_xyz[0]:.3f},{tgt_xyz[1]:.3f},{tgt_xyz[2]:.3f}) '
+                f'Δj1={math.degrees(target[0]-self._joints[0]):+.1f}deg '
+                f'Δj2={math.degrees(target[1]-self._joints[1]):+.1f}deg '
+                f'Δj4={math.degrees(target[3]-self._joints[3]):+.1f}deg'
+                + (f' ∠opt={float(ang_opt):.1f}deg' if ang_opt is not None else ''))
+        else:
+            self._servo_pending_record = None
+        return ok
+
+    def _start_wrist_servo_step(
+        self,
+        berry: Optional[DetectedBerry],
+        z_cam: float,
+        pix_err: Optional[float],
+        *,
+        using_estimate: bool = False,
+        dist_cup: Optional[float] = None,
+        lost_streak: int = 0,
+    ) -> bool:
+        """Closed-loop mid-range: EE Cartesian waypoint → position IK → joints.
+
+        j6 is locked (5-DOF). MoveIt `/compute_ik` asks for full SE(3) and
+        returns NO_IK_SOLUTION for almost any absolute pose off the manifold.
+        We therefore solve *position-only* Jacobian IK (joints 1–5) so cm-scale
+        cup→berry waypoints map to FollowJointTrajectory without joint heuristics.
+        """
+        if not self._arm.server_is_ready():
+            return False
+
+        if berry is not None:
+            cam = self._berry_cam_xyz(berry)
+        elif self._last_berry_base is not None:
+            cam = self._base_xyz_to_cam(self._last_berry_base)
+        else:
+            return False
+
+        berry_xyz = self._last_berry_base
+        if berry is not None:
+            berry_xyz = self._berry_base_xyz(berry) or berry_xyz
+        tcp = self._tcp_or_ee_xyz()
+        ee = self._current_ee_pose()
+        if berry_xyz is None or tcp is None or ee is None:
+            return False
+
+        if cam is not None and cam[2] > 1e-4:
+            cx, cy, cz = cam[0], cam[1], z_cam if z_cam > 1e-4 else float(cam[2])
+        else:
+            # No wrist projection (FOV / lost) — pure cup→berry PBVS.
+            cx, cy, cz = 0.0, 0.0, float(z_cam) if z_cam > 1e-4 else 0.20
+
+        if dist_cup is None:
+            dist_cup = math.sqrt(
+                (berry_xyz[0] - tcp[0]) ** 2
+                + (berry_xyz[1] - tcp[1]) ** 2
+                + (berry_xyz[2] - tcp[2]) ** 2)
+
+        if cam is not None and cam[2] > 1e-4:
+            err_yaw, err_pitch = self._cam_angular_errors((cx, cy, cz))
+        else:
+            err_yaw, err_pitch = 0.0, 0.0
+        dead = math.radians(float(self._args.servo_ang_deadband_deg))
+        if abs(err_yaw) < dead:
+            err_yaw = 0.0
+        if abs(err_pitch) < dead:
+            err_pitch = 0.0
+
+        contact = float(self._args.cup_contact_offset)
+        step_cap = float(self._args.servo_step_m)
+        if self._refine_phase == 'center':
+            # Smaller lateral steps so BoT-SORT can keep the lock.
+            step_cap = min(step_cap, float(getattr(
+                self._args, 'servo_center_step_m', 0.012)))
+        if dist_cup <= contact + 1e-4:
+            return False
+
+        ex = float(ee.pose.position.x)
+        ey = float(ee.pose.position.y)
+        ez = float(ee.pose.position.z)
+        control = 'position_diff_ik'
+        aim_kind = 'cup'
+        reach_scale = self._ibvs_reach_scale(pix_err, lost_streak=lost_streak)
+
+        if self._refine_phase == 'center' and cam is not None and cam[2] > 1e-4:
+            # Pure lateral IBVS in cam: no range close until image is centered.
+            ax, ay, aim_kind = self._center_aim_cam_xy((cx, cy, cz))
+            off_x = cx - ax
+            off_y = cy - ay
+            lat_mag = math.hypot(off_x, off_y)
+            if lat_mag < 1e-4:
+                return False
+            gain = float(getattr(self._args, 'servo_center_gain', 0.45))
+            step_m = min(step_cap, max(0.004, gain * lat_mag))
+            d_cam = (-step_m * off_x / lat_mag, -step_m * off_y / lat_mag, 0.0)
+            d_base = self._cam_delta_to_base(d_cam)
+            if d_base is None:
+                return False
+            tgt_xyz = (ex + d_base[0], ey + d_base[1], ez + d_base[2])
+            ux, uy, uz = d_base[0] / step_m, d_base[1] / step_m, d_base[2] / step_m
+            reach_scale = 0.0
+            control = 'center_ibvs'
+        else:
+            # Approach PBVS: step EE along TCP→berry after center (+probe).
+            ux = (berry_xyz[0] - tcp[0]) / dist_cup
+            uy = (berry_xyz[1] - tcp[1]) / dist_cup
+            uz = (berry_xyz[2] - tcp[2]) / dist_cup
+            step_m = min(step_cap, dist_cup - contact) * reach_scale
+            if step_m < 1e-4:
+                lat = 0.004 * max(abs(err_yaw), abs(err_pitch)) / max(dead, 1e-3)
+                step_m = min(step_cap * 0.35, max(0.002, lat))
+            tgt_xyz = (ex + ux * step_m, ey + uy * step_m, ez + uz * step_m)
+            control = 'approach_pbvs'
+
+        # Predicted EE move vs cup→berry vector (for replay diagnosis).
+        geo = self._cup_berry_geometry(berry_xyz, tcp, berry_cam=(cx, cy, cz))
+
+        joints = position_ik_keep_orient(tgt_xyz, self._joints)
+        if joints is None:
+            self._servo_ik_fail_t = time.time()
+            self._servo_ik_fail_n = int(getattr(self, '_servo_ik_fail_n', 0)) + 1
+            self.get_logger().warn(
+                f'REFINING servo[{self._servo_step_idx}]: keep_orient IK failed '
+                f'n={self._servo_ik_fail_n} '
+                f'tgt=({tgt_xyz[0]:.3f},{tgt_xyz[1]:.3f},{tgt_xyz[2]:.3f})')
+            return False
+        self._servo_ik_fail_n = 0
+
+        max_dj = [
+            math.radians(float(self._args.servo_max_dj1_deg)),
+            math.radians(float(self._args.servo_max_dj2_deg)),
+            math.radians(float(self._args.servo_max_dj3_deg)),
+            math.radians(5.0),
+            math.radians(float(self._args.servo_max_dj5_deg)),
+            0.0,
+        ]
+        if self._refine_phase == 'center':
+            # Tighter joint caps during centering to keep tracker alive.
+            max_dj = [0.55 * v for v in max_dj]
+            max_dj[5] = 0.0
+        target = list(self._joints)
+        for i in range(6):
+            d = joints[i] - self._joints[i]
+            d = max(-max_dj[i], min(max_dj[i], d))
+            target[i] = float(self._joints[i] + d)
+        target[5] = 0.0
+        target = self._clamp_servo_target(target)
+
+        est_tag = ' est' if using_estimate else ''
+        self._servo_pending_record = {
+            'step': int(self._servo_step_idx),
+            'track_id': self._refine_locked_track_id,
+            'refine_phase': str(self._refine_phase),
+            'aim_kind': aim_kind,
+            'berry_base': list(berry_xyz),
+            'tcp_base': list(tcp),
+            'ee_base': [ex, ey, ez],
+            'target_xyz': list(tgt_xyz),
+            'cmd_dxyz': [ux * step_m, uy * step_m, uz * step_m],
+            'berry_rel_cup': geo.get('berry_rel_cup'),
+            'berry_cam': geo.get('berry_cam'),
+            'cup_cam': geo.get('cup_cam'),
+            'berry_uv': geo.get('berry_uv'),
+            'cup_uv': geo.get('cup_uv'),
+            'optical_uv': geo.get('optical_uv'),
+            'z_cam': float(z_cam),
+            'dist_cup': float(dist_cup),
+            'pix_err': float(pix_err) if pix_err is not None else None,
+            'err_yaw_deg': math.degrees(err_yaw),
+            'err_pitch_deg': math.degrees(err_pitch),
+            'reach_scale': float(reach_scale),
+            'step_m': float(step_m),
+            'using_estimate': bool(using_estimate),
+            'lost_streak': int(lost_streak),
+            'control': control,
+            'delta_j_deg': {
+                'j1': math.degrees(target[0] - self._joints[0]),
+                'j2': math.degrees(target[1] - self._joints[1]),
+                'j3': math.degrees(target[2] - self._joints[2]),
+                'j5': math.degrees(target[4] - self._joints[4]),
+            },
+            'target_j_deg': {
+                'j1': math.degrees(target[0]),
+                'j2': math.degrees(target[1]),
+                'j3': math.degrees(target[2]),
+                'j5': math.degrees(target[4]),
+            },
+            'qa_tag': f'servo_{self._servo_step_idx:02d}_after',
+            'source': 'step_json',
+        }
+        if berry is not None:
+            self._servo_pending_record.update(self._berry_depth_diag(berry))
+
+        self.get_logger().info(
+            f'REFINING servo[{self._servo_step_idx}]: {control}{est_tag} '
+            f'phase={self._refine_phase} aim={aim_kind} '
+            f'z_cam={z_cam:.3f} dist_cup={dist_cup:.3f} step_m={step_m:.3f} '
+            f'pix_err={(pix_err if pix_err is not None else -1.0):.1f} '
+            f'err_yaw_deg={math.degrees(err_yaw):.1f} '
+            f'err_pitch_deg={math.degrees(err_pitch):.1f} '
+            f'reach_scale={reach_scale:.2f} '
+            f'tgt=({tgt_xyz[0]:.3f},{tgt_xyz[1]:.3f},{tgt_xyz[2]:.3f})')
+        traj_s = float(self._args.servo_traj_s)
+        if self._refine_phase == 'center':
+            traj_s = max(traj_s, float(getattr(self._args, 'servo_center_traj_s', 2.5)))
+        return self._send_joint_servo_goal(
+            target,
+            tag='servo',
+            traj_s=traj_s,
+            extra=(
+                f'{control} step_m={step_m:.3f} reach_scale={reach_scale:.2f} '
+                f'dist_cup={dist_cup:.3f} phase={self._refine_phase}'
+            ),
+        )
+
+    def _poll_wrist_servo(self) -> None:
+        if self._servo_deadline > 0.0 and time.time() > self._servo_deadline:
+            self._cancel_move()
+            self._servo_pending_record = None
+            self._set_state('ERROR', 'wrist servo step timeout')
+            return
+
+        if self._move_phase == 'servo_ik':
+            # Legacy absolute-/compute_ik path removed (j6 lock → always -31).
+            self.get_logger().warn('REFINING: unexpected servo_ik phase — clearing')
+            self._ik_fut = None
+            self._move_phase = None
+            self._servo_pending_record = None
+            return
+
+        if self._traj_goal_fut is not None:
+            if not self._traj_goal_fut.done():
+                self._snap_servo_motion_frame()
+                return
+            gh = self._traj_goal_fut.result()
+            self._traj_goal_fut = None
+            if gh is None or not gh.accepted:
+                self._cancel_move()
+                self._servo_pending_record = None
+                self._servo_motion_frames = []
+                self._set_state('ERROR', 'servo traj rejected')
+                return
+            self._arm_goal_handle = gh
+            self._traj_result_fut = gh.get_result_async()
+            self._snap_servo_motion_frame(force=True)
+            return
+
+        if self._traj_result_fut is not None:
+            if not self._traj_result_fut.done():
+                self._snap_servo_motion_frame()
+                return
+            self._traj_result_fut = None
+            self._arm_goal_handle = None
+            self._snap_servo_motion_frame(force=True)
+            # Brief settle so next image is not from mid-motion.
+            self._servo_settle_until = time.time() + float(self._args.servo_settle_s)
+            self._move_phase = 'servo_settle'
+            return
+
+        if self._move_phase == 'servo_settle':
+            if time.time() < self._servo_settle_until:
+                self._snap_servo_motion_frame()
+                return
+            self._move_phase = None
+            qa_tag = f'servo_{self._servo_step_idx:02d}_after'
+            self._snap_qa(qa_tag)
+            fb = {
+                'j1': math.degrees(self._joints[0]),
+                'j2': math.degrees(self._joints[1]),
+                'j3': math.degrees(self._joints[2]),
+                'j5': math.degrees(self._joints[4]),
+            }
+            self.get_logger().info(
+                f'REFINING servo step OK fb_j=('
+                f'{fb["j1"]:.1f},{fb["j2"]:.1f},{fb["j3"]:.1f},{fb["j5"]:.1f})')
+            rec = self._servo_pending_record
+            near_oneshot_done = False
+            if rec is not None and int(rec.get('step', -1)) == int(self._servo_step_idx):
+                near_oneshot_done = rec.get('control') in (
+                    'near_oneshot_cart', 'near_oneshot_position_ik')
+                rec = dict(rec)
+                rec['fb_j_deg'] = fb
+                rec['timestamp'] = datetime.now().isoformat(timespec='seconds')
+                rec['session'] = self._qa_session
+                rec['qa_tag'] = qa_tag
+                rec['motion_frames'] = list(self._servo_motion_frames)
+                rec['n_motion_frames'] = len(self._servo_motion_frames)
+                tcp_after = self._tcp_or_ee_xyz()
+                berry_after = self._last_berry_base
+                if tcp_after is not None and berry_after is not None:
+                    geo_after = self._cup_berry_geometry(berry_after, tcp_after)
+                    rec['tcp_base_after'] = list(tcp_after)
+                    rec['berry_rel_cup_after'] = geo_after.get('berry_rel_cup')
+                    rec['dist_cup_after'] = geo_after.get('dist_cup')
+                    rec['berry_uv_after'] = geo_after.get('berry_uv')
+                    # Always keep model reproject separate from live (avoid circular QA).
+                    rec['berry_uv_after_reproject'] = geo_after.get('berry_uv')
+                    # Read-only: live bbox near center only (no coast / no re-pin).
+                    if rec.get('refine_phase') == 'center_oneshot':
+                        _cam_a, uv_a, src_a = self._center_oneshot_measure()
+                        if uv_a is not None and src_a in ('live_bbox', 'live'):
+                            rec['berry_uv_after'] = [float(uv_a[0]), float(uv_a[1])]
+                            rec['berry_uv_after_src'] = src_a
+                            rec['berry_uv_after_live'] = [
+                                float(uv_a[0]), float(uv_a[1])]
+                        else:
+                            rec['berry_uv_after_src'] = 'yolo_miss_at_center'
+                            rec['berry_uv_after_live'] = None
+                        # Executed vs planned endpoint (control QA).
+                        last_cmd = getattr(self, '_center_last_cmd', None) or {}
+                        if last_cmd.get('ee_xyz_cmd') is not None:
+                            rec['ee_xyz_cmd'] = list(last_cmd['ee_xyz_cmd'])
+                        if last_cmd.get('joints_cmd_rad') is not None:
+                            rec['joints_cmd_rad'] = list(last_cmd['joints_cmd_rad'])
+                        rec['joints_fb_rad'] = [
+                            float(v) for v in self._joints[:6]]
+                        try:
+                            ee_fb = fk_xyz(rec['joints_fb_rad'])
+                            rec['ee_xyz_fb'] = [
+                                float(ee_fb[0]), float(ee_fb[1]), float(ee_fb[2])]
+                            if rec.get('ee_xyz_cmd') is not None:
+                                rec['ee_err_mm'] = float(np.linalg.norm(
+                                    np.array(rec['ee_xyz_fb'])
+                                    - np.array(rec['ee_xyz_cmd'])) * 1000.0)
+                        except Exception:
+                            pass
+                        # Independent control-gate live near cup-aim.
+                        z_g = float(self._last_z_cam or 0.35)
+                        au_g, av_g, _ = self._aim_uv_for_center(z_g)
+                        live_max_g = max(
+                            float(getattr(self._args, 'servo_center_pix_tol_px', 35.0)),
+                            float(getattr(
+                                self._args, 'refine_fresh_lock_max_pix_px', 80.0)),
+                        )
+                        _c2, uv2, src2 = self._center_arrive_measure_near_aim(
+                            aim_uv=(au_g, av_g), max_pix=live_max_g)
+                        rec['live_uv_near_aim'] = (
+                            [float(uv2[0]), float(uv2[1])] if uv2 else None)
+                        rec['live_src_near_aim'] = src2
+                    rec['cup_uv_after'] = geo_after.get('cup_uv')
+                    # Achieved Cartesian step at TCP (diagnose joint-clamp distortion).
+                    tcp0 = rec.get('tcp_base')
+                    if tcp0 is not None and len(tcp0) >= 3:
+                        rec['achieved_dxyz'] = [
+                            float(tcp_after[0] - tcp0[0]),
+                            float(tcp_after[1] - tcp0[1]),
+                            float(tcp_after[2] - tcp0[2]),
+                        ]
+                    self._write_cup_rel_overlay(qa_tag, geo_after)
+                elif rec.get('berry_rel_cup') is not None:
+                    self._write_cup_rel_overlay(qa_tag, {
+                        'berry_rel_cup': rec.get('berry_rel_cup'),
+                        'dist_cup': rec.get('dist_cup'),
+                        'berry_uv': rec.get('berry_uv'),
+                        'cup_uv': rec.get('cup_uv'),
+                    })
+                self._write_qa_json(f'servo_{self._servo_step_idx:02d}.json', rec)
+            self._servo_pending_record = None
+            self._servo_motion_frames = []
+            self._servo_motion_last_t = 0.0
+            self._servo_step_idx += 1
+            # Center lookat finished → residual or depth/stop.
+            if self._refine_phase == 'center_oneshot':
+                self._finish_center_oneshot()
+            elif near_oneshot_done and (
+                self._near_mode or self._refine_phase == 'near'):
+                self._near_oneshot_sent = False
+                dist_now = self._cup_berry_dist()
+                contact = float(self._args.cup_contact_offset)
+                # Tip↔berry-center ≤ contact (+8mm) = soft cup on fruit surface.
+                # Former +25mm gate declared SUCCESS at ~40mm standoff (0.039m).
+                tol = contact + 0.008
+                if dist_now is not None and dist_now <= tol:
+                    self.get_logger().info(
+                        f'REFINING near oneshot done: contact dist={dist_now:.3f}m '
+                        f'≤ {tol:.3f}m')
+                    self._snap_qa(f'servo_{self._servo_step_idx:02d}_contact')
+                    self._reached_pub.publish(Bool(data=True))
+                    self._set_state('REACHED')
+                    self._set_state('WAIT_CONFIRM')
+                else:
+                    max_att = max(1, int(getattr(self._args, 'servo_near_oneshot_max', 2)))
+                    if int(self._near_oneshot_attempts) < max_att:
+                        self.get_logger().warn(
+                            f'REFINING near oneshot short dist='
+                            f'{(dist_now if dist_now is not None else -1):.3f}m '
+                            f'(need ≤{tol:.3f}m) — residual attempt '
+                            f'{int(self._near_oneshot_attempts)+1}/{max_att}')
+                    else:
+                        self._set_state(
+                            'ERROR',
+                            f'near oneshot finished short of contact '
+                            f'dist={(dist_now if dist_now is not None else -1):.3f}m '
+                            f'(need ≤{tol:.3f}m)')
+            return
 
     def _fine_msg_age_s(self) -> float:
         if self._fine is None or self._fine_recv_t <= 0.0:
@@ -1154,16 +6037,263 @@ class ReachFsmNode(Node):
             return True
         return self._fine_msg_age_s() <= max_age
 
+    def _fine_reject_reason(self) -> str:
+        """Why REFINING cannot yet promote a wrist fine berry (for logs / ERROR)."""
+        if self._fine is None:
+            return 'no /perception/fine/berries received yet'
+        if not self._fine.berries:
+            n = 0
+            return (
+                f'fine msg empty (n={n}) frame={self._fine.header.frame_id!r} '
+                f'age={self._fine_msg_age_s():.2f}s')
+        if not self._fine_is_fresh():
+            return (
+                f'fine msg stale age={self._fine_msg_age_s():.2f}s '
+                f'> max={self._args.fine_max_age_s:.2f}s (n={len(self._fine.berries)})')
+        berries = list(self._fine.berries)
+        max_d = self._args.fine_assoc_max_m
+        lock_tid = self._refine_locked_track_id
+        parts = []
+        for i, b in enumerate(berries[:5]):
+            p = b.pose.pose.position
+            bf = b.pose.header.frame_id or self._fine.header.frame_id
+            parts.append(
+                f'[{i}] id={int(b.track_id)} conf={b.confidence:.2f} '
+                f'xyz=({p.x:.3f},{p.y:.3f},{p.z:.3f}) frame={bf!r}')
+        if lock_tid is not None and lock_tid >= 0:
+            if any(int(b.track_id) == int(lock_tid) for b in berries):
+                modes = [
+                    str(getattr(b, 'depth_mode', '') or '')
+                    for b in berries if int(b.track_id) == int(lock_tid)]
+                return (
+                    f'locked track_id={lock_tid} present but not live-synced '
+                    f'(modes={modes}; n={len(berries)}); ' + '; '.join(parts))
+            return (
+                f'locked track_id={lock_tid} not in frame (n={len(berries)}); '
+                + '; '.join(parts))
+        if max_d > 0 and self._locked is not None:
+            lx = self._locked.pose.pose.position.x
+            ly = self._locked.pose.pose.position.y
+            lz = self._locked.pose.pose.position.z
+            lock_frame = self._locked.pose.header.frame_id or self._locked.header.frame_id
+            nearest = min(
+                math.sqrt(
+                    (b.pose.pose.position.x - lx) ** 2
+                    + (b.pose.pose.position.y - ly) ** 2
+                    + (b.pose.pose.position.z - lz) ** 2)
+                for b in berries)
+            if nearest > max_d:
+                return (
+                    f'assoc fail nearest={nearest:.3f}m > fine_assoc_max_m={max_d:.3f}m '
+                    f'lock=({lx:.3f},{ly:.3f},{lz:.3f}) frame={lock_frame!r}; '
+                    + '; '.join(parts))
+        return f'have n={len(berries)} but pick rejected; ' + '; '.join(parts)
+
+    def _berry_uv_pix(
+        self, berry: DetectedBerry,
+    ) -> Optional[Tuple[float, float]]:
+        cam = self._berry_cam_xyz(berry)
+        if cam is None or cam[2] <= 1e-4:
+            return None
+        return self._berry_uv_from_cam(cam)
+
+    def _berry_optical_pix_err(self, berry: DetectedBerry) -> Optional[float]:
+        """Pixel distance of berry UV from cup-axis aim (fallback optical center)."""
+        uv = self._berry_uv_pix(berry)
+        if uv is None:
+            return None
+        cam = self._berry_cam_xyz(berry)
+        z = float(cam[2]) if cam is not None and cam[2] > 1e-4 else None
+        au, av, _ = self._aim_uv_for_center(z)
+        return math.hypot(uv[0] - au, uv[1] - av)
+
+    def _live_fine_berries(self) -> List[DetectedBerry]:
+        if self._fine is None or not self._fine.berries or not self._fine_is_fresh():
+            return []
+        out: List[DetectedBerry] = []
+        for b in self._fine.berries:
+            mode = str(getattr(b, 'depth_mode', '') or '')
+            if mode == 'base_coast':
+                continue
+            out.append(b)
+        return out
+
+    def _pick_probe_live_berry(self) -> Optional[DetectedBerry]:
+        """Live locked berry for probe calib (center/depth). Never base_coast."""
+        lock_tid = self._refine_locked_track_id
+        track_min = float(getattr(self._args, 'refine_track_min_conf', 0.12))
+        candidates: List[DetectedBerry] = []
+        for b in self._live_fine_berries():
+            if lock_tid is not None and int(b.track_id) != int(lock_tid):
+                continue
+            if float(b.confidence) < track_min:
+                continue
+            candidates.append(b)
+        if not candidates:
+            return None
+        if lock_tid is not None:
+            return candidates[0]
+        # Entry calib before lock settled: nearest cam range.
+        ranked: List[Tuple[float, DetectedBerry]] = []
+        for b in candidates:
+            d = self._berry_cam_range(b)
+            if d is not None:
+                ranked.append((d, b))
+        if ranked:
+            ranked.sort(key=lambda x: x[0])
+            return ranked[0][1]
+        return candidates[0]
+
+    def _pick_live_nearest_optical(
+        self,
+        max_pix: Optional[float] = None,
+        *,
+        min_conf: Optional[float] = None,
+    ) -> Optional[DetectedBerry]:
+        """Live YOLO closest to cup-axis aim UV (gate / fresh lock after center)."""
+        if min_conf is None:
+            track_min = float(getattr(self._args, 'refine_track_min_conf', 0.12))
+        else:
+            track_min = float(min_conf)
+        ranked: List[Tuple[float, DetectedBerry]] = []
+        for b in self._live_fine_berries():
+            if float(b.confidence) < track_min:
+                continue
+            e = self._berry_optical_pix_err(b)
+            if e is not None:
+                ranked.append((e, b))
+        if not ranked:
+            return None
+        ranked.sort(key=lambda x: x[0])
+        if max_pix is not None and ranked[0][0] > float(max_pix):
+            return None
+        return ranked[0][1]
+
+    def _pick_live_near_uv(self, uv_ref) -> Optional[DetectedBerry]:
+        """Live detection closest to a reference UV (continue same berry)."""
+        if uv_ref is None or len(uv_ref) < 2:
+            return None
+        ranked: List[Tuple[float, DetectedBerry]] = []
+        for b in self._live_fine_berries():
+            uv = self._berry_image_uv(b)
+            if uv is None:
+                continue
+            d = math.hypot(float(uv[0]) - float(uv_ref[0]), float(uv[1]) - float(uv_ref[1]))
+            ranked.append((d, b))
+        if not ranked:
+            return None
+        ranked.sort(key=lambda x: x[0])
+        # Reject if nearest live jumped too far (different berry / ghost).
+        if ranked[0][0] > 120.0:
+            return None
+        return ranked[0][1]
+
+    def _pick_sync_repin_candidate(self, *, old_tid: int) -> Optional[DetectedBerry]:
+        """Sync-timeout re-pin: UV continuity / cup-aim only — never cam-range free pick."""
+        max_pix = float(getattr(self._args, 'refine_fresh_lock_max_pix_px', 80.0))
+        track_min = float(getattr(self._args, 'refine_track_min_conf', 0.12))
+        uv_ref: Optional[Tuple[float, float]] = None
+        if self._fine is not None and self._fine.berries:
+            for b in self._fine.berries:
+                if int(b.track_id) != int(old_tid):
+                    continue
+                uv_ref = self._berry_image_uv(b)
+                if uv_ref is not None:
+                    break
+        if uv_ref is None and self._last_berry_base is not None:
+            T = self._lookup_T_base_cam()
+            if T is not None:
+                pb = np.array(
+                    [self._last_berry_base[0], self._last_berry_base[1],
+                     self._last_berry_base[2], 1.0],
+                    dtype=float)
+                try:
+                    T_inv = np.linalg.inv(T)
+                    cam = (T_inv @ pb)[:3]
+                    if float(cam[2]) > 1e-4:
+                        uv_ref = self._berry_uv_from_cam(
+                            (float(cam[0]), float(cam[1]), float(cam[2])))
+                except Exception:
+                    uv_ref = None
+        if uv_ref is not None:
+            neu = self._pick_live_near_uv(uv_ref)
+            if neu is not None:
+                return neu
+        # Cup-aim neighborhood (same radius as fresh lock).
+        return self._pick_live_nearest_optical(max_pix=max_pix, min_conf=track_min)
+
+    def _relock_sight_center(self, *, reason: str) -> Optional[DetectedBerry]:
+        """After centering: lock the berry nearest cup-axis aim for depth/contact."""
+        neu = self._pick_live_nearest_optical()
+        if neu is None:
+            return None
+        old = self._refine_locked_track_id
+        tid = int(neu.track_id)
+        self._refine_locked_track_id = tid
+        self._lock_pub.publish(neu)
+        cam = self._berry_cam_xyz(neu)
+        if cam is not None and cam[2] > 1e-4:
+            self._remember_berry(neu, float(cam[2]))
+        pix = self._berry_optical_pix_err(neu)
+        self.get_logger().info(
+            f'REFINING sight-center lock {old}→{tid} ({reason}) '
+            f'cup_aim_pix={(pix if pix is not None else -1):.1f} '
+            f'mode={getattr(neu, "depth_mode", "")}')
+        return neu
+
     def _pick_fine_berry(self) -> Optional[DetectedBerry]:
         if self._fine is None or not self._fine.berries:
             return None
         if not self._fine_is_fresh():
-            # Drop stale cache so later ticks stay blind until a fresh msg arrives.
             self._fine = None
             return None
         berries = list(self._fine.berries)
+
+        lock_tid = self._refine_locked_track_id
+        if lock_tid is not None and lock_tid >= 0:
+            live = self._live_fine_berries()
+            locked: Optional[DetectedBerry] = None
+            for b in berries:
+                if int(b.track_id) == lock_tid:
+                    locked = b
+                    break
+
+            if locked is not None:
+                mode = str(getattr(locked, 'depth_mode', '') or '')
+                if mode != 'base_coast':
+                    return locked
+                # Ghost lock: prefer live; near may keep coast only if nothing live.
+                if self._near_mode or self._refine_phase == 'near':
+                    if not live:
+                        return locked
+
+            # Lost/coast: re-pin only during free centering — NEVER during probe
+            # ranging (optical-nearest will grab wrong clutter after a bad move).
+            if live and self._refine_phase in ('center',):
+                neu = self._pick_live_nearest_optical()
+                if neu is None:
+                    # Fallback: nearest cam range.
+                    ranked: List[Tuple[float, DetectedBerry]] = []
+                    for b in live:
+                        d = self._berry_cam_range(b)
+                        if d is not None:
+                            ranked.append((d, b))
+                    if ranked:
+                        ranked.sort(key=lambda x: x[0])
+                        neu = ranked[0][1]
+                if neu is not None:
+                    old = lock_tid
+                    self._refine_locked_track_id = int(neu.track_id)
+                    self._lock_pub.publish(neu)
+                    self.get_logger().warn(
+                        f'REFINING re-pin lock {old}→{int(neu.track_id)} '
+                        f'phase={self._refine_phase} '
+                        f'(old lost/coast; mode={getattr(neu, "depth_mode", "")})')
+                    return neu
+            return None
+
         max_d = self._args.fine_assoc_max_m
-        if self._locked is not None:
+        if max_d > 0 and self._locked is not None:
             lx = self._locked.pose.pose.position.x
             ly = self._locked.pose.pose.position.y
             lz = self._locked.pose.pose.position.z
@@ -1175,7 +6305,7 @@ class ReachFsmNode(Node):
                 return dx * dx + dy * dy + dz * dz
 
             berries.sort(key=d2)
-            if max_d > 0 and math.sqrt(d2(berries[0])) > max_d:
+            if math.sqrt(d2(berries[0])) > max_d:
                 return None
         return berries[0]
 
@@ -1319,7 +6449,15 @@ def main() -> int:
     parser.add_argument('--ee-link', default=os.environ.get('PICK_EE_LINK', 'link6'))
     parser.add_argument('--base-frame', default='base_link')
     parser.add_argument('--cup-contact-offset', type=float,
-                        default=float(os.environ.get('PICK_CUP_CONTACT_OFFSET', '0.04')))
+                        default=float(os.environ.get('PICK_CUP_CONTACT_OFFSET', '0.015')),
+                        help='Final tip↔berry-center standoff (0 = tip on berry center)')
+    parser.add_argument('--refine-skip-center', dest='refine_skip_center',
+                        action='store_true', default=False,
+                        help='After mono_probe orbit+depth: skip center oneshot; '
+                             'freeze probe berry and go straight to near contact oneshot')
+    parser.add_argument('--no-refine-skip-center', dest='refine_skip_center',
+                        action='store_false',
+                        help='Keep center oneshot after probe (default)')
     parser.add_argument('--pre-grasp-offset', type=float, default=0.12)
     parser.add_argument('--post-grasp-offset', type=float, default=0.10)
     parser.add_argument('--align-standoff-m', type=float, default=0.28)
@@ -1376,18 +6514,185 @@ def main() -> int:
                         help='Lower clamp for joint5 command during ALIGNING')
     parser.add_argument('--align-joint5-max-rad', type=float, default=1.20,
                         help='Upper clamp for joint5 command during ALIGNING')
+    parser.add_argument('--align-joint6-limit-rad', type=float, default=0.0,
+                        help='ALIGN |joint6| soft clamp; 0 locks j6 at 0 (suction tip, no roll)')
     parser.add_argument('--qa-dir', default=os.path.join(
         os.path.dirname(os.path.abspath(__file__)), '..', 'log', 'real_robot', 'qa'),
         help='Directory for before/after align screenshots')
     parser.add_argument('--velocity-scale', type=float, default=0.12)
     parser.add_argument('--position-tolerance', type=float, default=0.025)
     parser.add_argument('--orient-tolerance', type=float, default=0.35)
-    parser.add_argument('--fine-assoc-max-m', type=float, default=0.35,
-                        help='Max 3D distance global→fine association; 0=disable')
+    parser.add_argument('--fine-assoc-max-m', type=float, default=0.0,
+                        help='Optional max 3D distance global plant lock→fine berry; '
+                             '0=disable (default: wrist tracker berry[0] after ALIGN)')
     parser.add_argument('--fine-max-age-s', type=float, default=0.5,
                         help='Ignore /perception/fine/berries older than this (wall-clock recv age); '
                              '0 disables freshness gate')
-    parser.add_argument('--refine-timeout-s', type=float, default=20.0)
+    parser.add_argument('--refine-timeout-s', type=float, default=45.0,
+                        help='REFINING total budget for fine berry + wrist servo to contact; '
+                             'timeout → ERROR (never open-loop cup_axis / coarse lock)')
+    parser.add_argument('--servo-step-m', type=float, default=0.025,
+                        help='Wrist servo approach step per closed-loop move (m)')
+    parser.add_argument('--servo-blend', type=float, default=0.55,
+                        help='look_at position blend toward berry each servo step')
+    parser.add_argument('--servo-orient-frac', type=float, default=0.0,
+                        help='Slerp EE quat toward look-at (0=keep orientation for reliable IK)')
+    parser.add_argument('--servo-lateral-gain', type=float, default=0.35,
+                        help='Unused (CLI compat); lateral now via Cartesian PBVS')
+    parser.add_argument('--servo-yaw-gain', type=float, default=0.22,
+                        help='Legacy joint IBVS (unused by cartesian_ik path)')
+    parser.add_argument('--servo-pitch-gain', type=float, default=0.18,
+                        help='Legacy joint IBVS (unused by cartesian_ik path)')
+    parser.add_argument('--servo-reach-gain', type=float, default=5.5,
+                        help='Legacy joint reach map (unused by cartesian_ik path)')
+    parser.add_argument('--servo-ang-deadband-deg', type=float, default=3.0,
+                        help='Ignore image angular error smaller than this')
+    parser.add_argument('--servo-approach-ang-deg', type=float, default=18.0,
+                        help='Legacy alias; prefer --servo-approach-yaw-deg')
+    parser.add_argument('--servo-approach-yaw-deg', type=float, default=18.0,
+                        help='Legacy joint gate (unused by cartesian_ik path)')
+    parser.add_argument('--servo-near-handoff-z', type=float, default=0.05,
+                        help='Switch to pose+fixed-mono only below this wrist z_cam (m). '
+                             'With cam retracted ~4cm, wrist usable to ~3cm before fruit.')
+    parser.add_argument('--servo-near-handoff-dist-m', type=float, default=0.12,
+                        help='Max cup↔berry dist for near handoff (with image centered)')
+    parser.add_argument('--servo-near-pix-tol-px', type=float, default=55.0,
+                        help='Max pixel error for cup+image near handoff gate')
+    parser.add_argument('--servo-near-ang-tol-deg', type=float, default=8.0,
+                        help='Max |err_yaw|/|err_pitch| deg for near handoff gate')
+    parser.add_argument('--servo-ibvs-reach-pix-px', type=float, default=80.0,
+                        help='Full Cartesian step when pix_err (vs cup) below this')
+    parser.add_argument('--servo-ibvs-reach-pix-soft-px', type=float, default=280.0,
+                        help='Above this pix_err, step scale = min_scale (not zero)')
+    parser.add_argument('--servo-ibvs-reach-min-scale', type=float, default=0.30,
+                        help='Minimum Cartesian approach scale at large image error')
+    parser.add_argument('--servo-center-pix-tol-px', type=float, default=35.0,
+                        help='pix_err vs optical center to leave center phase')
+    parser.add_argument(
+        '--servo-center-cup-aim-frac', type=float, default=1.0,
+        help='Deprecated/debug: fraction of cup-axis UV from optical for mid-range '
+             'center (1=full cup-aim). Do not use <1 as a climb workaround')
+    parser.add_argument('--servo-center-ok-frames', type=int, default=3,
+                        help='Consecutive centered frames before center→probe/approach')
+    parser.add_argument('--servo-center-step-m', type=float, default=0.012,
+                        help='Max EE step during center lateral IBVS (m)')
+    parser.add_argument('--servo-center-gain', type=float, default=0.45,
+                        help='Fraction of cam-lateral error taken per center step')
+    parser.add_argument('--servo-center-traj-s', type=float, default=2.5,
+                        help='Slower traj during center so BoT-SORT can track')
+    parser.add_argument('--servo-center-oneshot-tol-m', type=float, default=0.008,
+                        help='Skip center oneshot if berry already within this cam-lateral (m)')
+    parser.add_argument('--servo-center-oneshot-traj-s', type=float, default=2.0,
+                        help='Traj time for one-shot optical centering move')
+    parser.add_argument('--servo-center-oneshot-gain', type=float, default=1.0,
+                        help='Fraction of UV/geo error closed by center arrive (default 1=full)')
+    parser.add_argument('--servo-center-oneshot-max-m', type=float, default=0.0,
+                        help='Max lateral EE step for center arrive (m); 0=no cap (full oneshot)')
+    parser.add_argument('--servo-center-oneshot-max', type=int, default=2,
+                        help='Max center aim_uv_ik shots (1 open-loop + 1 live-replan)')
+    parser.add_argument('--servo-center-live-replan', dest='servo_center_live_replan',
+                        action='store_true', default=True,
+                        help='After center arrive: live UV depth re-estimate + second oneshot')
+    parser.add_argument('--servo-center-oneshot-max-dj1-deg', type=float, default=10.0,
+                        help='Max |Δj1| for one center look-at')
+    parser.add_argument('--servo-center-oneshot-max-dj5-deg', type=float, default=10.0,
+                        help='Max |Δj5| for one center look-at')
+    parser.add_argument('--refine-stop-after-center', dest='refine_stop_after_center',
+                        action='store_true', default=False,
+                        help='Step1 test: after center oneshot pause at WAIT_CONFIRM (no depth/contact)')
+    parser.add_argument('--servo-near-confirm', dest='servo_near_confirm',
+                        action='store_true', default=True,
+                        help='Pause at REFINING_WAIT_NEAR for confirm_near (default on)')
+    parser.add_argument('--no-servo-near-confirm', dest='servo_near_confirm',
+                        action='store_false',
+                        help='Auto-enter near mode without user confirm_near')
+    parser.add_argument('--refine-fruit-assoc-max-m', type=float, default=0.12,
+                        help='Max 3D distance from REFINING entry fruit lock to accept detections')
+    parser.add_argument('--refine-lock-min-conf', type=float, default=0.5,
+                        help='Min YOLO/BoT-SORT confidence to lock a fruit at REFINING entry')
+    parser.add_argument('--refine-track-min-conf', type=float, default=0.12,
+                        help='After lock: min conf for ranging/track obs (box on locked id; << lock gate)')
+    parser.add_argument('--refine-fresh-lock-max-pix-px', type=float, default=80.0,
+                        help='Fresh lock after center: max live YOLO offset from cup-aim (px)')
+    parser.add_argument('--refine-fresh-lock-min-conf', type=float, default=0.10,
+                        help='After center re-lock: min conf (lower than entry; FOV is centered)')
+    parser.add_argument('--refine-post-center-live-wait-s', type=float, default=1.0,
+                        help='After center: wait for live YOLO near cup-aim before probe fallback (~10 frames @10Hz)')
+    parser.add_argument('--refine-contact-from-probe-tri', dest='refine_contact_from_probe_tri',
+                        action='store_true', default=True,
+                        help='YOLO miss after center: contact from center probe tri 3D (default on)')
+    parser.add_argument('--no-refine-contact-from-probe-tri', dest='refine_contact_from_probe_tri',
+                        action='store_false',
+                        help='Require live YOLO fresh lock after center (legacy ERROR on miss)')
+    parser.add_argument('--refine-probe-tri-mono-chord', dest='refine_probe_tri_mono_chord',
+                        action='store_true', default=True,
+                        help='After center probe tri: chord-scale depth via reproject-UV min-mono')
+    parser.add_argument('--no-refine-probe-tri-mono-chord', dest='refine_probe_tri_mono_chord',
+                        action='store_false',
+                        help='Keep raw probe tri 3D without mono chord scale')
+    parser.add_argument('--refine-mono-chord-scale-min', type=float, default=0.45,
+                        help='Min z_mono/z_cam scale for probe tri mono chord')
+    parser.add_argument('--refine-mono-chord-scale-max', type=float, default=1.05,
+                        help='Max z_mono/z_cam scale for probe tri mono chord')
+    parser.add_argument('--refine-reproject-mono-max-pix-px', type=float, default=120.0,
+                        help='Max YOLO offset from reproject UV for mono chord')
+    parser.add_argument('--berry-diameter-m', type=float, default=0.015,
+                        help='Berry diameter for mono depth sizing (m)')
+    parser.add_argument('--refine-z-cam-max-jump-m', type=float, default=0.22,
+                        help='Reject single-frame z_cam increases larger than this (m)')
+    parser.add_argument('--refine-track-max-jump-m', type=float, default=0.08,
+                        help='Reject locked-berry base jumps larger than this (m)')
+    parser.add_argument('--refine-lost-frames-for-near', type=int, default=8,
+                        help='Consecutive lost frames before near handoff (with dist gate)')
+    parser.add_argument('--servo-near-oneshot-max', type=int, default=2,
+                        help='Max near contact trajs (2=allow residual after approach_axis)')
+    parser.add_argument('--servo-near-oneshot-step-m', type=float, default=0.0,
+                        help='Optional Cartesian cap per near traj (m); '
+                        '0 = full remaining dist_cup-contact in one shot')
+    parser.add_argument('--servo-near-cam-lat-gain', type=float, default=0.12,
+                        help='Near cam-depth: lateral trim fraction from berry_cam XY')
+    parser.add_argument('--servo-mono-probe', dest='servo_mono_probe',
+                        action='store_true', default=True,
+                        help='After center: small-step triangulate depth, then oneshot contact')
+    parser.add_argument('--no-servo-mono-probe', dest='servo_mono_probe',
+                        action='store_false',
+                        help='Skip depth probe; after center go straight to oneshot')
+    parser.add_argument('--servo-mono-probe-steps', type=int, default=1,
+                        help='Known moves for mono depth confirm (1=one step then approach)')
+    parser.add_argument('--servo-mono-probe-step-m', type=float, default=0.02,
+                        help='Cartesian length of each mono probe move (m)')
+    parser.add_argument('--servo-mono-probe-yaw-frac', type=float, default=0.25,
+                        help='Fraction of orbit yaw to cancel (0=max ΔUV for Jac, 1=keep facing)')
+    parser.add_argument('--servo-mono-probe-max-duv-px', type=float, default=90.0,
+                        help='Abort probe if berry UV jumps more than this between views')
+    parser.add_argument('--servo-estimate-max-age-s', type=float, default=8.0,
+                        help='Max age of last berry base pose for near handoff after wrist loss')
+    parser.add_argument('--servo-j1-anchor-band-deg', type=float, default=0.0,
+                        help='Deprecated unused (ALIGN anchor bands removed)')
+    parser.add_argument('--servo-j5-anchor-band-deg', type=float, default=0.0,
+                        help='Deprecated unused (ALIGN anchor bands removed)')
+    parser.add_argument('--servo-j2-anchor-band-deg', type=float, default=0.0,
+                        help='Deprecated unused (ALIGN anchor bands removed)')
+    parser.add_argument('--servo-j3-anchor-band-deg', type=float, default=0.0,
+                        help='Deprecated unused (ALIGN anchor bands removed)')
+    parser.add_argument('--servo-max-dj1-deg', type=float, default=3.0)
+    parser.add_argument('--servo-max-dj5-deg', type=float, default=3.5)
+    parser.add_argument('--servo-max-dj2-deg', type=float, default=5.0)
+    parser.add_argument('--servo-max-dj3-deg', type=float, default=5.0)
+    parser.add_argument('--servo-settle-s', type=float, default=0.6,
+                        help='Settle time after each wrist servo traj before next image')
+    parser.add_argument('--servo-motion-snap-s', type=float, default=0.10,
+                        help='During servo traj, save replay frames at most every N seconds')
+    parser.add_argument('--servo-pixel-tol-px', type=float, default=40.0,
+                        help='Berry center pixel error threshold for contact')
+    parser.add_argument('--servo-traj-s', type=float, default=2.2,
+                        help='FollowJointTrajectory duration per wrist servo step')
+    parser.add_argument('--servo-timeout-s', type=float, default=12.0,
+                        help='Timeout for one servo step')
+    parser.add_argument('--wrist-camera-frame',
+                        default='camera_wrist_color_optical_frame')
+    parser.add_argument('--wrist-focal-px', type=float, default=488.0,
+                        help='Fallback wrist fx=fy if /camera_wrist/color/camera_info missing')
     parser.add_argument('--home-joints', type=float, nargs=6, default=HOME)
     parser.add_argument('--dry-run', action='store_true',
                         help='Skip MoveIt; still exercise topic FSM')

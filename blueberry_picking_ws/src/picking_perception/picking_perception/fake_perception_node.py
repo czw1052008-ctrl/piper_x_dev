@@ -173,6 +173,10 @@ class FakePerceptionNode(Node):
             b.pose.header.frame_id = transformed.header.frame_id
             b.pose.pose = transformed.pose
             b.confidence = 0.95
+            b.track_id = -1
+            b.depth_mode = ''
+            b.z_depth_m = -1.0
+            b.z_mono_m = -1.0
             berries.append(b)
 
         contact_gz = PoseStamped()

@@ -28,6 +28,7 @@ class StaticFakePerceptionNode(Node):
       b.header = ps.header
       b.pose = ps
       b.confidence = 0.9
+      b.track_id = -1
       berries.append(b)
     return berries, contact, stem
 

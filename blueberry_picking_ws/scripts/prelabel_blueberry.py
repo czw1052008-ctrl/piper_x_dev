@@ -86,7 +86,8 @@ def main() -> int:
         open_vocab=open_vocab,
     )
     if not detector.ready:
-        print('ERROR: YOLO model not available (install ultralytics in conda env foundationpose)',
+        print('ERROR: YOLO model not available (ultralytics / weights). '
+              'Use: bash scripts/run_prelabel_blueberry.sh …',
               file=sys.stderr)
         return 1
 

@@ -20,6 +20,11 @@ class YoloDetection:
     bbox_xyxy: Tuple[int, int, int, int]
 
 
+@dataclass
+class TrackedYoloDetection(YoloDetection):
+    track_id: int = -1
+
+
 def _mask_circularity(mask: np.ndarray) -> float:
     contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
@@ -47,6 +52,7 @@ class YoloBerryDetector:
         border_margin_frac: float = 0.02,
         open_vocab: bool = True,
         device: str = '',
+        tracker_config: str = 'botsort.yaml',
     ) -> None:
         self._ready = False
         self._model = None
@@ -61,6 +67,7 @@ class YoloBerryDetector:
         self._max_dets = max_detections
         self._border_margin = border_margin_frac
         self._device = device
+        self._tracker_config = tracker_config
 
         try:
             from ultralytics import YOLO  # noqa: WPS433
@@ -92,27 +99,65 @@ class YoloBerryDetector:
             return False
         return True
 
-    def detect(self, rgb: np.ndarray) -> List[YoloDetection]:
+    def detect(
+        self, rgb: np.ndarray, *, conf: Optional[float] = None,
+    ) -> List[YoloDetection]:
         if not self._ready or self._model is None:
             return []
 
         h, w = rgb.shape[:2]
-        max_area = int(h * w * self._max_area_frac)
-        predict_kw = dict(conf=self._conf, verbose=False, device=self._device or None)
+        predict_kw = dict(
+            conf=float(self._conf if conf is None else conf),
+            verbose=False,
+            device=self._device or None,
+        )
         if self._open_vocab:
             predict_kw['prompts'] = self._prompts
         results = self._model.predict(rgb, **predict_kw)
         if not results:
             return []
 
-        res = results[0]
-        candidates: List[YoloDetection] = []
+        tracked = self._parse_result_detections(results[0], h, w, with_track_id=False)
+        tracked.sort(key=lambda d: d.confidence, reverse=True)
+        return tracked[: self._max_dets]
+
+    def reset_tracker(self) -> None:
+        """Clear BoT-SORT state (FSM clear_lock / new REFINING pin).
+
+        Only call tracker.reset() — do NOT empty predictor.trackers; ultralytics
+        assumes trackers[0] exists on the next track() frame.
+        """
+        if self._model is None:
+            return
+        predictor = getattr(self._model, 'predictor', None)
+        if predictor is None:
+            return
+        trackers = getattr(predictor, 'trackers', None)
+        if not trackers:
+            return
+        for tr in trackers:
+            if hasattr(tr, 'reset'):
+                try:
+                    tr.reset()
+                except Exception:
+                    pass
+
+    def _parse_result_detections(
+        self, res, h: int, w: int, *, with_track_id: bool,
+    ) -> List[TrackedYoloDetection]:
+        max_area = int(h * w * self._max_area_frac)
+        candidates: List[TrackedYoloDetection] = []
 
         if res.masks is not None and len(res.masks):
             for i, mask_tensor in enumerate(res.masks.data):
                 conf = float(res.boxes.conf[i]) if res.boxes is not None else 0.5
-                xyxy = res.boxes.xyxy[i].cpu().numpy().astype(int).tolist() if res.boxes is not None else [0, 0, w, h]
+                xyxy = (
+                    res.boxes.xyxy[i].cpu().numpy().astype(int).tolist()
+                    if res.boxes is not None else [0, 0, w, h])
                 bbox = (xyxy[0], xyxy[1], xyxy[2], xyxy[3])
+                tid = -1
+                if with_track_id and res.boxes is not None and res.boxes.id is not None:
+                    tid = int(res.boxes.id[i].item())
                 mask = mask_tensor.cpu().numpy()
                 if mask.shape[:2] != (h, w):
                     mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
@@ -122,12 +167,15 @@ class YoloBerryDetector:
                     continue
                 if not self._passes_shape_filter(mask_u8, bbox, h, w):
                     continue
-                candidates.append(YoloDetection(mask_u8, conf, bbox))
+                candidates.append(TrackedYoloDetection(mask_u8, conf, bbox, tid))
         elif res.boxes is not None:
-            for box in res.boxes:
+            for bi, box in enumerate(res.boxes):
                 conf = float(box.conf)
                 x0, y0, x1, y1 = [int(v) for v in box.xyxy[0].tolist()]
                 bbox = (x0, y0, x1, y1)
+                tid = -1
+                if with_track_id and res.boxes.id is not None:
+                    tid = int(res.boxes.id[bi].item())
                 bw, bh = max(x1 - x0, 1), max(y1 - y0, 1)
                 area = bw * bh
                 if area < self._min_area or area > max_area:
@@ -137,8 +185,32 @@ class YoloBerryDetector:
                 cv2.ellipse(mask, (cx, cy), (bw // 2, bh // 2), 0, 0, 360, 1, -1)
                 if not self._passes_shape_filter(mask, bbox, h, w):
                     continue
-                candidates.append(YoloDetection(mask, conf, bbox))
+                candidates.append(TrackedYoloDetection(mask, conf, bbox, tid))
 
+        return candidates
+
+    def track(
+        self, rgb: np.ndarray, *, conf: Optional[float] = None,
+    ) -> List[TrackedYoloDetection]:
+        """YOLO + BoT-SORT; requires consecutive frames (persist=True)."""
+        if not self._ready or self._model is None:
+            return []
+
+        h, w = rgb.shape[:2]
+        track_kw = dict(
+            conf=float(self._conf if conf is None else conf),
+            verbose=False,
+            device=self._device or None,
+            persist=True,
+            tracker=self._tracker_config,
+        )
+        if self._open_vocab:
+            track_kw['prompts'] = self._prompts
+        results = self._model.track(rgb, **track_kw)
+        if not results:
+            return []
+
+        candidates = self._parse_result_detections(results[0], h, w, with_track_id=True)
         candidates.sort(key=lambda d: d.confidence, reverse=True)
         return candidates[: self._max_dets]
 

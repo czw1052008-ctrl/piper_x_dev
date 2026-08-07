@@ -10,16 +10,23 @@ fine_detector_node:
     max_detections: 6
     # mask_source: yolo (custom trained) | hsv
     mask_source: yolo
-    yolo_model: /home/user/codes/piper_x_dev/blueberry_picking_ws/runs/detect/blueberry-4/weights/best.pt
+    yolo_model: /home/user/codes/piper_x_dev/blueberry_picking_ws/runs/detect/blueberry-7/weights/best.pt
     yolo_open_vocab: false
     yolo_classes: "blueberry"
-    yolo_conf_threshold: 0.38
+    # Locked mid-range tracking: keep this high so BoT-SORT stays sticky.
+    # After-center / entry unlock uses yolo_unlocked_conf_threshold (detect only).
+    yolo_conf_threshold: 0.28
+    yolo_unlocked_conf_threshold: 0.10
     yolo_min_area_px: 120
-    yolo_max_area_frac: 0.04
+    # Was 0.04 → rejected berries closer than ~0.07m (blocks cup contact ~0.04m).
+    yolo_max_area_frac: 0.18
     yolo_min_circularity: 0.45
     yolo_max_aspect_ratio: 2.0
     enable_tracking: true
-    berry_diameter_m: 0.015
+    # Calibrated 2026-08-05: tape cam→berry ≈15cm while mono@0.015→~13cm; scale d.
+    berry_diameter_m: 0.017
+    # Pose Z: mono (bbox) | depth (RGB-D blend). Default mono for DaBai.
+    depth_pose_source: mono
     depth_min_m: 0.03
     depth_max_m: 1.8
     track_lost_max_frames: 8

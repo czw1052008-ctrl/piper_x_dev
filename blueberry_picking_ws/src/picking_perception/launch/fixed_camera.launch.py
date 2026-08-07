@@ -18,7 +18,8 @@ def _launch(context, *args, **kwargs):
         name='driver',
         parameters=[{
             'video_device': device,
-            'image_size': [1280, 720],
+            # 640x480 YUYV is much likelier to sustain ~10 Hz on USB2 than 1280x720.
+            'image_size': [640, 480],
             'pixel_format': 'YUYV',
             'camera_frame_id': frame_id,
         }],
