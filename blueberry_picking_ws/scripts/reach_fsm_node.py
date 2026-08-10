@@ -932,10 +932,22 @@ class ReachFsmNode(Node):
             self._set_state('IDLE')
 
     def _enter_fine_after_coarse(self, reason: str) -> None:
-        # Goal 4: mark success and flush episode to disk before transitioning.
+        # Goal 4: close ALIGNING episode, then open a REFINING episode.
         if self._data_collector is not None:
             self._data_collector.mark_success()
             self._data_collector.end_episode()
+            # Immediately start a companion REFINING episode.
+            plant_xyz = None
+            if self._locked is not None:
+                try:
+                    plant_xyz = [
+                        float(self._locked.pose.position.x),
+                        float(self._locked.pose.position.y),
+                        float(self._locked.pose.position.z),
+                    ]
+                except Exception:
+                    pass
+            self._data_collector.start_episode(plant_xyz=plant_xyz, phase='refining')
         self.get_logger().info(f'ALIGNING → fine control ({reason})')
         self._refine_deadline = time.time() + self._args.refine_timeout_s
         self._refine_j1_anchor = float(self._joints[0])
@@ -5213,6 +5225,9 @@ class ReachFsmNode(Node):
             self.get_logger().info(f'PBVS DONE: cup_dist={cup_dist*1000:.1f} mm')
             self._pbvs_state = 'DONE'
             self._reach_reached_pub.publish(self._bool_msg(True))
+            if self._data_collector is not None:
+                self._data_collector.mark_success()
+                self._data_collector.end_episode()
             self._set_state('WAIT_CONFIRM', 'pbvs_contact')
             return
 
@@ -5255,6 +5270,64 @@ class ReachFsmNode(Node):
         if q_target is None:
             return
         self._send_joint_servo_goal(q_target, duration_s=SERVO_DUR_S)
+
+        # Goal 4: log REFINING step for visualisation.
+        if self._data_collector is not None and self._data_collector.active:
+            iw, ih = self._wrist_image_wh()
+            _joints = self._joints or []
+            refine_obs: dict = {
+                'joint1_deg': math.degrees(_joints[0]) if len(_joints) > 0 else 0.0,
+                'joint2_deg': math.degrees(_joints[1]) if len(_joints) > 1 else 0.0,
+                'joint3_deg': math.degrees(_joints[2]) if len(_joints) > 2 else 0.0,
+                'joint5_deg': math.degrees(_joints[4]) if len(_joints) > 4 else 0.0,
+                'fine_cx': float(iw / 2),
+                'fine_cy': float(ih / 2),
+                'cup_dist_m': float(cup_dist) if cup_dist is not None else 0.0,
+                'kf_uncertainty': float(self._pbvs_kf.uncertainty()),
+                'fine_viz_annotated': 1.0,  # wrist image already has bbox overlay
+            }
+            if target_xyz is not None:
+                refine_obs.update({'kf_px': float(target_xyz[0]),
+                                   'kf_py': float(target_xyz[1]),
+                                   'kf_pz': float(target_xyz[2])})
+            if berries is not None and len(berries.berries) > 0:
+                b = berries.berries[0]
+                if hasattr(b, 'bbox_xyxy') and len(b.bbox_xyxy) >= 4:
+                    fu = (b.bbox_xyxy[0] + b.bbox_xyxy[2]) / 2.0
+                    fv = (b.bbox_xyxy[1] + b.bbox_xyxy[3]) / 2.0
+                    refine_obs.update({
+                        'fine_visible': 1.0,
+                        'fine_u': float(fu), 'fine_v': float(fv),
+                        'fine_du': float(fu - iw / 2),
+                        'fine_dv': float(fv - ih / 2),
+                        'fine_confidence': float(getattr(b, 'confidence', 0.0)),
+                        'bbox_x1': float(b.bbox_xyxy[0]),
+                        'bbox_y1': float(b.bbox_xyxy[1]),
+                        'bbox_x2': float(b.bbox_xyxy[2]),
+                        'bbox_y2': float(b.bbox_xyxy[3]),
+                    })
+                else:
+                    refine_obs['fine_visible'] = 0.0
+            else:
+                refine_obs['fine_visible'] = 0.0
+
+            refine_action = {
+                'action': 'servo',
+                'phase': 'refining',
+                'source': 'pbvs',
+                'reason': (f'{self._pbvs_state}'
+                           + (f' cup={cup_dist*100:.1f}cm' if cup_dist else '')),
+            }
+            # Prefer fine_viz (already has YOLO overlay) for wrist image.
+            wrist_img = (self._qa_rgb_fine_viz if self._qa_rgb_fine_viz is not None
+                         else self._qa_rgb_wrist)
+            if wrist_img is not None and self._qa_rgb_fixed is not None:
+                self._data_collector.log_step(
+                    global_img=self._qa_rgb_fixed,
+                    wrist_img=wrist_img,
+                    obs=refine_obs,
+                    action=refine_action,
+                )
 
     def _start_pbvs_probe(self, step_deg: float) -> None:
         """Initiate a lateral probe step to triangulate berry 3-D position."""

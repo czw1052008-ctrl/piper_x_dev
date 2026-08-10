@@ -64,7 +64,7 @@ class AlignDataCollector:
     # Episode lifecycle
     # ------------------------------------------------------------------
 
-    def start_episode(self, plant_xyz=None) -> None:
+    def start_episode(self, plant_xyz=None, phase: str = 'aligning') -> None:
         if not self._enabled:
             return
         if self._ep is not None:
@@ -82,9 +82,10 @@ class AlignDataCollector:
             'steps': [],
             'success': False,
             'teacher': self._teacher,
+            'phase': phase,
             'start_time': time.time(),
         }
-        _LOG.info(f'AlignDataCollector: episode {ep_id_str} started')
+        _LOG.info(f'AlignDataCollector: episode {ep_id_str} ({phase}) started')
 
     def log_step(
         self,
@@ -145,6 +146,7 @@ class AlignDataCollector:
         # Write metadata.json.
         meta = {
             'episode_id': ep['ep_id'],
+            'phase': ep.get('phase', 'aligning'),
             'success': ep['success'],
             'n_steps': len(ep['steps']),
             'plant_xyz': ep['plant_xyz'],
@@ -156,11 +158,25 @@ class AlignDataCollector:
 
         status = 'SUCCESS' if ep['success'] else 'FAIL'
         _LOG.info(
-            f'AlignDataCollector: episode {ep["ep_id"]} {status} '
+            f'AlignDataCollector: episode {ep["ep_id"]} [{meta["phase"]}] {status} '
             f'({len(ep["steps"])} steps) → {ep_dir}'
         )
         self._ep_id += 1
         self._ep = None
+
+        # Auto-generate HTML report immediately after saving.
+        try:
+            import sys as _sys
+            _sys.path.insert(0, os.path.dirname(__file__))
+            from visualize_episodes import render_episode_html
+            viz_dir = os.path.join(self._save_dir, 'viz')
+            html_path = render_episode_html(
+                {'meta': meta, 'steps': ep['steps'], 'ep_dir': ep_dir},
+                viz_dir,
+            )
+            _LOG.info(f'AlignDataCollector: report → {html_path}')
+        except Exception as exc:
+            _LOG.debug(f'Auto-viz skipped ({exc})')
 
     # ------------------------------------------------------------------
     # Helpers

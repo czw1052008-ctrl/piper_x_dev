@@ -63,16 +63,30 @@ _OBS_TABLE_KEYS = (
 # ---------------------------------------------------------------------------
 
 def _annotate_wrist(img, obs: Dict) -> 'np.ndarray':
-    """Draw fine-detector overlay onto wrist image (in-place copy)."""
+    """Draw fine-detector overlay onto wrist image.
+
+    Skipped when obs['fine_viz_annotated'] == 1 (image already has YOLO overlay
+    from /perception/fine/detection_viz — happens during REFINING steps).
+    """
     import cv2
     import numpy as np
+
+    # REFINING images arrive pre-annotated; add only the badge.
+    if float(obs.get('fine_viz_annotated', 0)) >= 1.0:
+        img = img.copy()
+        visible = float(obs.get('fine_visible', 0)) >= 1.0
+        if visible:
+            _badge(img, 'TRACKED', (4, 4), (0, 160, 0))
+        else:
+            _badge(img, 'NOT VISIBLE', (4, 4), (0, 60, 200))
+        return img
+
     img = img.copy()
     h, w = img.shape[:2]
 
     visible = float(obs.get('fine_visible', 0)) >= 1.0
     fu = obs.get('fine_u')
     fv = obs.get('fine_v')
-    # Fallback: reconstruct from centre + delta.
     if fu is None:
         cx = obs.get('fine_cx', w / 2.0)
         fu = cx + obs.get('fine_du', 0.0)
@@ -87,8 +101,17 @@ def _annotate_wrist(img, obs: Dict) -> 'np.ndarray':
     if visible:
         cx_det, cy_det = int(fu), int(fv)
         conf = float(obs.get('fine_confidence', 0.0))
-        cv2.circle(img, (cx_det, cy_det), 22, (0, 220, 0), 2)
-        cv2.drawMarker(img, (cx_det, cy_det), (0, 220, 0),
+        # Full bbox rectangle if coordinates saved (ALIGNING steps usually have them).
+        x1 = obs.get('bbox_x1')
+        y1 = obs.get('bbox_y1')
+        x2 = obs.get('bbox_x2')
+        y2 = obs.get('bbox_y2')
+        if x1 is not None and not _isnan(x1):
+            cv2.rectangle(img, (int(x1), int(y1)), (int(x2), int(y2)),
+                          (0, 220, 0), 2)
+        else:
+            cv2.circle(img, (cx_det, cy_det), 22, (0, 220, 0), 2)
+        cv2.drawMarker(img, (cx_det, cy_det), (0, 255, 100),
                        cv2.MARKER_CROSS, 12, 1)
         cv2.putText(img, f'{conf:.2f}', (cx_det + 6, cy_det - 26),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 220, 0), 1)
@@ -231,18 +254,37 @@ def _action_block(action: Dict) -> str:
 
 def _step_badges(obs: Dict, action: Dict) -> str:
     parts = []
-    parts.append(f'<span class="badge b-locked">LOCKED</span>')
+    phase = action.get('phase', '')
+    is_refining = phase == 'refining'
+
+    parts.append('<span class="badge b-locked">LOCKED</span>')
+
     visible = float(obs.get('fine_visible', 0)) >= 1.0
-    if visible:
-        parts.append('<span class="badge b-detected">WRIST DETECTED</span>')
+    if is_refining:
+        # REFINING: fine_viz image already has YOLO bbox — show TRACKED badge
+        if visible:
+            parts.append('<span class="badge b-detected">WRIST TRACKED</span>')
+            dist = obs.get('cup_dist_m')
+            if dist is not None:
+                parts.append(
+                    f'<span class="badge b-phase">cup {dist*100:.1f} cm</span>')
+        else:
+            parts.append('<span class="badge b-nodet">WRIST LOST</span>')
+        unc = obs.get('kf_uncertainty')
+        if unc is not None:
+            parts.append(f'<span class="badge b-phase">KF σ²={unc*1e6:.1f}µm²</span>')
     else:
-        parts.append('<span class="badge b-nodet">WRIST NOT VISIBLE</span>')
-    has_proj = float(obs.get('fixed_has_view', 0)) >= 0.5
-    if has_proj:
-        parts.append('<span class="badge b-detected">GLOBAL PROJ</span>')
-    phase = action.get('phase', action.get('action', ''))
+        if visible:
+            parts.append('<span class="badge b-detected">WRIST DETECTED</span>')
+        else:
+            parts.append('<span class="badge b-nodet">WRIST NOT VISIBLE</span>')
+        has_proj = float(obs.get('fixed_has_view', 0)) >= 0.5
+        if has_proj:
+            parts.append('<span class="badge b-detected">GLOBAL PROJ</span>')
+
     if phase:
         parts.append(f'<span class="badge b-phase">{phase.upper()}</span>')
+
     return f'<div class="badges">{"".join(parts)}</div>'
 
 
@@ -258,16 +300,21 @@ def render_episode_html(ep: Dict, viz_dir: str) -> str:
 
     ok_cls   = 'ok' if meta.get('success') else 'fail'
     ok_str   = 'SUCCESS ✓' if meta.get('success') else 'FAIL ✗'
+    phase    = meta.get('phase', 'aligning')
     plant    = meta.get('plant_xyz')
     plant_s  = (f'[{plant[0]:.3f}, {plant[1]:.3f}, {plant[2]:.3f}] m'
                 if plant else 'unknown')
+    phase_cls = 'b-phase'
 
-    html = [_HEAD, f'<h1>Episode {ep_id} &nbsp;'
+    html = [_HEAD,
+            f'<h1>Episode {ep_id} &nbsp;'
+            f'<span class="badge {phase_cls}">{phase.upper()}</span> &nbsp;'
             f'<span class="{ok_cls}">{ok_str}</span></h1>']
 
     # Metadata summary
     html.append('<table>')
-    for k, v in [('teacher', meta.get('teacher', '?')),
+    for k, v in [('phase', phase),
+                 ('teacher', meta.get('teacher', '?')),
                  ('n_steps', meta.get('n_steps', '?')),
                  ('duration', f'{meta.get("duration_s", 0):.1f} s'),
                  ('plant_xyz (locked)', plant_s)]:
