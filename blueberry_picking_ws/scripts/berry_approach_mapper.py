@@ -18,7 +18,8 @@ Usage (called from reach_fsm_node._build_approach_map_from_global):
 
 from __future__ import annotations
 
-from typing import Optional
+import time as _time
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -121,6 +122,96 @@ class BerryApproachMapper:
         return best_dir
 
 
+class FusedApproachMap:
+    """Rolling multi-source point cloud for approach direction estimation.
+
+    Accepts depth frames from both the global (DaBai) and wrist (Gemini 305)
+    cameras.  Each call to add_frame() back-projects a depth image into
+    base_link and appends the obstacle points near the berry.  Frames older
+    than max_age_s are pruned automatically so the map stays fresh as the arm
+    moves.
+
+    Usage:
+        fmap = FusedApproachMap()
+        fmap.add_frame(depth_global, K_global, T_base_global, berry_xyz)
+        # ... every 0.5 s during SERVO ...
+        fmap.add_frame(depth_wrist, K_wrist, T_base_wrist, berry_xyz,
+                       radius_m=0.15, depth_min_m=0.10, depth_max_m=1.50)
+        direction = fmap.get_approach_dir(berry_xyz, ee_xyz)
+    """
+
+    def __init__(self, max_age_s: float = 4.0) -> None:
+        self._max_age_s = max_age_s
+        self._frames: List[Tuple[np.ndarray, float]] = []  # (N×3, timestamp)
+        self._mapper = BerryApproachMapper()
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def add_frame(
+        self,
+        depth_img: np.ndarray,      # H×W float32, metres (0=invalid)
+        K: np.ndarray,              # 3×3 intrinsic
+        T_base_cam: np.ndarray,     # 4×4 camera→base_link
+        berry_xyz: np.ndarray,      # (3,) berry position in base_link
+        radius_m: float = 0.22,
+        depth_min_m: float = 0.05,
+        depth_max_m: float = 4.0,
+    ) -> int:
+        """Project depth frame and add obstacle points near berry.
+
+        Returns the number of points added (0 = nothing useful in this frame).
+        """
+        pts = self._mapper.build_local_map(
+            depth_img, K, T_base_cam, berry_xyz,
+            radius_m=radius_m,
+            depth_min_m=depth_min_m,
+            depth_max_m=depth_max_m,
+        )
+        if len(pts) > 0:
+            self._frames.append((pts, _time.time()))
+        self._prune()
+        return len(pts)
+
+    def get_point_cloud(self) -> np.ndarray:
+        """Return all non-expired points merged into a single N×3 array."""
+        self._prune()
+        if not self._frames:
+            return np.zeros((0, 3), dtype=np.float64)
+        return np.vstack([p for p, _ in self._frames])
+
+    def get_approach_dir(
+        self,
+        berry_xyz: np.ndarray,
+        ee_xyz: Optional[np.ndarray] = None,
+        **kwargs,
+    ) -> np.ndarray:
+        """Compute approach direction from the merged multi-source point cloud."""
+        return self._mapper.select_approach_direction(
+            self.get_point_cloud(), berry_xyz, ee_xyz, **kwargs)
+
+    def reset(self) -> None:
+        self._frames.clear()
+
+    @property
+    def n_frames(self) -> int:
+        self._prune()
+        return len(self._frames)
+
+    @property
+    def n_points(self) -> int:
+        return len(self.get_point_cloud())
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    def _prune(self) -> None:
+        cutoff = _time.time() - self._max_age_s
+        self._frames = [(p, t) for p, t in self._frames if t >= cutoff]
+
+
 # ---------------------------------------------------------------------------
 # Unit test  (python berry_approach_mapper.py)
 # ---------------------------------------------------------------------------
@@ -172,6 +263,36 @@ if __name__ == '__main__':
     # All points should be near z=0.5 in base frame
     assert np.all(np.abs(pts[:, 2] - 0.5) < 0.05), 'Test 3: depth mismatch'
     print(f'  Test 3 (build_local_map): {len(pts)} pts in sphere  ✓')
+
+    # ── Test 4: FusedApproachMap – multi-frame merge ─────────────────────
+    fmap = FusedApproachMap(max_age_s=10.0)
+    assert fmap.n_frames == 0 and fmap.n_points == 0, 'Test 4: empty init'
+
+    # Add global-camera frame (flat wall at z=0.5, camera=base)
+    depth_global = np.full((H, W), 0.5, dtype=np.float32)
+    n1 = fmap.add_frame(depth_global, K, T, berry_b, radius_m=0.3)
+    assert n1 > 0, f'Test 4: expected points from global frame, got {n1}'
+    assert fmap.n_frames == 1
+
+    # Add wrist-camera frame (same geometry for simplicity)
+    depth_wrist = np.full((H, W), 0.30, dtype=np.float32)
+    n2 = fmap.add_frame(depth_wrist, K, T, berry_b, radius_m=0.3)
+    assert n2 > 0, f'Test 4: expected points from wrist frame, got {n2}'
+    assert fmap.n_frames == 2
+
+    total = fmap.n_points
+    assert total == n1 + n2, f'Test 4: merged pts={total} != {n1}+{n2}'
+    d4 = fmap.get_approach_dir(berry_b, np.array([0.0, 0.0, 0.5]))
+    assert np.isclose(np.linalg.norm(d4), 1.0, atol=1e-5), 'Test 4: dir not unit'
+    print(f'  Test 4 (FusedApproachMap): {fmap.n_frames} frames, '
+          f'{total} pts, dir={np.round(d4, 3)}  ✓')
+
+    # Prune test: set max_age_s=0 → all frames should expire
+    fmap2 = FusedApproachMap(max_age_s=0.0)
+    fmap2.add_frame(depth_global, K, T, berry_b, radius_m=0.3)
+    import time as _t; _t.sleep(0.01)
+    assert fmap2.n_frames == 0, 'Test 4b: expected frames pruned'
+    print('  Test 4b (prune): frames expired correctly  ✓')
 
     print('  All assertions passed.')
     sys.exit(0)

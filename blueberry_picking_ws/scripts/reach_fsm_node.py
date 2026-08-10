@@ -315,6 +315,8 @@ class ReachFsmNode(Node):
         self._fixed_camera_K: Optional[np.ndarray] = None
         self._fixed_camera_frame: str = 'camera_fixed_color_optical_frame'
         self._precomputed_approach_dir: Optional[np.ndarray] = None
+        self._fused_map: Optional[object] = None          # FusedApproachMap (created in _init_pbvs)
+        self._pbvs_last_wrist_map_t: float = 0.0
         self.create_subscription(
             Image, '/perception/global/detection_viz', self._on_global_viz, qos_profile_sensor_data,
             callback_group=self._cb_group)
@@ -1012,15 +1014,14 @@ class ReachFsmNode(Node):
             f'lock_min_conf={float(self._args.refine_lock_min_conf):.2f} '
             f'near_confirm={int(self._args.servo_near_confirm)}; '
             f'await fine tracker reset before fruit lock')
-        # Pre-compute 3D approach direction from global RGB-D before entering REFINING.
-        # Must run before _init_pbvs so _precomputed_approach_dir is populated first.
+        # Re-init PBVS first (creates _fused_map), then feed global RGB-D into it.
+        # Must run in this order: _init_pbvs creates _fused_map; _build_approach_map_from_global feeds it.
+        if getattr(self, '_use_pbvs', False) and not self._args.align_only:
+            self._init_pbvs()
         self._build_approach_map_from_global()
         if self._args.align_only:
             self._set_state('WAIT_CONFIRM')
         else:
-            # Always re-init PBVS state so multi-loop runs (--loops N) get a fresh KF.
-            if getattr(self, '_use_pbvs', False):
-                self._init_pbvs()
             self._set_state('REFINING')
 
     def _clear_target_lock(self) -> None:
@@ -5151,20 +5152,19 @@ class ReachFsmNode(Node):
             sys.path.insert(0, _scripts_dir)
         from berry_kf_tracker import BerryKFTracker
         from approach_dir_selector import select_approach_direction
+        from berry_approach_mapper import FusedApproachMap
         self._pbvs_kf = BerryKFTracker()
         self._pbvs_state = 'INIT'   # INIT → SERVO → PROBE → APPROACH → DONE
         self._pbvs_last_tick = time.time()
-        self._pbvs_approach_dir_base = None   # (3,) unit vec in base_link
+        self._pbvs_approach_dir_base = None   # (3,) unit vec in base_link, set by _build_approach_map_from_global
         self._pbvs_probe_q_before = None
         self._pbvs_probe_obs_list = []
         self._pbvs_select_approach_direction = select_approach_direction
-        # Use approach direction pre-computed at LOCKING if available.
-        if getattr(self, '_precomputed_approach_dir', None) is not None:
-            self._pbvs_approach_dir_base = self._precomputed_approach_dir.copy()
-            self.get_logger().info(
-                f'PBVS using pre-computed approach dir: '
-                f'{np.round(self._pbvs_approach_dir_base, 3)}')
-        self.get_logger().info('PBVS loop initialised')
+        # Fresh fused map — receives global frame from _build_approach_map_from_global,
+        # then wrist frames every 0.5 s during SERVO.
+        self._fused_map = FusedApproachMap(max_age_s=4.0)
+        self._pbvs_last_wrist_map_t = 0.0
+        self.get_logger().info('PBVS loop initialised (FusedApproachMap ready)')
 
     def _tick_refining_pbvs(self) -> None:
         """Continuous PBVS loop: track berry in 3-D, servo to standoff, approach.
@@ -5249,25 +5249,32 @@ class ReachFsmNode(Node):
         if target_xyz is None:
             return
 
-        # ── 5. Approach-direction selection (once per SERVO entry) ────
-        if (self._pbvs_approach_dir_base is None
+        # ── 5. Update fused map with wrist frame (every 0.5 s during SERVO) ─
+        # The global frame was already added by _build_approach_map_from_global at
+        # REFINING entry.  Here we continuously refine the direction as the arm
+        # closes in and the wrist camera sees the berry from closer range.
+        if (self._pbvs_state == 'SERVO'
                 and depth_img is not None
                 and K_wrist is not None
-                and berry_xyz_base is not None):
-            try:
-                # Use DetectedBerry.image_u/v (center pixels) and PoseStamped depth.
-                b = berries.berries[0]  # type: ignore[union-attr]
-                uv = (int(round(float(b.image_u))), int(round(float(b.image_v))))
-                z_berry = b.pose.pose.position.z
-                dir_cam = self._pbvs_select_approach_direction(
-                    depth_img, uv, z_berry, K_wrist)
+                and target_xyz is not None
+                and getattr(self, '_fused_map', None) is not None):
+            now_map = time.time()
+            if now_map - self._pbvs_last_wrist_map_t >= 0.5:
                 T_base_cam = self._tf_base_cam()
                 if T_base_cam is not None:
-                    self._pbvs_approach_dir_base = T_base_cam[:3, :3] @ dir_cam
-                    self.get_logger().info(
-                        f'PBVS approach dir (base): {self._pbvs_approach_dir_base}')
-            except Exception as exc:
-                self.get_logger().warn(f'PBVS approach dir selection failed: {exc}')
+                    n_pts = self._fused_map.add_frame(
+                        depth_img, K_wrist, T_base_cam,
+                        target_xyz, radius_m=0.15,
+                        depth_min_m=0.10, depth_max_m=1.50)
+                    self._pbvs_last_wrist_map_t = now_map
+                    if n_pts > 0:
+                        new_dir = self._fused_map.get_approach_dir(
+                            target_xyz, self._tcp_or_ee_xyz())
+                        self._pbvs_approach_dir_base = new_dir
+                        self.get_logger().debug(
+                            f'FusedApproachMap: +{n_pts} wrist pts '
+                            f'(total {self._fused_map.n_points}), '
+                            f'dir={np.round(new_dir, 3)}')
 
         approach_dir = self._pbvs_approach_dir_base
         if approach_dir is None:
@@ -5457,34 +5464,38 @@ class ReachFsmNode(Node):
             return None
 
     def _build_approach_map_from_global(self) -> None:
-        """Called at LOCKING success. Uses global RGB-D depth to pre-compute approach dir."""
+        """Feed global RGB-D frame into fused map and update approach direction.
+
+        Skipped silently when no global depth is available or _fused_map hasn't
+        been created yet (non-PBVS mode / align_only).
+        """
+        fused_map = getattr(self, '_fused_map', None)
+        if fused_map is None:
+            return
         if self._last_fixed_depth is None or self._fixed_camera_K is None:
             self.get_logger().info(
-                'BerryApproachMapper: skipped (no global depth/K yet)')
+                'FusedApproachMap: skipped global frame (no depth/K yet)')
             return
         if self._locked is None:
             return
         try:
-            from berry_approach_mapper import BerryApproachMapper
-            if not hasattr(self, '_approach_mapper'):
-                self._approach_mapper = BerryApproachMapper()
             T = self._tf_fixed_cam()
             if T is None:
                 self.get_logger().warn(
-                    'BerryApproachMapper: TF camera_fixed→base_link unavailable')
+                    'FusedApproachMap: TF camera_fixed→base_link unavailable')
                 return
             p = self._locked.pose.pose.position
             berry = np.array([float(p.x), float(p.y), float(p.z)])
             ee = self._tcp_or_ee_xyz()
-            pts = self._approach_mapper.build_local_map(
+            n = fused_map.add_frame(
                 self._last_fixed_depth, self._fixed_camera_K, T, berry)
-            self._precomputed_approach_dir = \
-                self._approach_mapper.select_approach_direction(pts, berry, ee)
+            self._pbvs_approach_dir_base = fused_map.get_approach_dir(berry, ee)
             self.get_logger().info(
-                f'BerryApproachMapper: {len(pts)} pts around berry, '
-                f'approach_dir={np.round(self._precomputed_approach_dir, 3)}')
+                f'FusedApproachMap: +{n} pts from global cam '
+                f'(total {fused_map.n_points}), '
+                f'approach_dir={np.round(self._pbvs_approach_dir_base, 3)}')
         except Exception as exc:
-            self.get_logger().warn(f'BerryApproachMapper failed: {exc}')
+            self.get_logger().warn(f'FusedApproachMap (global frame) failed: {exc}')
 
     # -----------------------------------------------------------------------
     # End PBVS (pbvs-vlm-reach-v2)

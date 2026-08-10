@@ -731,13 +731,17 @@ self._wrist_camera_K = np.array([
 
 ### New File: `scripts/berry_approach_mapper.py`
 
-替代原 2D 图像方法（`approach_dir_selector.py`），在 LOCKING 成功时从全局 RGB-D 帧构建
-果实周围 3D 点云，通过射线投射选出障碍物最少的进入方向。
+包含两个类：
+
+#### `BerryApproachMapper`
+
+底层几何工具，单帧操作：
 
 ```
 Class: BerryApproachMapper
 
-  build_local_map(depth_img, K, T_base_cam, berry_xyz_base, radius_m=0.22)
+  build_local_map(depth_img, K, T_base_cam, berry_xyz_base,
+                  radius_m=0.22, depth_min_m=0.05, depth_max_m=4.0)
     → N×3 ndarray (obstacle points in base_link)
     Back-projects valid depth pixels to base_link frame via T_base_cam.
     Keeps only points within radius_m sphere around berry.
@@ -750,13 +754,37 @@ Class: BerryApproachMapper
     Casts 36 candidate rays outward from berry, counts point cloud hits
     inside a cylinder (radius 3 cm) between 3–25 cm from berry.
     Returns direction with lowest obstacle count.
-    Falls back to EE→berry (or +X) when point cloud is empty.
+    Falls back to EE→berry (or +X base_link) when point cloud is empty.
 ```
+
+#### `FusedApproachMap`
+
+滚动时间窗多源点云融合，持续接受来自全局相机（DaBai）和腕部相机（Gemini 305）的深度帧：
+
+```
+Class: FusedApproachMap(max_age_s=4.0)
+
+  add_frame(depth_img, K, T_base_cam, berry_xyz,
+            radius_m=0.22, depth_min_m=0.05, depth_max_m=4.0)
+    → int  (added point count, 0 = nothing useful)
+    Calls BerryApproachMapper.build_local_map(), appends (N×3, timestamp).
+    Auto-prunes frames older than max_age_s.
+
+  get_point_cloud() → N×3 merged array (all non-expired frames)
+  get_approach_dir(berry_xyz, ee_xyz=None, **kwargs) → (3,) unit vector
+  reset()         — clear all frames
+  n_frames (int), n_points (int) — live stats
+```
+
+**设计意图**：全局相机在 REFINING 入口提供场景骨架（远视角，无遮挡），腕部相机在
+SERVO 期间每 0.5 s 更新一帧（近视角，分辨率高）。两源数据在 base_link 坐标系下
+直接合并，方向选择器同时看到两层信息，随手臂靠近动态收敛。
 
 Unit tests embedded in `__main__`:
 - Test 1: empty cloud → fallback to EE→berry
 - Test 2: obstacle directly ahead → picks lateral direction
 - Test 3: `build_local_map` geometry with flat wall
+- Test 4: `FusedApproachMap` multi-frame merge + prune
 
 ---
 
@@ -781,36 +809,69 @@ self._last_wrist_depth: Optional[np.ndarray] = None
 self._last_fixed_depth: Optional[np.ndarray] = None
 self._fixed_camera_K: Optional[np.ndarray] = None
 self._fixed_camera_frame: str = 'camera_fixed_color_optical_frame'
-self._precomputed_approach_dir: Optional[np.ndarray] = None
+self._precomputed_approach_dir: Optional[np.ndarray] = None  # 保留（未使用，供调试）
+self._fused_map: Optional[object] = None       # FusedApproachMap（_init_pbvs 创建）
+self._pbvs_last_wrist_map_t: float = 0.0
 ```
 
-#### LOCKING hook：`_build_approach_map_from_global()`
+#### `_build_approach_map_from_global()`
 
-在 `_tick_lock_region` 里两处 `return True` 之前各调用一次。
+在 `_enter_fine_after_coarse` 里（`_init_pbvs` 之后）调用一次，将全局相机帧加入 fused map。
 
 ```python
 def _build_approach_map_from_global(self) -> None:
-    # 跳过条件：无全局深度 / 无内参 / 未锁定果实
-    # 查找 TF: base_link → fixed_camera_frame（_tf_fixed_cam()）
-    # 调用 BerryApproachMapper.build_local_map() → 点云
-    # 调用 .select_approach_direction() → 存入 self._precomputed_approach_dir
-    # 日志：'BerryApproachMapper: N pts around berry, approach_dir=[...]'
+    # 跳过条件：_fused_map 为 None（非 PBVS / align_only）
+    #           或 无全局深度 / 无内参 / 未锁定果实
+    # 查找 TF: base_link → camera_fixed_color_optical_frame（_tf_fixed_cam()）
+    # fused_map.add_frame(global_depth, K_fixed, T, berry) → n_pts
+    # fused_map.get_approach_dir(berry, ee) → self._pbvs_approach_dir_base
+    # 日志：'FusedApproachMap: +N pts from global cam (total M), approach_dir=[...]'
 ```
 
-#### PBVS 使用预计算方向
+#### `_init_pbvs()` — 创建 FusedApproachMap
 
-在 `_init_pbvs` 末尾：
 ```python
-if getattr(self, '_precomputed_approach_dir', None) is not None:
-    self._pbvs_approach_dir_base = self._precomputed_approach_dir.copy()
-    self.get_logger().info(
-        f'PBVS using pre-computed approach dir: {np.round(self._pbvs_approach_dir_base, 3)}')
+from berry_approach_mapper import FusedApproachMap
+self._fused_map = FusedApproachMap(max_age_s=4.0)
+self._pbvs_last_wrist_map_t = 0.0
+# _pbvs_approach_dir_base 留 None，由随后的 _build_approach_map_from_global 设置
 ```
 
-二级 fallback 链（优先级从高到低）：
-1. `_precomputed_approach_dir`（全局 RGB-D，在 LOCKING 时计算）
-2. 腕部单帧深度 + `approach_dir_selector`（在 REFINING 入口计算，修复前从未执行）
-3. `+X base_link`（纯 fallback）
+#### `_tick_refining_pbvs()` SERVO — 腕部帧时间门控更新
+
+每 0.5 s 将腕部深度帧加入 fused map，重算方向（取代旧的单帧 `approach_dir_selector` 调用）：
+
+```python
+if (self._pbvs_state == 'SERVO'
+        and depth_img is not None and K_wrist is not None
+        and target_xyz is not None
+        and getattr(self, '_fused_map', None) is not None):
+    now_map = time.time()
+    if now_map - self._pbvs_last_wrist_map_t >= 0.5:
+        T_base_cam = self._tf_base_cam()
+        if T_base_cam is not None:
+            n_pts = self._fused_map.add_frame(
+                depth_img, K_wrist, T_base_cam,
+                target_xyz, radius_m=0.15, depth_min_m=0.10, depth_max_m=1.50)
+            self._pbvs_last_wrist_map_t = now_map
+            if n_pts > 0:
+                new_dir = self._fused_map.get_approach_dir(
+                    target_xyz, self._tcp_or_ee_xyz())
+                self._pbvs_approach_dir_base = new_dir
+```
+
+#### `_enter_fine_after_coarse` 调用顺序（关键）
+
+```
+_init_pbvs()                     ← 先建 _fused_map
+_build_approach_map_from_global() ← 再喂全局帧
+_set_state('REFINING')
+```
+
+方向 fallback 链（优先级从高到低）：
+1. **FusedApproachMap**：全局 RGB-D（REFINING 入口）+ 腕部 RGB-D（SERVO 每 0.5 s）
+2. EE→berry 向量（`_tcp_or_ee_xyz()` 可用时）
+3. `+Z base_link`（最后兜底）
 
 ---
 
@@ -904,12 +965,13 @@ nohup /usr/bin/python3 -u \
    ros2 topic hz /camera_fixed/color/image_raw
    ```
 
-3. **验证 BerryApproachMapper 运行**（FSM 日志应出现）：
+3. **验证 FusedApproachMap 运行**（FSM 日志应出现）：
    ```
-   BerryApproachMapper: N pts around berry, approach_dir=[...]
-   PBVS using pre-computed approach dir: [...]
+   PBVS loop initialised (FusedApproachMap ready)
+   FusedApproachMap: +N pts from global cam (total M), approach_dir=[...]
+   FusedApproachMap: +N wrist pts (total M), dir=[...]    ← DEBUG 级别，SERVO 期间
    ```
-   不应出现 `PBVS approach dir selection failed`。
+   不应出现 `FusedApproachMap (global frame) failed`。
 
 4. **重新标定 TF**（换了 DaBai 物理位置后）：
    更新 `src/picking_description/calibration/fixed_camera_to_base.yaml`，
@@ -948,16 +1010,16 @@ start_refine（调试脚本）             start（完整链路）
 2. _reset_refine_state(keep_anchors=True)     ← 清除上一轮所有状态
 3. _refine_await_tracker_reset = True
 4. self._fine = None    ← 丢弃旧 BoT-SORT 缓存，防止 stale berry 被 pin
-5. _build_approach_map_from_global()
-   • 条件：_last_fixed_depth 非 None + _fixed_camera_K 非 None + _locked 非 None
+5. _init_pbvs()         ← 每次进入都重新初始化，多轮 --loops N 安全
+   • BerryKFTracker 重置；_pbvs_state = 'INIT'
+   • FusedApproachMap(max_age_s=4.0) 重置；_pbvs_last_wrist_map_t = 0.0
+   • _pbvs_approach_dir_base = None（由步骤 6 填充）
+6. _build_approach_map_from_global()
+   • 条件：_fused_map 非 None + _last_fixed_depth 非 None + _locked 非 None
    • TF 查询 base_link → camera_fixed_color_optical_frame
-   • 反投影深度图 → 3D 点云（以 _locked 位置为中心，球半径 0.22m）
-   • 36 方向射线投票（cylinder radius 3cm，检测范围 3–25cm）
-   • 结果存入 _precomputed_approach_dir
-6. _init_pbvs()         ← 每次进入都重新初始化，多轮 --loops N 安全
-   • BerryKFTracker 重置
-   • _pbvs_state = 'INIT'
-   • _pbvs_approach_dir_base ← _precomputed_approach_dir（若有）
+   • fused_map.add_frame(global_depth, K_fixed, T, berry, radius_m=0.22)
+   • fused_map.get_approach_dir(berry, ee) → _pbvs_approach_dir_base
+   • 日志：'FusedApproachMap: +N pts from global cam (total M), approach_dir=[...]'
 7. _set_state('REFINING')
 ```
 
@@ -988,10 +1050,13 @@ SERVO（每 tick）
   • KF.predict(dt)
   • 若有新检测：KF.update(xyz, sigma)
   • 若不确定度 trace(P) > 4×8e-4 且无在途 probe → PROBE
-  • 若 _pbvs_approach_dir_base 仍 None（预计算未成功）：
-      用腕部深度图 + image_u/v 调 approach_dir_selector 补算
+  • 每 0.5 s：fused_map.add_frame(wrist_depth, K_wrist, T_base_wrist,
+                                  target_xyz, radius_m=0.15)
+              若 n_pts > 0：_pbvs_approach_dir_base 更新为 fused_map.get_approach_dir()
+  • approach_dir = _pbvs_approach_dir_base
+      若仍 None → fallback EE→berry → fallback +Z
   • standoff_xyz = KF.position - approach_dir × 0.07m
-  • cup_axis_ik(standoff_xyz, approach_dir) → q_target
+  • cup_axis_ik(standoff_xyz, target_xyz) → q_target
   • send_joint_servo_goal(q_target, 0.15s)
   进入 APPROACH 条件：trace(P) < 8e-4 AND cup_dist < 9.1cm
 
