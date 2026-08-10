@@ -168,8 +168,8 @@ class AlignDataGenerator:
                 input('  Press Enter to continue, Ctrl-C to abort.')
                 self._consecutive_errors = 0
 
-            # 1. Reset FSM to IDLE.
-            self._send_cmd('reset')
+            # 1. Reset FSM to IDLE ('abort' is the correct FSM command; 'reset' is not handled).
+            self._send_cmd('abort')
             final = self._wait_for_state({'IDLE'}, timeout_s=15.0)
             if final != 'IDLE':
                 _LOG.warning(f'Could not reach IDLE (state={self._fsm_state}); skipping')

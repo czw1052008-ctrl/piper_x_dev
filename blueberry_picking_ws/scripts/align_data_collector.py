@@ -105,10 +105,15 @@ class AlignDataCollector:
         self._save_jpg(global_img, os.path.join(ep_dir, g_fname))
         self._save_jpg(wrist_img,  os.path.join(ep_dir, w_fname))
 
-        # Filter obs to known keys, coerce to float.
-        obs_filtered = {
-            k: float(obs[k]) for k in OBS_KEYS if k in obs
-        }
+        # Save all numeric obs fields.  Training code filters to OBS_KEYS itself;
+        # extra fields (fine_u/v, fixed_plant_u/v, fixed_ee_u/v …) are needed by
+        # the visualiser to draw per-frame detection/lock overlays.
+        obs_filtered = {}
+        for k, v in obs.items():
+            try:
+                obs_filtered[k] = float(v)
+            except (TypeError, ValueError):
+                pass
 
         # Strip large/non-serialisable fields from action.
         action_clean = {

@@ -586,6 +586,8 @@ class ReachFsmNode(Node):
                 self._cancel_move()
                 self._reset_align_loop()
                 self._reset_refine_state()
+                if self._data_collector is not None and self._state in ('LOCKING', 'ALIGNING'):
+                    self._data_collector.end_episode()
                 self._set_state('IDLE')
             return
 
@@ -853,16 +855,15 @@ class ReachFsmNode(Node):
         self._snap_qa(f'align_{self._align_step_idx:02d}_before_{label}')
         self._write_align_observation(
             f'align_{self._align_step_idx:02d}_before_{label}.json', obs, decision)
-        # Goal 4: log step for BC training.
+        # Goal 4: log step for BC training (skip if cameras not yet warm).
         if self._data_collector is not None:
-            self._data_collector.log_step(
-                global_img=self._qa_rgb_fixed if self._qa_rgb_fixed is not None
-                           else _np_zeros_rgb(),
-                wrist_img=self._qa_rgb_wrist if self._qa_rgb_wrist is not None
-                          else _np_zeros_rgb(),
-                obs=obs,
-                action=decision,
-            )
+            if self._qa_rgb_fixed is not None and self._qa_rgb_wrist is not None:
+                self._data_collector.log_step(
+                    global_img=self._qa_rgb_fixed,
+                    wrist_img=self._qa_rgb_wrist,
+                    obs=obs,
+                    action=decision,
+                )
         return self._start_align_step(decision, rollback=False)
 
     def _start_move(self, goal: MoveGroup.Goal, label: str) -> None:
@@ -931,9 +932,10 @@ class ReachFsmNode(Node):
             self._set_state('IDLE')
 
     def _enter_fine_after_coarse(self, reason: str) -> None:
-        # Goal 4: mark current episode as successful before transitioning.
+        # Goal 4: mark success and flush episode to disk before transitioning.
         if self._data_collector is not None:
             self._data_collector.mark_success()
+            self._data_collector.end_episode()
         self.get_logger().info(f'ALIGNING → fine control ({reason})')
         self._refine_deadline = time.time() + self._args.refine_timeout_s
         self._refine_j1_anchor = float(self._joints[0])
