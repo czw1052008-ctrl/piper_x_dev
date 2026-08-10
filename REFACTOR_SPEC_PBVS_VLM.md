@@ -914,3 +914,139 @@ nohup /usr/bin/python3 -u \
 4. **重新标定 TF**（换了 DaBai 物理位置后）：
    更新 `src/picking_description/calibration/fixed_camera_to_base.yaml`，
    重新运行 hand-eye 标定。当前先用旧标定文件凑合。
+
+---
+
+## REFINING 完整流程（PBVS 路径，2026-08-10 修订）
+
+Commit: `5a0364e`
+
+### 触发入口：两条路径收敛到同一函数
+
+```
+start_refine（调试脚本）             start（完整链路）
+       ↓                                   ↓
+  _on_cmd:                            LOCKING
+  • 若 _locked=None，尝试               • _tick_lock_region()
+    全局相机 fallback 锁定               • _build_approach_map_from_global()
+  • 记录关节锚点 j1/j5                   → ALIGNING
+       ↓                               • _tick_aligning()
+  _enter_fine_after_coarse()                ↓
+                                    _enter_fine_after_coarse()
+```
+
+注意：`start_refine` **直接进 REFINING，不走 LOCKING/ALIGNING**。
+`_build_approach_map_from_global()` 现在也在 `_enter_fine_after_coarse` 里调用，
+确保调试路径也能预计算进入方向。
+
+---
+
+### `_enter_fine_after_coarse()` 执行顺序
+
+```
+1. 保存关节锚点 (j1/j2/j3/j5 anchor)
+2. _reset_refine_state(keep_anchors=True)     ← 清除上一轮所有状态
+3. _refine_await_tracker_reset = True
+4. self._fine = None    ← 丢弃旧 BoT-SORT 缓存，防止 stale berry 被 pin
+5. _build_approach_map_from_global()
+   • 条件：_last_fixed_depth 非 None + _fixed_camera_K 非 None + _locked 非 None
+   • TF 查询 base_link → camera_fixed_color_optical_frame
+   • 反投影深度图 → 3D 点云（以 _locked 位置为中心，球半径 0.22m）
+   • 36 方向射线投票（cylinder radius 3cm，检测范围 3–25cm）
+   • 结果存入 _precomputed_approach_dir
+6. _init_pbvs()         ← 每次进入都重新初始化，多轮 --loops N 安全
+   • BerryKFTracker 重置
+   • _pbvs_state = 'INIT'
+   • _pbvs_approach_dir_base ← _precomputed_approach_dir（若有）
+7. _set_state('REFINING')
+```
+
+---
+
+### `_tick_refining_pbvs()` 主循环
+
+每个 FSM tick 调用一次。每 tick 先采集腕部数据：
+
+```python
+berries = self._fine if self._fine_is_fresh() else None
+# 取 berries.berries[0]（DetectedBerry），经 TF 转换到 base_link
+# DetectedBerry.pose 是 PoseStamped → 位置用 b.pose.pose.position.x/y/z
+# 深度来源：b.depth_mode → sigma:
+#   rgbd/fused_rgbd → 5mm，da2 → 12mm，mono → 25mm
+# 中心像素：b.image_u, b.image_v（非 bbox_xyxy，该字段不在消息里）
+```
+
+**PBVS 子状态机：**
+
+```
+INIT
+  • 等第一帧有效 berry_xyz_base（self._fine = None 时自然等待，等价于 tracker reset）
+  • KF.initialize(xyz, sigma_init = berry_sigma × 3)
+  → SERVO
+
+SERVO（每 tick）
+  • KF.predict(dt)
+  • 若有新检测：KF.update(xyz, sigma)
+  • 若不确定度 trace(P) > 4×8e-4 且无在途 probe → PROBE
+  • 若 _pbvs_approach_dir_base 仍 None（预计算未成功）：
+      用腕部深度图 + image_u/v 调 approach_dir_selector 补算
+  • standoff_xyz = KF.position - approach_dir × 0.07m
+  • cup_axis_ik(standoff_xyz, approach_dir) → q_target
+  • send_joint_servo_goal(q_target, 0.15s)
+  进入 APPROACH 条件：trace(P) < 8e-4 AND cup_dist < 9.1cm
+
+PROBE（主动三角测量，降低 KF 不确定度）
+  • 记录当前关节 q_before
+  • joint1 +3°，发 0.4s 轨迹
+  • 收集 ≥2 帧 berry_xyz_base，取均值
+  • KF.update_triangulated(mean_xyz, sigma=4mm)
+  • 回到 q_before（0.4s 轨迹）
+  → SERVO
+
+APPROACH（KF 已收敛）
+  • KF 冻结：只 predict，不 update
+  • standoff_xyz = KF.position（offset=0，直接朝 berry）
+  • cup_axis_ik(target_xyz, approach_dir) → q_target
+  • send_joint_servo_goal(q_target, 0.15s)
+  终止条件：cup_dist < 15mm
+
+DONE
+  • 发布 /reach/reached = True
+  • FSM → WAIT_CONFIRM
+```
+
+**进入方向优先级：**
+
+```
+① _precomputed_approach_dir  ← LOCKING 或 _enter_fine_after_coarse 时，
+                                全局 RGB-D 点云 + 36 射线投票（最优）
+② approach_dir_selector      ← SERVO 首 tick，用腕部深度图在线计算
+③ np.array([1.0, 0.0, 0.0]) ← +X base_link 纯兜底
+```
+
+---
+
+### 已修复的 Bug（commit `5a0364e`）
+
+| 位置 | Bug | 影响 | 修复 |
+|---|---|---|---|
+| `_enter_fine_after_coarse` | `start_refine` 跳过 LOCKING，`_build_approach_map_from_global` 从不运行 | 调试路径永远用 +X | 在 `_enter_fine_after_coarse` 里调用 |
+| `_enter_fine_after_coarse` | 多轮 `--loops N` 时 PBVS 状态不重置（`_pbvs_kf` 已存在，`_init_pbvs` 不再调用） | 第二轮 `_pbvs_state='DONE'` 直接跳过 | 每次显式调 `_init_pbvs()` |
+| `_tick_refining_pbvs` | `_last_fine_berries`（从未赋值）替代 `self._fine` | `berries` 永远 None，KF 卡死 INIT | 换成 `self._fine if self._fine_is_fresh() else None` |
+| `_tick_refining_pbvs` | `b.pose.position.x`（PoseStamped 需双层 `.pose`） | try/except 捕获，`berry_xyz_base` 永远 None | 改为 `b.pose.pose.position.x/y/z` |
+| `_tick_refining_pbvs` | `getattr(b, 'mode', ...)` 字段不存在 | 深度 sigma 始终用默认 0.020 | 改为 `b.depth_mode` |
+| `_tick_refining_pbvs` | `b.bbox_xyxy` 字段不在 DetectedBerry.msg 里 | approach_dir 在线计算异常 | 改为 `b.image_u, b.image_v` |
+
+---
+
+### 正常成功的日志序列
+
+```
+BerryApproachMapper: 312 pts around berry, approach_dir=[0.85 0.02 0.21]
+PBVS loop initialised
+PBVS INIT → SERVO  berry_base=[0.341 0.008 0.201]
+PBVS active probe: step_deg=3.0
+PBVS probe triangulated: [0.342 0.007 0.199]  uncertainty→42.3 µm²
+PBVS SERVO → APPROACH  dist=8.7 cm
+PBVS DONE: cup_dist=11.2 mm
+```
