@@ -665,3 +665,252 @@ VLM fallback still active when `align_fail_count > 2`.
   launch files continue to work unchanged.
 - QA image writes (`_write_align_observation`) must still happen in the VLM path.
 - The 5 cm close-eyes approach and vacuum contact confirmation logic is unchanged.
+
+---
+
+## Hardware Upgrade: DaBai Global + Gemini 305 Wrist (2026-08-10)
+
+Commit: `b02d45d`  Branch: `pbvs-vlm-reach-v2`
+
+### 背景 / Context
+
+升级前存在两个根本性缺陷：
+
+1. **进入方向选择从未运行**：`reach_fsm_node.py` 里 `_last_wrist_depth` 和 `_wrist_camera_K`
+   从未被赋值（没有订阅对应话题），`approach_dir_selector` 的判断永远 False，PBVS 一直
+   fallback 到 `+X base_link` 方向。
+2. **全局相机无深度**：全局相机为 USB v4l2 摄像头，无法提供 3D 信息。
+
+本次升级：
+- 全局相机换 **Orbbec DaBai**（RGB-D，SDK v1 `OrbbecSDK_ROS2_main`）
+- 腕部相机换 **Orbbec Gemini 305**（RGB-D，新 SDK `OrbbecSDK_ROS2`，需 `uvc_backend:=libuvc`）
+- 修复两个 bug，并在 LOCKING 阶段利用全局深度构建 3D 进入方向地图
+
+---
+
+### Bug Fixes
+
+#### Bug 1：腕部深度订阅缺失
+
+`reach_fsm_node.py` 从未订阅 `/camera_wrist/depth/image_raw`，导致 `_last_wrist_depth` 永远
+为 None，`approach_dir_selector` 条件永远不满足。
+
+**Fix**：在 `__init__` 订阅块新增：
+```python
+self.create_subscription(
+    Image, '/camera_wrist/depth/image_raw',
+    self._on_wrist_depth, qos_profile_sensor_data, callback_group=self._cb_group)
+
+def _on_wrist_depth(self, msg: Image) -> None:
+    try:
+        d = np.frombuffer(msg.data, dtype=np.uint16).reshape(msg.height, msg.width)
+        self._last_wrist_depth = d.astype(np.float32) / 1000.0
+    except Exception:
+        pass
+```
+
+初始化：`self._last_wrist_depth: Optional[np.ndarray] = None`
+
+#### Bug 2：`_wrist_camera_K` 从未以 3×3 矩阵形式赋值
+
+`_on_wrist_info` 只存了 `_wrist_K`（4 元组），但 PBVS 代码引用的是 `_wrist_camera_K`
+（3×3 numpy），因此始终为 None。
+
+**Fix**：修改 `_on_wrist_info`，在已有赋值后追加：
+```python
+self._wrist_camera_K = np.array([
+    [float(msg.k[0]), 0.0,             float(msg.k[2])],
+    [0.0,             float(msg.k[4]), float(msg.k[5])],
+    [0.0,             0.0,             1.0            ],
+], dtype=np.float64)
+```
+
+初始化：`self._wrist_camera_K: Optional[np.ndarray] = None`
+
+---
+
+### New File: `scripts/berry_approach_mapper.py`
+
+替代原 2D 图像方法（`approach_dir_selector.py`），在 LOCKING 成功时从全局 RGB-D 帧构建
+果实周围 3D 点云，通过射线投射选出障碍物最少的进入方向。
+
+```
+Class: BerryApproachMapper
+
+  build_local_map(depth_img, K, T_base_cam, berry_xyz_base, radius_m=0.22)
+    → N×3 ndarray (obstacle points in base_link)
+    Back-projects valid depth pixels to base_link frame via T_base_cam.
+    Keeps only points within radius_m sphere around berry.
+
+  select_approach_direction(point_cloud, berry_xyz, ee_xyz=None,
+                            n_candidates=36, lateral_blend=0.25,
+                            cylinder_radius_m=0.03, ray_near_m=0.03, ray_far_m=0.25)
+    → (3,) unit vector in base_link
+    Seeds from current EE→berry direction.
+    Casts 36 candidate rays outward from berry, counts point cloud hits
+    inside a cylinder (radius 3 cm) between 3–25 cm from berry.
+    Returns direction with lowest obstacle count.
+    Falls back to EE→berry (or +X) when point cloud is empty.
+```
+
+Unit tests embedded in `__main__`:
+- Test 1: empty cloud → fallback to EE→berry
+- Test 2: obstacle directly ahead → picks lateral direction
+- Test 3: `build_local_map` geometry with flat wall
+
+---
+
+### Modified: `scripts/reach_fsm_node.py`
+
+新增三类改动，均不修改已有方法：
+
+#### 新增订阅和状态变量
+
+```python
+# 订阅
+self.create_subscription(Image, '/camera_fixed/depth/image_raw',
+    self._on_fixed_depth, qos_profile_sensor_data, callback_group=self._cb_group)
+self.create_subscription(CameraInfo, '/camera_fixed/color/camera_info',
+    self._on_fixed_cam_info, qos_profile_sensor_data, callback_group=self._cb_group)
+self.create_subscription(Image, '/camera_wrist/depth/image_raw',
+    self._on_wrist_depth, qos_profile_sensor_data, callback_group=self._cb_group)
+
+# 状态变量（在 _wrist_K 附近）
+self._wrist_camera_K: Optional[np.ndarray] = None
+self._last_wrist_depth: Optional[np.ndarray] = None
+self._last_fixed_depth: Optional[np.ndarray] = None
+self._fixed_camera_K: Optional[np.ndarray] = None
+self._fixed_camera_frame: str = 'camera_fixed_color_optical_frame'
+self._precomputed_approach_dir: Optional[np.ndarray] = None
+```
+
+#### LOCKING hook：`_build_approach_map_from_global()`
+
+在 `_tick_lock_region` 里两处 `return True` 之前各调用一次。
+
+```python
+def _build_approach_map_from_global(self) -> None:
+    # 跳过条件：无全局深度 / 无内参 / 未锁定果实
+    # 查找 TF: base_link → fixed_camera_frame（_tf_fixed_cam()）
+    # 调用 BerryApproachMapper.build_local_map() → 点云
+    # 调用 .select_approach_direction() → 存入 self._precomputed_approach_dir
+    # 日志：'BerryApproachMapper: N pts around berry, approach_dir=[...]'
+```
+
+#### PBVS 使用预计算方向
+
+在 `_init_pbvs` 末尾：
+```python
+if getattr(self, '_precomputed_approach_dir', None) is not None:
+    self._pbvs_approach_dir_base = self._precomputed_approach_dir.copy()
+    self.get_logger().info(
+        f'PBVS using pre-computed approach dir: {np.round(self._pbvs_approach_dir_base, 3)}')
+```
+
+二级 fallback 链（优先级从高到低）：
+1. `_precomputed_approach_dir`（全局 RGB-D，在 LOCKING 时计算）
+2. 腕部单帧深度 + `approach_dir_selector`（在 REFINING 入口计算，修复前从未执行）
+3. `+X base_link`（纯 fallback）
+
+---
+
+### Modified: `scripts/depth_fusion.py`
+
+Gemini 305 深度范围调整（原 Orbbec Astra 参数）：
+
+| 参数 | 旧值 | 新值 |
+|---|---|---|
+| `_RGBD_MIN_M` | 0.04 m | **0.10 m** |
+| `_RGBD_MAX_M` | 1.10 m | **1.50 m** |
+
+---
+
+### Modified: `src/picking_perception/config/foundation_pose.yaml`
+
+fine_detector_node 参数更新（Gemini 305 特性 + 已校准直径）：
+
+| 参数 | 旧值 | 新值 | 原因 |
+|---|---|---|---|
+| `depth_pose_source` | `mono` | **`depth`** | Gemini 305 近距离深度可靠 |
+| `depth_min_m` | 0.03 | **0.10** | Gemini 305 最小可靠深度 |
+| `depth_max_m` | 1.8 | **1.5** | 限制范围，减少噪声 |
+| `berry_diameter_m` | 0.015 | **0.017** | 2026-08-05 用胶带校准 |
+
+---
+
+### Modified: `scripts/real_robot_bringup.sh`
+
+#### 相机 SDK 拆分
+
+```bash
+ORBBEC_WS="${PIPER_X_DEV}/OrbbecSDK_ROS2"          # 新 SDK，腕部 Gemini 305
+ORBBEC_WS_FIXED="${PIPER_X_DEV}/OrbbecSDK_ROS2_main"  # SDK v1，全局 DaBai
+```
+
+`gemini305.launch.py` 仅存在于新 SDK；`dabai.launch.py` 仅存在于旧 SDK。
+
+#### 腕部相机（Gemini 305）
+
+```bash
+ORBBEC_LAUNCH=gemini305.launch.py
+# 新增参数：
+camera_args="... uvc_backend:=libuvc"   # Gemini 305 必须
+# 序列号需填写：
+ORBBEC_SERIAL=   # 运行 ros2 run orbbec_camera list_devices_node 查询
+```
+
+#### 全局相机（DaBai，原 v4l2）
+
+完整替换 `ENABLE_FIXED_CAMERA` 块：
+- 使用 `${ORBBEC_WS_FIXED}` source 旧 SDK
+- `ros2 launch orbbec_camera dabai.launch.py` + `depth_registration:=true`
+- 不加 `uvc_backend`（DaBai 旧 SDK 无此参数）
+- 等待 color 和 depth 两个话题就绪
+- TF 使用四元数形式发布（`--qx --qy --qz --qw`）
+- 新增配置变量：`FIXED_CAM_SERIAL=`、`FIXED_CAM_USB_PORT=`、`FIXED_CAM_QX/Y/Z/W`
+
+---
+
+### Modified: `scripts/_run_refine_pbvs.sh`
+
+fine_detector_node 启动参数新增 `-p depth_pose_source:=depth`，确保覆盖 yaml 默认值：
+
+```bash
+nohup /usr/bin/python3 -u \
+  install/picking_perception/lib/picking_perception/fine_detector_node \
+  --ros-args \
+  -p enable_foundation_pose:=false \
+  -p publish_hz:=10.0 \
+  -p mask_source:=yolo \
+  -p depth_pose_source:=depth \          # ← 新增
+  --params-file src/picking_perception/config/foundation_pose.yaml \
+```
+
+---
+
+### Deployment Checklist（部署前必做）
+
+1. **查询序列号**，填入 `config/real_robot.env`：
+   ```bash
+   ros2 run orbbec_camera list_devices_node
+   # 填写 ORBBEC_SERIAL=<Gemini 305 序列号>
+   # 填写 FIXED_CAM_SERIAL=<DaBai 序列号>
+   ```
+
+2. **验证话题**：
+   ```bash
+   ros2 topic hz /camera_wrist/depth/image_raw
+   ros2 topic hz /camera_fixed/depth/image_raw
+   ros2 topic hz /camera_fixed/color/image_raw
+   ```
+
+3. **验证 BerryApproachMapper 运行**（FSM 日志应出现）：
+   ```
+   BerryApproachMapper: N pts around berry, approach_dir=[...]
+   PBVS using pre-computed approach dir: [...]
+   ```
+   不应出现 `PBVS approach dir selection failed`。
+
+4. **重新标定 TF**（换了 DaBai 物理位置后）：
+   更新 `src/picking_description/calibration/fixed_camera_to_base.yaml`，
+   重新运行 hand-eye 标定。当前先用旧标定文件凑合。
