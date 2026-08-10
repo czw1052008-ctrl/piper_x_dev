@@ -59,6 +59,7 @@ if ! pgrep -f 'fine_detector_node' >/dev/null; then
     -p enable_foundation_pose:=false \
     -p publish_hz:=10.0 \
     -p mask_source:=yolo \
+    -p depth_pose_source:=depth \
     --params-file src/picking_perception/config/foundation_pose.yaml \
     >> log/real_robot/fine_detector.log 2>&1 &
   log "fine_detector PID=$!"

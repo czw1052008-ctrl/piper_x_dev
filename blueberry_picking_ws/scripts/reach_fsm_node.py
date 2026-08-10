@@ -294,12 +294,27 @@ class ReachFsmNode(Node):
             Image, '/camera_fixed/image_raw', self._on_fixed_img, qos_profile_sensor_data,
             callback_group=self._cb_group)
         self.create_subscription(
+            Image, '/camera_fixed/depth/image_raw', self._on_fixed_depth, qos_profile_sensor_data,
+            callback_group=self._cb_group)
+        self.create_subscription(
+            CameraInfo, '/camera_fixed/color/camera_info', self._on_fixed_cam_info,
+            qos_profile_sensor_data, callback_group=self._cb_group)
+        self.create_subscription(
             Image, '/camera_wrist/color/image_raw', self._on_wrist_img, qos_profile_sensor_data,
+            callback_group=self._cb_group)
+        self.create_subscription(
+            Image, '/camera_wrist/depth/image_raw', self._on_wrist_depth, qos_profile_sensor_data,
             callback_group=self._cb_group)
         self.create_subscription(
             CameraInfo, '/camera_wrist/color/camera_info', self._on_wrist_info,
             qos_profile_sensor_data, callback_group=self._cb_group)
         self._wrist_K: Optional[Tuple[float, float, float, float]] = None  # fx,fy,cx,cy
+        self._wrist_camera_K: Optional[np.ndarray] = None   # 3×3 for PBVS approach selector
+        self._last_wrist_depth: Optional[np.ndarray] = None
+        self._last_fixed_depth: Optional[np.ndarray] = None
+        self._fixed_camera_K: Optional[np.ndarray] = None
+        self._fixed_camera_frame: str = 'camera_fixed_color_optical_frame'
+        self._precomputed_approach_dir: Optional[np.ndarray] = None
         self.create_subscription(
             Image, '/perception/global/detection_viz', self._on_global_viz, qos_profile_sensor_data,
             callback_group=self._cb_group)
@@ -376,12 +391,37 @@ class ReachFsmNode(Node):
             self._qa_rgb_wrist = rgb
             self._qa_wrist_gen += 1
 
+    def _on_wrist_depth(self, msg: Image) -> None:
+        try:
+            d = np.frombuffer(msg.data, dtype=np.uint16).reshape(msg.height, msg.width)
+            self._last_wrist_depth = d.astype(np.float32) / 1000.0
+        except Exception:
+            pass
+
+    def _on_fixed_depth(self, msg: Image) -> None:
+        try:
+            d = np.frombuffer(msg.data, dtype=np.uint16).reshape(msg.height, msg.width)
+            self._last_fixed_depth = d.astype(np.float32) / 1000.0
+        except Exception:
+            pass
+
+    def _on_fixed_cam_info(self, msg: CameraInfo) -> None:
+        if msg.k[0] > 1.0 and msg.k[4] > 1.0:
+            self._fixed_camera_K = np.array(msg.k, dtype=np.float64).reshape(3, 3)
+            if msg.header.frame_id:
+                self._fixed_camera_frame = msg.header.frame_id
+
     def _on_wrist_info(self, msg: CameraInfo) -> None:
         if msg.k[0] > 1.0 and msg.k[4] > 1.0:
             self._wrist_K = (
                 float(msg.k[0]), float(msg.k[4]),
                 float(msg.k[2]), float(msg.k[5]),
             )
+            self._wrist_camera_K = np.array([
+                [float(msg.k[0]), 0.0,             float(msg.k[2])],
+                [0.0,             float(msg.k[4]), float(msg.k[5])],
+                [0.0,             0.0,             1.0            ],
+            ], dtype=np.float64)
 
     def _wrist_intrinsics(self) -> Tuple[float, float, float, float]:
         """fx, fy, cx, cy — prefer live camera_info over CLI focal + image center."""
@@ -2224,6 +2264,7 @@ class ReachFsmNode(Node):
             self.get_logger().warn(
                 'LOCKING heuristic: auto index=0 (file/agent mode required for approved path)')
             self._apply_region_lock(berries[0], source='heuristic_auto')
+            self._build_approach_map_from_global()
             return True
 
         if not self._lock_request_written:
@@ -2276,6 +2317,7 @@ class ReachFsmNode(Node):
         self._apply_region_lock(
             berries[idx],
             source=f'agent index={idx} reason={reason[:80]!r}')
+        self._build_approach_map_from_global()
         return True
 
     def _berry_cam_xyz(
@@ -5110,6 +5152,12 @@ class ReachFsmNode(Node):
         self._pbvs_probe_q_before = None
         self._pbvs_probe_obs_list = []
         self._pbvs_select_approach_direction = select_approach_direction
+        # Use approach direction pre-computed at LOCKING if available.
+        if getattr(self, '_precomputed_approach_dir', None) is not None:
+            self._pbvs_approach_dir_base = self._precomputed_approach_dir.copy()
+            self.get_logger().info(
+                f'PBVS using pre-computed approach dir: '
+                f'{np.round(self._pbvs_approach_dir_base, 3)}')
         self.get_logger().info('PBVS loop initialised')
 
     def _tick_refining_pbvs(self) -> None:
@@ -5385,6 +5433,50 @@ class ReachFsmNode(Node):
             return matrix_from_tf(tf_msg.transform)
         except Exception:
             return None
+
+    def _tf_fixed_cam(self):
+        """Look up T_base_fixed_cam (4×4) from TF2, returns None on failure."""
+        try:
+            tf_msg = self._tf_buffer.lookup_transform(
+                self._base_frame,
+                self._fixed_camera_frame,
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=0.05),
+            )
+            from picking_perception.perception_utils import matrix_from_tf
+            return matrix_from_tf(tf_msg.transform)
+        except Exception:
+            return None
+
+    def _build_approach_map_from_global(self) -> None:
+        """Called at LOCKING success. Uses global RGB-D depth to pre-compute approach dir."""
+        if self._last_fixed_depth is None or self._fixed_camera_K is None:
+            self.get_logger().info(
+                'BerryApproachMapper: skipped (no global depth/K yet)')
+            return
+        if self._locked is None:
+            return
+        try:
+            from berry_approach_mapper import BerryApproachMapper
+            if not hasattr(self, '_approach_mapper'):
+                self._approach_mapper = BerryApproachMapper()
+            T = self._tf_fixed_cam()
+            if T is None:
+                self.get_logger().warn(
+                    'BerryApproachMapper: TF camera_fixed→base_link unavailable')
+                return
+            p = self._locked.pose.pose.position
+            berry = np.array([float(p.x), float(p.y), float(p.z)])
+            ee = self._tcp_or_ee_xyz()
+            pts = self._approach_mapper.build_local_map(
+                self._last_fixed_depth, self._fixed_camera_K, T, berry)
+            self._precomputed_approach_dir = \
+                self._approach_mapper.select_approach_direction(pts, berry, ee)
+            self.get_logger().info(
+                f'BerryApproachMapper: {len(pts)} pts around berry, '
+                f'approach_dir={np.round(self._precomputed_approach_dir, 3)}')
+        except Exception as exc:
+            self.get_logger().warn(f'BerryApproachMapper failed: {exc}')
 
     # -----------------------------------------------------------------------
     # End PBVS (pbvs-vlm-reach-v2)

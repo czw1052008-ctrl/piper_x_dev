@@ -25,10 +25,10 @@ fine_detector_node:
     enable_tracking: true
     # Calibrated 2026-08-05: tape cam→berry ≈15cm while mono@0.015→~13cm; scale d.
     berry_diameter_m: 0.017
-    # Pose Z: mono (bbox) | depth (RGB-D blend). Default mono for DaBai.
-    depth_pose_source: mono
-    depth_min_m: 0.03
-    depth_max_m: 1.8
+    # Pose Z: mono (bbox) | depth (RGB-D blend). Gemini 305 has reliable close-range depth.
+    depth_pose_source: depth
+    depth_min_m: 0.10
+    depth_max_m: 1.5
     track_lost_max_frames: 8
 
 global_detector_node:

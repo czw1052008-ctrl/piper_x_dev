@@ -20,9 +20,9 @@ import numpy as np
 
 _LOG = logging.getLogger(__name__)
 
-# RGB-D depth validity range for the new wrist camera (metres).
-_RGBD_MIN_M = 0.04
-_RGBD_MAX_M = 1.10
+# RGB-D depth validity range for Orbbec Gemini 305 wrist camera (metres).
+_RGBD_MIN_M = 0.10
+_RGBD_MAX_M = 1.50
 
 # Minimum fraction of mask pixels that must carry valid RGB-D depth.
 _RGBD_VALID_RATIO = 0.30

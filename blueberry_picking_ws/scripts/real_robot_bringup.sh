@@ -69,7 +69,8 @@ _CLI_ENABLE_REACH_PERCEPTION="${ENABLE_REACH_PERCEPTION}"
 # Defaults if no config file
 PIPER_X_DEV="${HOME}/piper_x_dev"
 AGX_ARM_WS="${PIPER_X_DEV}/agx_arm_ros"
-ORBBEC_WS="${PIPER_X_DEV}/OrbbecSDK_ROS2_main"
+ORBBEC_WS="${PIPER_X_DEV}/OrbbecSDK_ROS2"          # Gemini 305 wrist (new SDK)
+ORBBEC_WS_FIXED="${PIPER_X_DEV}/OrbbecSDK_ROS2_main"  # DaBai global (SDK v1)
 PICKING_WS="${ROOT}"
 CAN_INTERFACE=can0
 CAN_BITRATE=1000000
@@ -83,8 +84,9 @@ ARM_AUTO_CONTROL_GATE=false
 ARM_ENABLE_TIMEOUT=15.0
 ARM_USE_RVIZ=false
 ARM_TCP_OFFSET='[0.0,0.0,0.05,0.0,0.0,0.0]'
-ORBBEC_LAUNCH=dabai.launch.py
+ORBBEC_LAUNCH=gemini305.launch.py  # Orbbec Gemini 305 wrist camera
 ORBBEC_USB_PORT=
+ORBBEC_SERIAL=                     # fill in: ros2 run orbbec_camera list_devices_node
 ORBBEC_CAMERA_NAME=camera_wrist
 ORBBEC_DEPTH_REGISTRATION=true
 ORBBEC_PUBLISH_TF=false
@@ -100,9 +102,10 @@ FINE_PERCEPTION=yolo_depth
 ENABLE_TELEOP_CFG=false
 TELEOP_LINEAR_SPEED=0.03
 TELEOP_ANGULAR_SPEED=10.0
-FIXED_CAMERA_DEVICE=/dev/video0
 FIXED_CAMERA_NAME=camera_fixed
-FIXED_CAMERA_FRAME=camera_fixed_optical_frame
+FIXED_CAMERA_FRAME=camera_fixed_color_optical_frame  # DaBai colour optical frame
+FIXED_CAM_SERIAL=                                    # fill in: ros2 run orbbec_camera list_devices_node
+FIXED_CAM_USB_PORT=
 FIXED_CAM_TX=0.60
 FIXED_CAM_TY=0.33
 FIXED_CAM_TZ=0.48
@@ -425,13 +428,10 @@ tcp_offset:='${ARM_TCP_OFFSET:-[0.0,0.0,0.05,0.0,0.0,0.0]}'" truncate
   fi
 
   if [[ "${ENABLE_CAMERA}" == "true" ]]; then
-    # Ensure Orbbec SDK libs are visible to component_container
-    # SDK v1 (OpenNI Dabai) needs libob_usb/liblive555 from install or SDK/lib/x64.
+    # Wrist camera: Orbbec Gemini 305 (new SDK — OrbbecSDK_ROS2)
     local _orb_install_lib="${ORBBEC_WS}/install/orbbec_camera/lib"
-    local _orb_sdk_lib="${ORBBEC_WS}/orbbec_camera/SDK/lib/x64"
     local _orb_ld=""
     [[ -d "${_orb_install_lib}" ]] && _orb_ld="${_orb_install_lib}:${_orb_ld}"
-    [[ -d "${_orb_sdk_lib}" ]] && _orb_ld="${_orb_sdk_lib}:${_orb_sdk_lib}/extensions/depthengine:${_orb_ld}"
     if [[ -n "${_orb_ld}" ]]; then
       export LD_LIBRARY_PATH="${_orb_ld}${LD_LIBRARY_PATH:-}"
       ros_setup="export LD_LIBRARY_PATH=${_orb_ld}\${LD_LIBRARY_PATH:-}; ${ros_setup}"
@@ -440,17 +440,19 @@ tcp_offset:='${ARM_TCP_OFFSET:-[0.0,0.0,0.05,0.0,0.0,0.0]}'" truncate
     _detect_orbbec_usb_port
     ORBBEC_PUBLISH_TF="${ORBBEC_PUBLISH_TF:-false}"
     CAMERA_TF_CHILD="${CAMERA_TF_CHILD:-${ORBBEC_CAMERA_NAME}_color_optical_frame}"
-    # dabai.launch in OrbbecSDK_ROS2_main (SDK v1) has no uvc_backend arg.
-    local camera_args="camera_name:=${ORBBEC_CAMERA_NAME} depth_registration:=${ORBBEC_DEPTH_REGISTRATION} publish_tf:=${ORBBEC_PUBLISH_TF}"
+    local camera_args="camera_name:=${ORBBEC_CAMERA_NAME} depth_registration:=${ORBBEC_DEPTH_REGISTRATION} publish_tf:=${ORBBEC_PUBLISH_TF} uvc_backend:=libuvc"
     if [[ -n "${ORBBEC_USB_PORT:-}" ]]; then
       camera_args="${camera_args} usb_port:=${ORBBEC_USB_PORT}"
     fi
-    _start_bg camera "${ros_setup}; export RMW_FASTRTPS_USE_SHM=0; exec ros2 launch orbbec_camera ${ORBBEC_LAUNCH} ${camera_args}"
+    if [[ -n "${ORBBEC_SERIAL:-}" ]]; then
+      camera_args="${camera_args} serial_number:=${ORBBEC_SERIAL}"
+    fi
+    local wrist_ros_setup="${ros_setup}; source ${ORBBEC_WS}/install/setup.bash"
+    _start_bg camera "${wrist_ros_setup}; export RMW_FASTRTPS_USE_SHM=0; exec ros2 launch orbbec_camera ${ORBBEC_LAUNCH} ${camera_args}"
     sleep 5
     _wait_for_topic "/${ORBBEC_CAMERA_NAME}/color/image_raw" 120 camera.log
     IFS=',' read -r _r _p _y <<< "${CAMERA_MOUNT_RPY}"
     _cam_parent="${CAMERA_MOUNT_FRAME:-link6}"
-    # Optical pitched ~23.5deg down vs link6 +Z (CAMERA_MOUNT_RPY roll); + mount translation
     _start_bg camera_tf "${ros_setup}; exec ros2 run tf2_ros static_transform_publisher \
 --x ${CAMERA_MOUNT_TX} --y ${CAMERA_MOUNT_TY} --z ${CAMERA_MOUNT_TZ} \
 --roll ${_r:-0} --pitch ${_p:-0} --yaw ${_y:-0} \
@@ -458,15 +460,33 @@ tcp_offset:='${ARM_TCP_OFFSET:-[0.0,0.0,0.05,0.0,0.0,0.0]}'" truncate
   fi
 
   if [[ "${ENABLE_FIXED_CAMERA}" == "true" ]]; then
-    if [[ ! -e "${FIXED_CAMERA_DEVICE}" ]]; then
-      _die "FIXED_CAMERA_DEVICE=${FIXED_CAMERA_DEVICE} missing"
+    # Fixed global camera: Orbbec DaBai (SDK v1 — OrbbecSDK_ROS2_main)
+    local _fixed_orb_install="${ORBBEC_WS_FIXED}/install/orbbec_camera/lib"
+    local _fixed_orb_sdk="${ORBBEC_WS_FIXED}/orbbec_camera/SDK/lib/x64"
+    local _fixed_ld=""
+    [[ -d "${_fixed_orb_install}" ]] && _fixed_ld="${_fixed_orb_install}:${_fixed_ld}"
+    [[ -d "${_fixed_orb_sdk}" ]] && _fixed_ld="${_fixed_orb_sdk}:${_fixed_orb_sdk}/extensions/depthengine:${_fixed_ld}"
+    local fixed_ros_setup="${ros_setup}; source ${ORBBEC_WS_FIXED}/install/setup.bash"
+    if [[ -n "${_fixed_ld}" ]]; then
+      fixed_ros_setup="export LD_LIBRARY_PATH=${_fixed_ld}\${LD_LIBRARY_PATH:-}; ${fixed_ros_setup}"
     fi
-    _start_bg fixed_cam "${ros_setup}; exec ros2 launch picking_perception fixed_camera.launch.py \
-video_device:=${FIXED_CAMERA_DEVICE} camera_name:=${FIXED_CAMERA_NAME} \
-frame_id:=${FIXED_CAMERA_FRAME} \
-tx:=${FIXED_CAM_TX} ty:=${FIXED_CAM_TY} tz:=${FIXED_CAM_TZ} \
-qx:=${FIXED_CAM_QX} qy:=${FIXED_CAM_QY} qz:=${FIXED_CAM_QZ} qw:=${FIXED_CAM_QW}"
-    _wait_for_topic "/${FIXED_CAMERA_NAME}/image_raw" 60 fixed_cam.log
+    # dabai.launch (SDK v1) has no uvc_backend arg — do not add it.
+    local fixed_cam_args="camera_name:=${FIXED_CAMERA_NAME} depth_registration:=true publish_tf:=false"
+    if [[ -n "${FIXED_CAM_USB_PORT:-}" ]]; then
+      fixed_cam_args="${fixed_cam_args} usb_port:=${FIXED_CAM_USB_PORT}"
+    fi
+    if [[ -n "${FIXED_CAM_SERIAL:-}" ]]; then
+      fixed_cam_args="${fixed_cam_args} serial_number:=${FIXED_CAM_SERIAL}"
+    fi
+    _start_bg fixed_cam "${fixed_ros_setup}; export RMW_FASTRTPS_USE_SHM=0; exec ros2 launch orbbec_camera dabai.launch.py ${fixed_cam_args}"
+    sleep 5
+    _wait_for_topic "/${FIXED_CAMERA_NAME}/color/image_raw" 60 fixed_cam.log
+    _wait_for_topic "/${FIXED_CAMERA_NAME}/depth/image_raw" 30 fixed_cam.log
+    # Publish fixed camera TF (update fixed_camera_to_base.yaml after re-calibrating DaBai position)
+    _start_bg fixed_cam_tf "${ros_setup}; exec ros2 run tf2_ros static_transform_publisher \
+--x ${FIXED_CAM_TX} --y ${FIXED_CAM_TY} --z ${FIXED_CAM_TZ} \
+--qx ${FIXED_CAM_QX} --qy ${FIXED_CAM_QY} --qz ${FIXED_CAM_QZ} --qw ${FIXED_CAM_QW} \
+--frame-id base_link --child-frame-id ${FIXED_CAMERA_FRAME}"
   fi
 
   if [[ "${ENABLE_REACH_PERCEPTION_CFG}" == "true" ]]; then
