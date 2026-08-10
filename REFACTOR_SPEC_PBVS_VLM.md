@@ -1021,7 +1021,9 @@ DONE
 ① _precomputed_approach_dir  ← LOCKING 或 _enter_fine_after_coarse 时，
                                 全局 RGB-D 点云 + 36 射线投票（最优）
 ② approach_dir_selector      ← SERVO 首 tick，用腕部深度图在线计算
-③ np.array([1.0, 0.0, 0.0]) ← +X base_link 纯兜底
+③ EE → berry                 ← KF.position 和 tcp_or_ee_xyz() 此时均可用，
+                                直接计算当前末端到果实的单位向量
+④ +Z base_link               ← tcp_pose 彻底不可用时的最后兜底（不应发生）
 ```
 
 ---

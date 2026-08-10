@@ -5271,7 +5271,14 @@ class ReachFsmNode(Node):
 
         approach_dir = self._pbvs_approach_dir_base
         if approach_dir is None:
-            approach_dir = np.array([1.0, 0.0, 0.0])   # fallback: +X in base
+            # Fallback: EE → berry (target_xyz already available from KF).
+            ee = self._tcp_or_ee_xyz()
+            if ee is not None:
+                d = target_xyz - np.array(ee, dtype=np.float64)
+                n = float(np.linalg.norm(d))
+                approach_dir = d / n if n > 1e-6 else np.array([0.0, 0.0, 1.0])
+            else:
+                approach_dir = np.array([0.0, 0.0, 1.0])  # last resort: +Z
 
         # ── 6. Check contact / transition to APPROACH ─────────────────
         cup_dist = self._cup_berry_dist_from(target_xyz)
