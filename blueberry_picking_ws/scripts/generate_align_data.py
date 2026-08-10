@@ -36,9 +36,12 @@ import numpy as np
 _LOG = logging.getLogger(__name__)
 
 # FSM state constants (must match reach_fsm_node).
-_FSM_SUCCESS_STATES = {'REFINING', 'WAIT_CONFIRM'}
+_FSM_ALIGN_DONE     = {'REFINING', 'WAIT_CONFIRM'}   # ALIGNING succeeded
+_FSM_REFINE_DONE    = {'WAIT_CONFIRM'}                # REFINING reached contact
 _FSM_FAIL_STATES    = {'ERROR', 'IDLE'}
-_TIMEOUT_S = 60.0
+_FSM_SUCCESS_STATES = _FSM_ALIGN_DONE                 # kept for compatibility
+_TIMEOUT_S      = 60.0
+_REFINE_TIMEOUT_S = 120.0   # REFINING can take longer (approach + contact)
 
 # Safe workspace guards (metres from base).
 _MIN_EE_HEIGHT_M = 0.05   # don't let EE go below 5 cm
@@ -194,24 +197,46 @@ class AlignDataGenerator:
                 self._consecutive_errors += 1
                 continue
 
-            # 4. Wait for ALIGNING to complete.
+            # 4. Wait for ALIGNING to complete → REFINING or error.
             final = self._wait_for_state(
-                _FSM_SUCCESS_STATES | {'ERROR'},
+                _FSM_ALIGN_DONE | {'ERROR'},
                 timeout_s=_TIMEOUT_S,
             )
 
-            if final in _FSM_SUCCESS_STATES:
-                print(f'  → SUCCESS (state={final})')
-                success_count += 1
-                self._consecutive_errors = 0
-            else:
-                print(f'  → FAIL (state={final})')
+            if final not in _FSM_ALIGN_DONE:
+                print(f'  → ALIGN FAIL (state={final})')
                 fail_count += 1
                 self._consecutive_errors += 1
+                continue
+
+            print(f'  ALIGN done (state={final}); waiting for REFINING to finish …')
+
+            # 5. If REFINING is running, wait for contact (WAIT_CONFIRM) or failure.
+            #    This lets the REFINING episode accumulate meaningful steps before abort.
+            if final == 'REFINING':
+                refine_final = self._wait_for_state(
+                    _FSM_REFINE_DONE | {'ERROR', 'IDLE'},
+                    timeout_s=_REFINE_TIMEOUT_S,
+                )
+                print(f'  REFINE result: {refine_final}')
+                refine_ok = refine_final in _FSM_REFINE_DONE
+            else:
+                refine_ok = True   # already at WAIT_CONFIRM
+
+            if refine_ok:
+                print(f'  → FULL SUCCESS (align+refine)')
+            else:
+                print(f'  → ALIGN OK / REFINE FAIL — align episode still saved')
+
+            success_count += 1
+            self._consecutive_errors = 0
 
         print(f'\nGeneration complete: {success_count} success / {fail_count} fail '
               f'out of {args.n_episodes} episodes.')
         print(f'Success rate: {success_count/max(1,args.n_episodes)*100:.1f}%')
+        print(f'Episodes saved: up to {success_count * 2} '
+              f'(1 aligning + 1 refining per successful run)')
+        print(f'HTML reports: data/align_episodes/viz/')
 
         import rclpy
         self._node.destroy_node()
