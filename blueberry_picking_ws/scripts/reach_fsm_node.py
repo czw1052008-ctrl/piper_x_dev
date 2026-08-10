@@ -1012,9 +1012,15 @@ class ReachFsmNode(Node):
             f'lock_min_conf={float(self._args.refine_lock_min_conf):.2f} '
             f'near_confirm={int(self._args.servo_near_confirm)}; '
             f'await fine tracker reset before fruit lock')
+        # Pre-compute 3D approach direction from global RGB-D before entering REFINING.
+        # Must run before _init_pbvs so _precomputed_approach_dir is populated first.
+        self._build_approach_map_from_global()
         if self._args.align_only:
             self._set_state('WAIT_CONFIRM')
         else:
+            # Always re-init PBVS state so multi-loop runs (--loops N) get a fresh KF.
+            if getattr(self, '_use_pbvs', False):
+                self._init_pbvs()
             self._set_state('REFINING')
 
     def _clear_target_lock(self) -> None:
@@ -5189,7 +5195,8 @@ class ReachFsmNode(Node):
         }
 
         # ── 1. Gather latest wrist detection ──────────────────────────
-        berries = getattr(self, '_last_fine_berries', None)   # DetectedBerryArray
+        # DetectedBerry.pose is PoseStamped → position via .pose.pose.position
+        berries = self._fine if self._fine_is_fresh() else None
         berry_xyz_base = None
         berry_sigma = 0.025
         depth_img = getattr(self, '_last_wrist_depth', None)
@@ -5197,16 +5204,16 @@ class ReachFsmNode(Node):
 
         if berries is not None and len(berries.berries) > 0:
             b = berries.berries[0]
-            # b.pose is in camera frame; transform to base_link.
+            # b.pose is PoseStamped in camera/base frame; transform to base_link.
             try:
                 T_base_cam = self._tf_base_cam()
                 if T_base_cam is not None:
-                    p_cam = np.array([b.pose.position.x,
-                                      b.pose.position.y,
-                                      b.pose.position.z, 1.0])
+                    p_cam = np.array([b.pose.pose.position.x,
+                                      b.pose.pose.position.y,
+                                      b.pose.pose.position.z, 1.0])
                     p_base = T_base_cam @ p_cam
                     berry_xyz_base = p_base[:3]
-                    src = str(getattr(b, 'mode', 'mono'))
+                    src = str(getattr(b, 'depth_mode', 'mono'))
                     berry_sigma = _DEPTH_SIGMA.get(src, 0.020)
             except Exception:
                 pass
@@ -5248,11 +5255,10 @@ class ReachFsmNode(Node):
                 and K_wrist is not None
                 and berry_xyz_base is not None):
             try:
-                # Compute berry UV in wrist image from last detection.
+                # Use DetectedBerry.image_u/v (center pixels) and PoseStamped depth.
                 b = berries.berries[0]  # type: ignore[union-attr]
-                uv = (int(b.bbox_xyxy[0] + (b.bbox_xyxy[2] - b.bbox_xyxy[0]) / 2),
-                      int(b.bbox_xyxy[1] + (b.bbox_xyxy[3] - b.bbox_xyxy[1]) / 2))
-                z_berry = b.pose.position.z
+                uv = (int(round(float(b.image_u))), int(round(float(b.image_v))))
+                z_berry = b.pose.pose.position.z
                 dir_cam = self._pbvs_select_approach_direction(
                     depth_img, uv, z_berry, K_wrist)
                 T_base_cam = self._tf_base_cam()
@@ -5340,19 +5346,14 @@ class ReachFsmNode(Node):
                                    'kf_pz': float(target_xyz[2])})
             if berries is not None and len(berries.berries) > 0:
                 b = berries.berries[0]
-                if hasattr(b, 'bbox_xyxy') and len(b.bbox_xyxy) >= 4:
-                    fu = (b.bbox_xyxy[0] + b.bbox_xyxy[2]) / 2.0
-                    fv = (b.bbox_xyxy[1] + b.bbox_xyxy[3]) / 2.0
+                fu, fv = float(b.image_u), float(b.image_v)
+                if fu >= 0 and fv >= 0:
                     refine_obs.update({
                         'fine_visible': 1.0,
-                        'fine_u': float(fu), 'fine_v': float(fv),
+                        'fine_u': fu, 'fine_v': fv,
                         'fine_du': float(fu - iw / 2),
                         'fine_dv': float(fv - ih / 2),
-                        'fine_confidence': float(getattr(b, 'confidence', 0.0)),
-                        'bbox_x1': float(b.bbox_xyxy[0]),
-                        'bbox_y1': float(b.bbox_xyxy[1]),
-                        'bbox_x2': float(b.bbox_xyxy[2]),
-                        'bbox_y2': float(b.bbox_xyxy[3]),
+                        'fine_confidence': float(b.confidence),
                     })
                 else:
                     refine_obs['fine_visible'] = 0.0
