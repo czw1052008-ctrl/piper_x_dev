@@ -100,6 +100,10 @@ STATES = (
 )
 
 
+def _np_zeros_rgb(h: int = 224, w: int = 224) -> np.ndarray:
+    return np.zeros((h, w, 3), dtype=np.uint8)
+
+
 def _matrix_from_tf(transform) -> np.ndarray:
     t = transform.transform.translation
     q = transform.transform.rotation
@@ -138,6 +142,20 @@ class ReachFsmNode(Node):
     def __init__(self, args: argparse.Namespace) -> None:
         super().__init__('reach_fsm_node')
         self._args = args
+        # pbvs-vlm-reach-v2: enable continuous PBVS refining loop.
+        self._use_pbvs: bool = getattr(args, 'use_pbvs', False)
+        # Goal 4: data collection for BC training.
+        self._data_collector = None
+        if getattr(args, 'collect_data', False):
+            import sys as _sys, os as _os
+            _scripts_dir = _os.path.dirname(_os.path.abspath(__file__))
+            if _scripts_dir not in _sys.path:
+                _sys.path.insert(0, _scripts_dir)
+            from align_data_collector import AlignDataCollector
+            self._data_collector = AlignDataCollector(
+                save_dir=getattr(args, 'collect_data_dir', 'data/align_episodes'),
+                teacher=getattr(args, 'align_judge_mode', 'heuristic'),
+            )
         self._state = 'IDLE'
         self._cmd_queue: List[str] = []
         self._global: Optional[DetectedBerryArray] = None
@@ -557,6 +575,9 @@ class ReachFsmNode(Node):
             self._cancel_move()
             self._reset_align_loop()
             self._reset_refine_state()
+            # Goal 4: close current episode on reset.
+            if self._data_collector is not None:
+                self._data_collector.end_episode()
             self._set_state('IDLE')
             return
         if cmd == 'clear_lock':
@@ -625,6 +646,19 @@ class ReachFsmNode(Node):
         if self._state == 'LOCKING':
             if self._tick_lock_region():
                 self._reset_align_loop()
+                # Goal 4: start a new episode when a target is locked.
+                if self._data_collector is not None:
+                    plant_xyz = None
+                    if self._locked is not None:
+                        try:
+                            plant_xyz = [
+                                float(self._locked.pose.position.x),
+                                float(self._locked.pose.position.y),
+                                float(self._locked.pose.position.z),
+                            ]
+                        except Exception:
+                            pass
+                    self._data_collector.start_episode(plant_xyz=plant_xyz)
                 self._set_state('ALIGNING')
             return
 
@@ -641,7 +675,11 @@ class ReachFsmNode(Node):
             return
 
         if self._state == 'REFINING':
-            self._tick_wrist_servo_refine()
+            # pbvs-vlm-reach-v2: route to PBVS loop when enabled.
+            if getattr(self, '_use_pbvs', False):
+                self._tick_refining_pbvs()
+            else:
+                self._tick_wrist_servo_refine()
             return
 
         if self._state == 'REFINING_WAIT_NEAR':
@@ -757,6 +795,31 @@ class ReachFsmNode(Node):
             decision = self._load_align_decision_from_file(obs, phase=phase)
             if decision is None:
                 return True
+        elif self._args.align_judge_mode == 'vlm':
+            # VLM-backed decision (pbvs-vlm-reach-v2).
+            from align_judge import decide_action_vlm
+            decision = decide_action_vlm(
+                obs,
+                global_img=self._qa_rgb_fixed,
+                wrist_img=self._qa_rgb_wrist,
+                phase=phase,
+                failed_actions=self._align_failed_actions,
+                yaw_deadband_deg=self._args.align_yaw_deadband_deg,
+                pitch_target_rad=self._args.align_pitch_target_rad,
+                fine_visible_conf=self._args.align_fine_visible_conf,
+                ee_angle_trigger_deg=self._args.align_ee_angle_trigger_deg,
+            )
+        elif self._args.align_judge_mode == 'bc':
+            # BC policy decision (Goal 4).
+            from align_judge import decide_action_bc
+            decision = decide_action_bc(
+                obs,
+                global_img=self._qa_rgb_fixed,
+                wrist_img=self._qa_rgb_wrist,
+                model_path=getattr(self._args, 'bc_model_path', ''),
+                phase=phase,
+                fail_count=self._align_step_idx,
+            )
         else:
             decision = decide_action(
                 obs,
@@ -790,6 +853,16 @@ class ReachFsmNode(Node):
         self._snap_qa(f'align_{self._align_step_idx:02d}_before_{label}')
         self._write_align_observation(
             f'align_{self._align_step_idx:02d}_before_{label}.json', obs, decision)
+        # Goal 4: log step for BC training.
+        if self._data_collector is not None:
+            self._data_collector.log_step(
+                global_img=self._qa_rgb_fixed if self._qa_rgb_fixed is not None
+                           else _np_zeros_rgb(),
+                wrist_img=self._qa_rgb_wrist if self._qa_rgb_wrist is not None
+                          else _np_zeros_rgb(),
+                obs=obs,
+                action=decision,
+            )
         return self._start_align_step(decision, rollback=False)
 
     def _start_move(self, goal: MoveGroup.Goal, label: str) -> None:
@@ -858,6 +931,9 @@ class ReachFsmNode(Node):
             self._set_state('IDLE')
 
     def _enter_fine_after_coarse(self, reason: str) -> None:
+        # Goal 4: mark current episode as successful before transitioning.
+        if self._data_collector is not None:
+            self._data_collector.mark_success()
         self.get_logger().info(f'ALIGNING → fine control ({reason})')
         self._refine_deadline = time.time() + self._args.refine_timeout_s
         self._refine_j1_anchor = float(self._joints[0])
@@ -5001,6 +5077,244 @@ class ReachFsmNode(Node):
 
         self._finish_mono_probe()
 
+    # -----------------------------------------------------------------------
+    # PBVS refining loop (pbvs-vlm-reach-v2)
+    # -----------------------------------------------------------------------
+
+    def _init_pbvs(self) -> None:
+        """Called once when REFINING state is entered with use_pbvs=True."""
+        import sys, os
+        _scripts_dir = os.path.dirname(os.path.abspath(__file__))
+        if _scripts_dir not in sys.path:
+            sys.path.insert(0, _scripts_dir)
+        from berry_kf_tracker import BerryKFTracker
+        from approach_dir_selector import select_approach_direction
+        self._pbvs_kf = BerryKFTracker()
+        self._pbvs_state = 'INIT'   # INIT → SERVO → PROBE → APPROACH → DONE
+        self._pbvs_last_tick = time.time()
+        self._pbvs_approach_dir_base = None   # (3,) unit vec in base_link
+        self._pbvs_probe_q_before = None
+        self._pbvs_probe_obs_list = []
+        self._pbvs_select_approach_direction = select_approach_direction
+        self.get_logger().info('PBVS loop initialised')
+
+    def _tick_refining_pbvs(self) -> None:
+        """Continuous PBVS loop: track berry in 3-D, servo to standoff, approach.
+
+        Replaces the two-step center_oneshot → range_depth path when
+        use_pbvs ROS param is True.
+        """
+        # Lazy init on first tick.
+        if not hasattr(self, '_pbvs_kf'):
+            self._init_pbvs()
+
+        now = time.time()
+        dt = min(now - self._pbvs_last_tick, 0.2)
+        self._pbvs_last_tick = now
+
+        # ── Constants ──────────────────────────────────────────────────
+        STANDOFF_M = 0.07          # desired cup-to-berry standoff
+        READY_THRESH = 8e-4        # trace(P) below this → enter APPROACH
+        CONTACT_DIST_M = 0.015     # cup-to-berry triggers DONE
+        PROBE_STEP_DEG = 3.0       # lateral probe delta (joint1)
+        SERVO_DUR_S = 0.15         # trajectory duration per PBVS step
+
+        # Depth-source → measurement sigma mapping.
+        _DEPTH_SIGMA = {
+            'rgbd': 0.005, 'fused_rgbd': 0.005,
+            'da2': 0.012,  'fused_da2': 0.012,
+            'mono': 0.025, 'mono_fallback': 0.025,
+        }
+
+        # ── 1. Gather latest wrist detection ──────────────────────────
+        berries = getattr(self, '_last_fine_berries', None)   # DetectedBerryArray
+        berry_xyz_base = None
+        berry_sigma = 0.025
+        depth_img = getattr(self, '_last_wrist_depth', None)
+        K_wrist = getattr(self, '_wrist_camera_K', None)
+
+        if berries is not None and len(berries.berries) > 0:
+            b = berries.berries[0]
+            # b.pose is in camera frame; transform to base_link.
+            try:
+                T_base_cam = self._tf_base_cam()
+                if T_base_cam is not None:
+                    p_cam = np.array([b.pose.position.x,
+                                      b.pose.position.y,
+                                      b.pose.position.z, 1.0])
+                    p_base = T_base_cam @ p_cam
+                    berry_xyz_base = p_base[:3]
+                    src = str(getattr(b, 'mode', 'mono'))
+                    berry_sigma = _DEPTH_SIGMA.get(src, 0.020)
+            except Exception:
+                pass
+
+        # ── 2. INIT state: wait for first valid detection ──────────────
+        if self._pbvs_state == 'INIT':
+            if berry_xyz_base is None:
+                return
+            self._pbvs_kf.initialize(berry_xyz_base, sigma_init=berry_sigma * 3)
+            self._pbvs_state = 'SERVO'
+            self.get_logger().info(
+                f'PBVS INIT → SERVO  berry_base={berry_xyz_base}')
+            return
+
+        # ── 3. KF predict + update ────────────────────────────────────
+        self._pbvs_kf.predict(dt)
+        if berry_xyz_base is not None:
+            self._pbvs_kf.update(berry_xyz_base, berry_sigma)
+
+        # ── 4. PROBE state: active lateral triangulation ──────────────
+        if self._pbvs_state == 'PROBE':
+            self._tick_pbvs_probe(PROBE_STEP_DEG, berry_xyz_base)
+            return
+
+        # Decide whether to trigger an active probe.
+        if (self._pbvs_state == 'SERVO'
+                and self._pbvs_kf.needs_active_probe(READY_THRESH * 4)
+                and self._pbvs_probe_q_before is None):
+            self._start_pbvs_probe(PROBE_STEP_DEG)
+            return
+
+        target_xyz = self._pbvs_kf.position
+        if target_xyz is None:
+            return
+
+        # ── 5. Approach-direction selection (once per SERVO entry) ────
+        if (self._pbvs_approach_dir_base is None
+                and depth_img is not None
+                and K_wrist is not None
+                and berry_xyz_base is not None):
+            try:
+                # Compute berry UV in wrist image from last detection.
+                b = berries.berries[0]  # type: ignore[union-attr]
+                uv = (int(b.bbox_xyxy[0] + (b.bbox_xyxy[2] - b.bbox_xyxy[0]) / 2),
+                      int(b.bbox_xyxy[1] + (b.bbox_xyxy[3] - b.bbox_xyxy[1]) / 2))
+                z_berry = b.pose.position.z
+                dir_cam = self._pbvs_select_approach_direction(
+                    depth_img, uv, z_berry, K_wrist)
+                T_base_cam = self._tf_base_cam()
+                if T_base_cam is not None:
+                    self._pbvs_approach_dir_base = T_base_cam[:3, :3] @ dir_cam
+                    self.get_logger().info(
+                        f'PBVS approach dir (base): {self._pbvs_approach_dir_base}')
+            except Exception as exc:
+                self.get_logger().warn(f'PBVS approach dir selection failed: {exc}')
+
+        approach_dir = self._pbvs_approach_dir_base
+        if approach_dir is None:
+            approach_dir = np.array([1.0, 0.0, 0.0])   # fallback: +X in base
+
+        # ── 6. Check contact / transition to APPROACH ─────────────────
+        cup_dist = self._cup_berry_dist_from(target_xyz)
+        if cup_dist is not None and cup_dist < CONTACT_DIST_M:
+            self.get_logger().info(f'PBVS DONE: cup_dist={cup_dist*1000:.1f} mm')
+            self._pbvs_state = 'DONE'
+            self._reach_reached_pub.publish(self._bool_msg(True))
+            self._set_state('WAIT_CONFIRM', 'pbvs_contact')
+            return
+
+        if (self._pbvs_state == 'SERVO'
+                and not self._pbvs_kf.needs_active_probe(READY_THRESH)
+                and cup_dist is not None
+                and cup_dist < STANDOFF_M * 1.3):
+            self._pbvs_state = 'APPROACH'
+            self.get_logger().info(
+                f'PBVS SERVO → APPROACH  dist={cup_dist*100:.1f} cm')
+
+        # ── 7. IK and execution ───────────────────────────────────────
+        if self._pbvs_state == 'APPROACH':
+            # Freeze KF: predict only, no more updates.
+            standoff_xyz = target_xyz - approach_dir * 0.0   # go straight to berry
+            q_current = self._joint_positions_rad()
+            if q_current is None:
+                return
+            try:
+                from piper_position_ik import cup_axis_ik
+                q_target = cup_axis_ik(standoff_xyz, approach_dir, q_current,
+                                       self._robot_model)
+            except Exception as exc:
+                self.get_logger().warn(f'PBVS APPROACH IK failed: {exc}')
+                return
+        else:
+            # SERVO: aim for standoff point along approach direction.
+            standoff_xyz = target_xyz - approach_dir * STANDOFF_M
+            q_current = self._joint_positions_rad()
+            if q_current is None:
+                return
+            try:
+                from piper_position_ik import cup_axis_ik
+                q_target = cup_axis_ik(standoff_xyz, approach_dir, q_current,
+                                       self._robot_model)
+            except Exception as exc:
+                self.get_logger().warn(f'PBVS SERVO IK failed: {exc}')
+                return
+
+        if q_target is None:
+            return
+        self._send_joint_servo_goal(q_target, duration_s=SERVO_DUR_S)
+
+    def _start_pbvs_probe(self, step_deg: float) -> None:
+        """Initiate a lateral probe step to triangulate berry 3-D position."""
+        q = self._joint_positions_rad()
+        if q is None:
+            return
+        self._pbvs_probe_q_before = q.copy()
+        self._pbvs_probe_obs_list = []
+        self._pbvs_state = 'PROBE'
+        # Step joint1 laterally.
+        q_probe = q.copy()
+        q_probe[0] += float(np.radians(step_deg))
+        self._send_joint_servo_goal(q_probe, duration_s=0.4)
+        self.get_logger().info(f'PBVS active probe: step_deg={step_deg}')
+
+    def _tick_pbvs_probe(self, step_deg: float,
+                         berry_xyz_base) -> None:
+        """Collect probe observation and return to original pose."""
+        if berry_xyz_base is not None:
+            self._pbvs_probe_obs_list.append(berry_xyz_base)
+
+        # After one lateral step and one observation: update KF with average.
+        if len(self._pbvs_probe_obs_list) >= 1 and self._pbvs_probe_q_before is not None:
+            if len(self._pbvs_probe_obs_list) >= 2:
+                triangulated = np.mean(self._pbvs_probe_obs_list, axis=0)
+                self._pbvs_kf.update_triangulated(triangulated, sigma_meas=0.004)
+                self.get_logger().info(
+                    f'PBVS probe triangulated: {triangulated}  '
+                    f'uncertainty→{self._pbvs_kf.uncertainty()*1e6:.1f} µm²')
+            # Return to original pose.
+            self._send_joint_servo_goal(self._pbvs_probe_q_before, duration_s=0.4)
+            self._pbvs_probe_q_before = None
+            self._pbvs_probe_obs_list = []
+            self._pbvs_state = 'SERVO'
+
+    def _cup_berry_dist_from(self, berry_xyz_base: np.ndarray) -> float | None:
+        """Distance from TCP to a given berry position in base_link frame."""
+        tcp = self._tcp_or_ee_xyz()
+        if tcp is None:
+            return None
+        diff = np.array(berry_xyz_base) - np.array(tcp)
+        return float(np.linalg.norm(diff))
+
+    def _tf_base_cam(self):
+        """Look up T_base_cam (4×4) from TF2, returns None on failure."""
+        try:
+            from tf2_ros import TransformException
+            tf_msg = self._tf_buffer.lookup_transform(
+                self._base_frame,
+                getattr(self, '_wrist_camera_frame', 'camera_wrist_color_optical_frame'),
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=0.05),
+            )
+            from picking_perception.perception_utils import matrix_from_tf
+            return matrix_from_tf(tf_msg.transform)
+        except Exception:
+            return None
+
+    # -----------------------------------------------------------------------
+    # End PBVS (pbvs-vlm-reach-v2)
+    # -----------------------------------------------------------------------
+
     def _tick_wrist_servo_refine(self) -> None:
         """range_center → center_oneshot → range_depth → contact oneshot."""
         if self._refine_lock_snap_pending:
@@ -6476,8 +6790,8 @@ def main() -> int:
     parser.add_argument('--align-timeout-s', type=float, default=12.0)
     parser.add_argument('--align-only', action='store_true',
                         help='Stop after coarse ALIGNING (QA); do not refine/approach')
-    parser.add_argument('--align-judge-mode', choices=('heuristic', 'file'), default='heuristic',
-                        help='Action judge source during ALIGNING; file mode waits for qa_dir/session/align_decision.json')
+    parser.add_argument('--align-judge-mode', choices=('heuristic', 'file', 'vlm'), default='heuristic',
+                        help='Action judge source during ALIGNING; file mode waits for qa_dir/session/align_decision.json; vlm uses Claude vision API')
     parser.add_argument('--align-max-steps', type=int, default=8,
                         help='Max accepted-or-rolled-back ALIGNING attempts before exit')
     parser.add_argument('--align-yaw-step-deg', type=float, default=18.0,
@@ -6494,6 +6808,16 @@ def main() -> int:
                         help='Use follow_joint_trajectory for ALIGNING (default, same as teleop)')
     parser.add_argument('--align-ee-angle-trigger-deg', type=float, default=20.0,
                         help='When wrist blind and EE angle exceeds this, use face_plant_yaw')
+    # pbvs-vlm-reach-v2
+    parser.add_argument('--use-pbvs', action='store_true', default=False,
+                        help='Use continuous PBVS+KF refining loop instead of center_oneshot→range_depth')
+    # Goal 4: BC training data collection
+    parser.add_argument('--collect-data', action='store_true', default=False,
+                        help='Enable AlignDataCollector: log every ALIGNING episode')
+    parser.add_argument('--collect-data-dir', default='data/align_episodes',
+                        help='Directory to save collected episodes')
+    parser.add_argument('--bc-model-path', default='',
+                        help='Path to trained BCAlignPolicy .pt file (used with --align-judge-mode bc)')
     parser.add_argument('--align-min-joint-move-deg', type=float, default=0.8,
                         help='Minimum joint motion to count as a real step')
     parser.add_argument('--align-min-ee-angle-gain-deg', type=float, default=3.0,

@@ -194,11 +194,27 @@ class FineDetectorNode(Node):
         self._track_lost_max = int(self.get_parameter('track_lost_max_frames').value)
         self._depth_pose_source = str(
             self.get_parameter('depth_pose_source').value or 'mono').strip().lower()
-        if self._depth_pose_source not in ('mono', 'depth'):
+        if self._depth_pose_source not in ('mono', 'depth', 'fused'):
             self.get_logger().warn(
                 f'unknown depth_pose_source={self._depth_pose_source!r}; using mono')
             self._depth_pose_source = 'mono'
         self.get_logger().info(f'depth_pose_source={self._depth_pose_source}')
+
+        # Depth Anything V2 fuser — lazy-loaded on first use (pbvs-vlm-reach-v2).
+        self._depth_fuser = None
+        if self._depth_pose_source == 'fused':
+            try:
+                import sys, os
+                _scripts_dir = os.path.join(
+                    os.path.dirname(__file__), '..', '..', '..', '..', 'scripts')
+                if _scripts_dir not in sys.path:
+                    sys.path.insert(0, os.path.abspath(_scripts_dir))
+                from depth_fusion import DepthFuser
+                self._depth_fuser = DepthFuser(use_da2=True)
+                self.get_logger().info('DepthFuser (RGB-D + DA2) initialised.')
+            except Exception as exc:
+                self.get_logger().warn(
+                    f'DepthFuser init failed ({exc}); falling back to mono')
 
         self._base_frame = self.get_parameter('base_frame').value
         self._camera_frame = self.get_parameter('camera_frame').value
@@ -358,7 +374,24 @@ class FineDetectorNode(Node):
     ) -> Tuple[np.ndarray, str, Optional[float], float]:
         z_depth = self._depth_util.depth_in_mask(depth, det.mask)
         z_mono = self._depth_util.mono_depth_from_mask(det.mask, k)
-        if self._depth_pose_source == 'mono':
+        if self._depth_pose_source == 'fused' and self._depth_fuser is not None:
+            # Priority: RGB-D → Depth Anything V2 → mono.
+            rgb = getattr(self, '_rgb', None)
+            fused_z, fused_src = self._depth_fuser.get_depth(
+                rgb_img=rgb if rgb is not None else np.zeros((1, 1, 3), dtype=np.uint8),
+                raw_depth_m=depth,
+                mask=det.mask.astype(bool),
+            )
+            if fused_z is not None:
+                z = float(fused_z)
+                mode = f'fused_{fused_src}'
+                if prior_z is not None:
+                    z = 0.90 * z + 0.10 * float(prior_z)
+                    mode = f'fused_{fused_src}_coast'
+            else:
+                z = float(z_mono)
+                mode = 'mono_fallback'
+        elif self._depth_pose_source == 'mono':
             # Hardware RGB-D often samples background through mask holes.
             z = float(z_mono)
             mode = 'mono'

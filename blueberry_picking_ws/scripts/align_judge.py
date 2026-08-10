@@ -641,3 +641,98 @@ def verify_step(
         'moved': moved,
         'reason': reason,
     }
+
+
+# ---------------------------------------------------------------------------
+# VLM-backed decision (pbvs-vlm-reach-v2 branch)
+# ---------------------------------------------------------------------------
+
+_vlm_client = None   # module-level singleton, initialised on first call
+
+
+def decide_action_vlm(
+    obs: Dict[str, object],
+    global_img,   # np.ndarray RGB, target circled in red
+    wrist_img,    # np.ndarray RGB
+    phase: str = 'command',
+    **kwargs,
+) -> Dict[str, object]:
+    """VLM-backed alignment decision via Claude vision API.
+
+    Falls back to decide_action() on any API or parse error so the robot
+    never stalls.  Set --action-judge-source=vlm to activate.
+    """
+    global _vlm_client
+    if _vlm_client is None:
+        try:
+            from vlm_align_client import VLMAlignClient
+            _vlm_client = VLMAlignClient()
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning(
+                f'VLMAlignClient init failed ({exc}); using heuristic for this session')
+            _vlm_client = False   # sentinel: don't retry import
+
+    if not _vlm_client:
+        return decide_action(obs, phase=phase, **kwargs)
+
+    try:
+        return _vlm_client.decide(global_img, wrist_img, obs, phase=phase)
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning(
+            f'decide_action_vlm error ({exc}), falling back to heuristic')
+        return decide_action(obs, phase=phase, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# BC policy decision (pbvs-vlm-reach-v2 Goal 4)
+# ---------------------------------------------------------------------------
+
+_bc_policy = None   # BCAlignPolicyInference singleton
+
+
+def decide_action_bc(
+    obs: Dict[str, object],
+    global_img,    # np.ndarray RGB
+    wrist_img,     # np.ndarray RGB
+    model_path: str = '',
+    phase: str = 'command',
+    fail_count: int = 0,
+    **kwargs,
+) -> Dict[str, object]:
+    """BC policy decision; VLM fallback when fail_count > 2, heuristic on error.
+
+    Activate with --align-judge-mode bc --bc-model-path <path>.
+    """
+    global _bc_policy
+
+    # After repeated failures let VLM try to recover.
+    if fail_count > 2:
+        import logging
+        logging.getLogger(__name__).info(
+            f'BC: fail_count={fail_count} > 2 → VLM recovery')
+        return decide_action_vlm(obs, global_img, wrist_img, phase=phase, **kwargs)
+
+    if _bc_policy is None:
+        if not model_path or not __import__('os').path.exists(model_path):
+            import logging
+            logging.getLogger(__name__).warning(
+                f'BC model not found at {model_path!r}; falling back to heuristic')
+            return decide_action(obs, phase=phase, **kwargs)
+        try:
+            from bc_align_policy import BCAlignPolicyInference
+            _bc_policy = BCAlignPolicyInference(model_path)
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning(
+                f'BC model load failed ({exc}); using heuristic')
+            return decide_action(obs, phase=phase, **kwargs)
+
+    try:
+        return _bc_policy.decide(global_img, wrist_img, obs, phase=phase)
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning(
+            f'BC inference error ({exc}); using heuristic')
+        return decide_action(obs, phase=phase, **kwargs)
