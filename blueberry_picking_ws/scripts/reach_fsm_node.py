@@ -5302,28 +5302,28 @@ class ReachFsmNode(Node):
 
         # ── 7. IK and execution ───────────────────────────────────────
         if self._pbvs_state == 'APPROACH':
-            # Freeze KF: predict only, no more updates.
-            standoff_xyz = target_xyz - approach_dir * 0.0   # go straight to berry
+            # Freeze KF: go straight to berry, cup axis auto-aimed by IK.
+            standoff_xyz = target_xyz.copy()
             q_current = self._joint_positions_rad()
             if q_current is None:
                 return
             try:
                 from piper_position_ik import cup_axis_ik
-                q_target = cup_axis_ik(standoff_xyz, approach_dir, q_current,
-                                       self._robot_model)
+                q_target = cup_axis_ik(
+                    tuple(standoff_xyz.tolist()), tuple(target_xyz.tolist()), q_current)
             except Exception as exc:
                 self.get_logger().warn(f'PBVS APPROACH IK failed: {exc}')
                 return
         else:
-            # SERVO: aim for standoff point along approach direction.
+            # SERVO: aim for standoff point; cup axis auto-aimed toward berry by IK.
             standoff_xyz = target_xyz - approach_dir * STANDOFF_M
             q_current = self._joint_positions_rad()
             if q_current is None:
                 return
             try:
                 from piper_position_ik import cup_axis_ik
-                q_target = cup_axis_ik(standoff_xyz, approach_dir, q_current,
-                                       self._robot_model)
+                q_target = cup_axis_ik(
+                    tuple(standoff_xyz.tolist()), tuple(target_xyz.tolist()), q_current)
             except Exception as exc:
                 self.get_logger().warn(f'PBVS SERVO IK failed: {exc}')
                 return
