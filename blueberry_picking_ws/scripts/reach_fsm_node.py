@@ -18,7 +18,7 @@ import sys
 import threading
 import time
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import rclpy
@@ -77,12 +77,15 @@ from piper_position_ik import (  # noqa: E402
     aim_uv_ik,
     approach_axis_ik,
     approach_axis_ik_chunked,
+    cartesian_velocity_step,
     cup_axis_ik,
     cup_axis_ik_chunked,
+    fk_link6,
     fk_link6_T,
     fk_xyz,
     position_ik_keep_orient,
     position_ik_keep_orient_chunked,
+    tip_xyz,
 )
 from refine_depth_util import (  # noqa: E402
     apply_mono_chord_scale,
@@ -232,9 +235,6 @@ class ReachFsmNode(Node):
         # REFINING: one fruit locked at entry — BoT-SORT track_id for whole phase.
         self._refine_fruit_anchor: Optional[Tuple[float, float, float]] = None
         self._refine_locked_track_id: Optional[int] = None
-        self._refine_lock_sync_tid: Optional[int] = None
-        self._refine_lock_sync_streak = 0
-        self._refine_lock_sync_deadline = 0.0
         # After clear_lock: fine must reset BoT-SORT before we pin a new tid.
         self._refine_await_tracker_reset = False
         self._refine_tracker_reset_t = 0.0
@@ -266,6 +266,8 @@ class ReachFsmNode(Node):
         self._servo_pending_record: Optional[Dict] = None
         self._servo_motion_frames: List[Dict] = []
         self._servo_motion_last_t = 0.0
+        self._pbvs_qa_recorder = None
+        self._pbvs_qa_finalized = False
         self._servo_ik_fail_n = 0
         self._servo_ik_fail_t = 0.0
         self._tcp_pose: Optional[PoseStamped] = None
@@ -291,7 +293,7 @@ class ReachFsmNode(Node):
             PoseStamped, '/feedback/tcp_pose', self._on_tcp_pose, 10,
             callback_group=self._cb_group)
         self.create_subscription(
-            Image, '/camera_fixed/image_raw', self._on_fixed_img, qos_profile_sensor_data,
+            Image, '/camera_fixed/color/image_raw', self._on_fixed_img, qos_profile_sensor_data,
             callback_group=self._cb_group)
         self.create_subscription(
             Image, '/camera_fixed/depth/image_raw', self._on_fixed_depth, qos_profile_sensor_data,
@@ -338,11 +340,17 @@ class ReachFsmNode(Node):
         os.makedirs(self._args.qa_dir, exist_ok=True)
 
         self.create_timer(0.1, self._tick, callback_group=self._cb_group)
+        # Continuous PBVS execution at ~25 Hz (main tick stays 10 Hz for FSM/cmd).
+        if self._use_pbvs:
+            self.create_timer(
+                0.04, self._tick_pbvs_rate, callback_group=self._cb_group)
         self._publish_status()
         self.get_logger().info(
             f'reach_fsm ready — LOCK_REGION(agent) → ALIGNING → wrist servo '
             f'(judge_mode={self._args.align_judge_mode}); '
-            f'qa_dir={self._args.qa_dir}')
+            f'qa_dir={self._args.qa_dir}'
+            + (f'; pbvs={getattr(self._args, "pbvs_mode", "stream")}@25Hz'
+               if self._use_pbvs else ''))
 
     def _on_cmd(self, msg: String) -> None:
         cmd = msg.data.strip().lower()
@@ -542,6 +550,13 @@ class ReachFsmNode(Node):
             self.get_logger().info(
                 f'QA motion {self._qa_session}/{tag} '
                 f'(n={len(self._servo_motion_frames)})')
+        if self._use_pbvs:
+            self._record_pbvs_tick(
+                source='motion',
+                motion_tag=tag,
+                motion_i=idx,
+                refine_phase=str(self._refine_phase),
+            )
 
     def _qa_session_dir(self) -> Optional[str]:
         if not self._qa_session:
@@ -559,9 +574,211 @@ class ReachFsmNode(Node):
             json.dump(payload, f, indent=2, ensure_ascii=True)
         return path
 
+    def _ensure_pbvs_qa_recorder(self) -> None:
+        if not self._use_pbvs:
+            return
+        if self._pbvs_qa_finalized:
+            return
+        if self._pbvs_qa_recorder is not None:
+            return
+        if not self._qa_session:
+            self._qa_session = datetime.now().strftime('%Y%m%d_%H%M%S')
+        from pbvs_qa_recorder import PbvsQaRecorder
+        self._pbvs_qa_recorder = PbvsQaRecorder(
+            self._args.qa_dir, self._qa_session)
+        self.get_logger().info(
+            f'PBVS QA recorder → {self._pbvs_qa_recorder.session_dir}')
+
+    def _pbvs_qa_images(self) -> Dict[str, Optional[np.ndarray]]:
+        return {
+            'fixed': self._qa_rgb_fixed,
+            'wrist': self._qa_rgb_wrist,
+            'global_viz': self._qa_rgb_global_viz,
+            'fine_viz': self._qa_rgb_fine_viz,
+        }
+
+    def _pbvs_build_tick_meta(self, **extra) -> Dict:
+        """Snapshot PBVS + arm state for one QA jsonl row (25 Hz or motion)."""
+        q = self._joint_positions_rad()
+        tcp = self._tcp_or_ee_xyz()
+        target = None
+        cup_dist = None
+        p_des = None
+        err_m = None
+        if hasattr(self, '_pbvs_kf'):
+            target = self._pbvs_control_target()
+            if target is not None:
+                cup_dist = self._cup_berry_dist_from(target)
+        cup_gap = None
+        cup_open = None
+        d_cam_m = None
+        d_cam_surface_m = None
+        berry = self._pick_probe_live_berry() if self._refine_fruit_anchor else None
+        depth_mode = ''
+        berry_xyz = None
+        z_depth_m = None
+        z_mono_m = None
+        z_used_m = None
+        cam_dist_m = None
+        if berry is not None:
+            try:
+                base = self._berry_base_xyz(berry)
+                if base is not None:
+                    berry_xyz = list(base)
+                depth_mode = str(getattr(berry, 'depth_mode', '') or '')
+                z_d = float(getattr(berry, 'z_depth_m', -1.0))
+                z_m = float(getattr(berry, 'z_mono_m', -1.0))
+                if z_d > 1e-4:
+                    z_depth_m = z_d
+                if z_m > 1e-4:
+                    z_mono_m = z_m
+                cam = self._berry_cam_xyz(berry)
+                if cam is not None and cam[2] > 1e-4:
+                    z_used_m = float(cam[2])
+                    cam_dist_m = float(
+                        math.sqrt(cam[0] ** 2 + cam[1] ** 2 + cam[2] ** 2))
+            except Exception:
+                pass
+        if berry is not None and berry_xyz is not None:
+            cam_m = self._pbvs_cam_metrics(berry, np.asarray(berry_xyz, dtype=np.float64))
+            if cam_m:
+                d_cam_m = cam_m.get('d_cam_m')
+                d_cam_surface_m = cam_m.get('d_cam_surface_m')
+        # Always publish cup opening (= tip) in base_link for QA overlay.
+        cup_open = self._cup_open_xyz(q)
+        frozen_berry = getattr(self, '_pbvs_frozen_berry', None)
+        if frozen_berry is None and self._refine_fruit_anchor is not None:
+            frozen_berry = np.asarray(self._refine_fruit_anchor, dtype=np.float64)
+        berry_base_locked = (
+            np.asarray(frozen_berry, dtype=np.float64).flatten()[:3].tolist()
+            if frozen_berry is not None else None)
+        # Prefer live berry_xyz; else locked/frozen for oneshot after vision lost.
+        if berry_xyz is None and berry_base_locked is not None:
+            berry_xyz = list(berry_base_locked)
+        cup_berry_dist_m = None
+        cup_berry_dxyz_m = None
+        if berry_base_locked is not None and cup_open is not None:
+            dvec = np.asarray(berry_base_locked, dtype=np.float64).flatten()[:3] - np.asarray(
+                cup_open, dtype=np.float64).flatten()[:3]
+            cup_berry_dxyz_m = [float(v) for v in dvec]
+            cup_berry_dist_m = float(np.linalg.norm(dvec))
+        if target is not None:
+            gap_axis = self._cup_gap_along_axis(
+                np.asarray(target, dtype=np.float64),
+                approach_dir=getattr(self, '_pbvs_frozen_approach_dir', None))
+            if gap_axis is not None:
+                cup_gap, _ = gap_axis
+        tip = tip_xyz(q.tolist()) if q is not None else None
+        if (target is not None and tip is not None
+                and hasattr(self, '_pbvs_state')):
+            approach_dir = getattr(self, '_pbvs_frozen_approach_dir', None)
+            if approach_dir is None:
+                approach_dir = getattr(self, '_pbvs_approach_dir_base', None)
+            if approach_dir is not None:
+                ad = np.asarray(approach_dir, dtype=np.float64)
+                tip_standoff = self._tip_contact_standoff_m()
+                standoff = 0.07
+                if self._pbvs_state == 'APPROACH':
+                    p_des = target - ad * tip_standoff
+                elif self._pbvs_state == 'SERVO':
+                    p_des = target - ad * standoff
+                if p_des is not None:
+                    err_m = float(np.linalg.norm(p_des - tip))
+        meta: Dict = {
+            'pbvs_state': getattr(self, '_pbvs_state', 'INIT'),
+            'move_phase': self._move_phase,
+            'track_id': (
+                getattr(self, '_pbvs_lock_track_id', None)
+                or self._refine_locked_track_id),
+            'servo_step_idx': int(self._servo_step_idx),
+            'depth_mode': depth_mode,
+            'z_depth_m': z_depth_m,
+            'z_mono_m': z_mono_m,
+            'z_used_m': z_used_m,
+            'cam_dist_m': cam_dist_m,
+            'berry_xyz': berry_xyz,
+            'berry_base_locked': berry_base_locked,
+            'berry_z_m': (float(berry_xyz[2]) if berry_xyz else None),
+            'target_xyz': (target.tolist() if target is not None else None),
+            'frozen_target': (
+                self._pbvs_frozen_target.tolist()
+                if getattr(self, '_pbvs_frozen_target', None) is not None
+                else berry_base_locked),
+            'tip_xyz': (tip.tolist() if tip is not None else None),
+            'p_des': (p_des.tolist() if p_des is not None else None),
+            'cup_dist_m': cup_dist,
+            'cup_gap_m': cup_gap,
+            'd_cam_m': d_cam_m,
+            'd_cam_surface_m': d_cam_surface_m,
+            'cup_open_xyz': (cup_open.tolist() if cup_open is not None else None),
+            'cup_berry_dist_m': cup_berry_dist_m,
+            'cup_berry_dxyz_m': cup_berry_dxyz_m,
+            'approach_blind': bool(getattr(self, '_pbvs_approach_blind', False)),
+            'vision_lost_streak': int(getattr(self, '_pbvs_vision_lost_streak', 0)),
+            'cam_snapshot_d_cam_m': (
+                (self._pbvs_cam_snapshot or {}).get('d_cam_surface_m')),
+            'err_m': err_m,
+            'v_mps': float(getattr(self, '_pbvs_last_v_norm', 0.0)),
+            'tcp_base': list(tcp) if tcp is not None else None,
+            'joints_deg': {
+                'j1': math.degrees(self._joints[0]),
+                'j2': math.degrees(self._joints[1]),
+                'j3': math.degrees(self._joints[2]),
+                'j5': math.degrees(self._joints[4]),
+            } if self._joints and len(self._joints) >= 6 else None,
+            'kf_uncertainty': (
+                float(self._pbvs_kf.uncertainty())
+                if hasattr(self, '_pbvs_kf') and self._pbvs_kf.initialized
+                else None),
+            'kf_reject_streak': int(getattr(self, '_pbvs_kf_reject_streak', 0)),
+            'camera_gens': {
+                'fixed': int(self._qa_fixed_gen),
+                'wrist': int(self._qa_wrist_gen),
+                'global_viz': int(self._qa_global_viz_gen),
+                'fine_viz': int(self._qa_fine_viz_gen),
+            },
+            'source': 'pbvs_tick',
+        }
+        meta.update(extra)
+        return meta
+
+    def _record_pbvs_tick(self, meta: Optional[Dict] = None, **extra) -> None:
+        if not self._use_pbvs:
+            return
+        self._ensure_pbvs_qa_recorder()
+        if self._pbvs_qa_recorder is None:
+            return
+        payload = self._pbvs_build_tick_meta(**(meta or {}), **extra)
+        self._pbvs_qa_recorder.record_tick(payload, self._pbvs_qa_images())
+
+    def _pbvs_qa_log_event(self, kind: str, detail: Optional[Dict] = None) -> None:
+        self._ensure_pbvs_qa_recorder()
+        if self._pbvs_qa_recorder is not None:
+            self._pbvs_qa_recorder.log_event(kind, detail)
+
+    def _finalize_pbvs_qa(
+        self, outcome: str, extra: Optional[Dict] = None,
+    ) -> Optional[str]:
+        if self._pbvs_qa_finalized or self._pbvs_qa_recorder is None:
+            return None
+        self._pbvs_qa_finalized = True
+        html = self._pbvs_qa_recorder.finalize(outcome, extra)
+        self.get_logger().info(
+            f'PBVS QA finalized ({outcome}): '
+            f'{self._pbvs_qa_recorder.frame_count} frames → {html}')
+        return html
+
     def _set_state(self, state: str, err: str = '') -> None:
+        prev = self._state
         if state not in STATES:
             state = 'ERROR'
+        if (prev == 'REFINING' and self._use_pbvs
+                and state in ('ERROR', 'WAIT_CONFIRM', 'IDLE')
+                and not self._pbvs_qa_finalized):
+            outcome = (
+                'success' if state == 'WAIT_CONFIRM'
+                else ('error' if state == 'ERROR' else 'idle'))
+            self._finalize_pbvs_qa(outcome, {'err': err, 'fsm_state': state})
         self._state = state
         self._error_msg = err
         self._publish_status()
@@ -719,11 +936,10 @@ class ReachFsmNode(Node):
             return
 
         if self._state == 'REFINING':
-            # pbvs-vlm-reach-v2: route to PBVS loop when enabled.
+            # pbvs-vlm-reach-v2: continuous rate timer owns PBVS execution.
             if getattr(self, '_use_pbvs', False):
-                self._tick_refining_pbvs()
-            else:
-                self._tick_wrist_servo_refine()
+                return
+            self._tick_wrist_servo_refine()
             return
 
         if self._state == 'REFINING_WAIT_NEAR':
@@ -1012,13 +1228,17 @@ class ReachFsmNode(Node):
             f'near_handoff_z={float(self._args.servo_near_handoff_z):.2f}m '
             f'fruit_assoc={float(self._args.refine_fruit_assoc_max_m):.2f}m '
             f'lock_min_conf={float(self._args.refine_lock_min_conf):.2f} '
+            f'lock_max_base_y={float(self._args.refine_lock_max_base_y_m):.2f}m '
             f'near_confirm={int(self._args.servo_near_confirm)}; '
             f'await fine tracker reset before fruit lock')
         # Re-init PBVS first (creates _fused_map), then feed global RGB-D into it.
         # Must run in this order: _init_pbvs creates _fused_map; _build_approach_map_from_global feeds it.
         if getattr(self, '_use_pbvs', False) and not self._args.align_only:
             self._init_pbvs()
-        self._build_approach_map_from_global()
+            # Wait for static fixed-cam TF (buffer fill race right after FSM start).
+            self._build_approach_map_from_global(wait_tf_s=2.0)
+        else:
+            self._build_approach_map_from_global()
         if self._args.align_only:
             self._set_state('WAIT_CONFIRM')
         else:
@@ -1027,9 +1247,6 @@ class ReachFsmNode(Node):
     def _clear_target_lock(self) -> None:
         """Tell fine_detector to drop BoT-SORT pin / base_coast and reset tracker."""
         self._refine_locked_track_id = None
-        self._refine_lock_sync_tid = None
-        self._refine_lock_sync_streak = 0
-        self._refine_lock_sync_deadline = 0.0
         msg = DetectedBerry()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = self._args.base_frame
@@ -1041,6 +1258,17 @@ class ReachFsmNode(Node):
         self._lock_pub.publish(msg)
 
     def _reset_refine_state(self, *, keep_anchors: bool = False) -> None:
+        if (self._use_pbvs and self._pbvs_qa_recorder is not None
+                and not self._pbvs_qa_finalized):
+            self._finalize_pbvs_qa('reset')
+        self._pbvs_qa_recorder = None
+        self._pbvs_qa_finalized = False
+        for attr in (
+            '_pbvs_kf', '_pbvs_state', '_pbvs_target_cmd', '_pbvs_frozen_target',
+            '_pbvs_contact_sent', '_fused_map',
+        ):
+            if hasattr(self, attr):
+                delattr(self, attr)
         self._servo_step_idx = 0
         self._near_mode = False
         self._near_handoff_written = False
@@ -1067,9 +1295,6 @@ class ReachFsmNode(Node):
         self._center_live_replan_done = False
         self._refine_fruit_anchor = None
         self._refine_locked_track_id = None
-        self._refine_lock_sync_tid = None
-        self._refine_lock_sync_streak = 0
-        self._refine_lock_sync_deadline = 0.0
         self._refine_await_tracker_reset = False
         self._refine_tracker_reset_t = 0.0
         self._refine_tracker_reset_live_streak = 0
@@ -1105,6 +1330,29 @@ class ReachFsmNode(Node):
         """True only when wrist RGB-D mask depth is valid (mono-only never qualifies)."""
         return float(getattr(berry, 'z_depth_m', -1.0)) > 1e-4
 
+    def _berry_depth_trusted(self, berry: DetectedBerry) -> bool:
+        """Wrist RGB-D ranging is authoritative — do not substitute mono depth."""
+        mode = str(getattr(berry, 'depth_mode', '') or '')
+        if mode in ('depth_raw', 'depth_coast'):
+            return float(getattr(berry, 'z_depth_m', -1.0)) > 1e-4
+        return False
+
+    def _berry_range_z_m(
+        self, berry: Optional[DetectedBerry],
+    ) -> Tuple[Optional[float], str]:
+        """Cam-frame Z for ranging: depth when available, else mono (legacy paths)."""
+        if berry is None:
+            return None, 'none'
+        zd = float(getattr(berry, 'z_depth_m', -1.0))
+        if self._berry_depth_trusted(berry) and 0.08 < zd < 1.5:
+            return zd, 'depth'
+        zm = float(getattr(berry, 'z_mono_m', -1.0))
+        if 0.08 < zm < 1.5:
+            return zm, 'mono'
+        if zd > 1e-4 and 0.08 < zd < 1.5:
+            return zd, 'depth'
+        return None, 'none'
+
     def _berry_cam_range(self, berry: DetectedBerry) -> Optional[float]:
         """Distance from wrist camera optical origin to berry (m)."""
         cam = self._berry_cam_xyz(berry)
@@ -1122,36 +1370,50 @@ class ReachFsmNode(Node):
             + (base[1] - tcp[1]) ** 2
             + (base[2] - tcp[2]) ** 2)
 
-    def _pick_nearest_fine_berry_by_cup(self) -> Optional[DetectedBerry]:
-        """REFINING entry lock: among conf≥min, pick nearest to wrist camera.
+    def _berry_lock_base_y_ok(self, berry: DetectedBerry) -> bool:
+        """Reject lock candidates too far in base_link +Y (workspace ceiling)."""
+        max_y = float(getattr(self._args, 'refine_lock_max_base_y_m', 0.42))
+        if max_y <= 0.0:
+            return True
+        base = self._berry_base_xyz(berry)
+        if base is None:
+            return False
+        return float(base[1]) <= max_y
 
-        Pose Z comes from mono (bbox size); DaBai RGB-D on dark berries is
-        unreliable so we no longer require z_depth_m for lock ranking.
-        """
+    def _pick_nearest_fine_berry_by_cup(self) -> Optional[DetectedBerry]:
+        """REFINING entry lock: among conf≥min with valid wrist depth, nearest cam."""
         if self._fine is None or not self._fine.berries:
             return None
         if not self._fine_is_fresh():
             self._fine = None
             return None
         min_conf = float(self._args.refine_lock_min_conf)
+        max_y = float(getattr(self._args, 'refine_lock_max_base_y_m', 0.42))
         ranked: List[Tuple[float, DetectedBerry]] = []
         skipped_low = 0
+        skipped_high_y = 0
         for b in self._fine.berries:
             mode = str(getattr(b, 'depth_mode', '') or '')
             # Never pin a ghost / coast-only ID at entry — wait for live YOLO.
             if mode == 'base_coast':
                 continue
+            if not self._berry_depth_trusted(b):
+                continue
             if float(b.confidence) < min_conf:
                 skipped_low += 1
+                continue
+            if not self._berry_lock_base_y_ok(b):
+                skipped_high_y += 1
                 continue
             d_cam = self._berry_cam_range(b)
             if d_cam is not None:
                 ranked.append((d_cam, b))
         if not ranked:
-            if skipped_low > 0:
+            if skipped_low > 0 or skipped_high_y > 0:
                 self.get_logger().info(
-                    f'REFINING: waiting for mono lock '
-                    f'(low_conf={skipped_low} min_conf={min_conf:.2f})')
+                    f'REFINING: waiting for depth lock '
+                    f'(low_conf={skipped_low} min_conf={min_conf:.2f} '
+                    f'high_y={skipped_high_y} max_base_y={max_y:.2f}m)')
             return None
         ranked.sort(key=lambda x: x[0])
         return ranked[0][1]
@@ -1167,13 +1429,19 @@ class ReachFsmNode(Node):
         self._lock_wait_rec_t = now
         berries = []
         if self._fine is not None and self._fine.berries and self._fine_is_fresh():
+            max_y = float(getattr(self._args, 'refine_lock_max_base_y_m', 0.42))
             for b in self._fine.berries:
+                base = self._berry_base_xyz(b)
+                base_y = float(base[1]) if base is not None else None
                 berries.append({
                     'track_id': int(b.track_id),
                     'confidence': float(b.confidence),
                     'depth_mode': str(getattr(b, 'depth_mode', '') or ''),
                     'z_mono_m': float(getattr(b, 'z_mono_m', -1.0)),
                     'z_depth_m': float(getattr(b, 'z_depth_m', -1.0)),
+                    'base_y_m': base_y,
+                    'y_ok': (
+                        base_y is None or max_y <= 0.0 or base_y <= max_y),
                 })
         berries.sort(key=lambda x: -x['confidence'])
         best = berries[0]['confidence'] if berries else None
@@ -1230,9 +1498,6 @@ class ReachFsmNode(Node):
             self._last_z_cam = float(cam[2])
         berry.track_id = tid
         self._lock_pub.publish(berry)
-        self._refine_lock_sync_tid = tid if tid >= 0 else None
-        self._refine_lock_sync_streak = 0
-        self._refine_lock_sync_deadline = time.time() + 3.0
         self.get_logger().info(
             f'REFINING fruit lock (nearest cam, mono pose, '
             f'conf>={float(self._args.refine_lock_min_conf):.2f}): '
@@ -1292,93 +1557,6 @@ class ReachFsmNode(Node):
             self._write_cup_rel_overlay('refine_fruit_lock', geo)
         self._write_qa_json('refine_fruit_lock.json', lock_payload)
         self._refine_lock_snap_pending = True
-
-    def _locked_track_live_synced(self) -> bool:
-        """Wait until fine_detector echoes the requested lock as a live non-base_coast track."""
-        tid = self._refine_lock_sync_tid
-        if tid is None or tid < 0:
-            return True
-        live = None
-        for b in self._live_fine_berries():
-            if int(b.track_id) == int(tid):
-                live = b
-                break
-        # Also look at coasted pin (not in _live_fine_berries) — but coast alone
-        # does not complete sync (see below).
-        if live is None and self._fine is not None and self._fine.berries:
-            for b in self._fine.berries:
-                if int(b.track_id) == int(tid):
-                    live = b
-                    break
-        if live is not None:
-            mode = str(getattr(live, 'depth_mode', '') or '')
-            # Ghost pin must not finish sync — probe rejects base_coast and would
-            # hang waiting for UV. Treat coast as not-yet-synced (timeout → re-pin).
-            if mode == 'base_coast':
-                self._refine_lock_sync_streak = 0
-            else:
-                self._refine_lock_sync_streak += 1
-                if self._refine_lock_sync_streak >= 3:
-                    self._refine_lock_sync_tid = None
-                    self._refine_lock_sync_deadline = 0.0
-                    self.get_logger().info(
-                        f'REFINING target_lock synced tid={tid} '
-                        f'mode={mode} '
-                        f'conf={float(live.confidence):.2f}')
-                    return True
-                return False
-        else:
-            self._refine_lock_sync_streak = 0
-        now = time.time()
-        if now - self._refine_wait_log_t > 1.0:
-            self._refine_wait_log_t = now
-            mode_hint = ''
-            if live is not None:
-                mode_hint = f' mode={getattr(live, "depth_mode", "")}'
-            self.get_logger().info(
-                f'REFINING waiting target_lock sync tid={tid}{mode_hint} '
-                f'(need live non-coast fine echo before probe)')
-        if self._refine_lock_sync_deadline > 0.0 and now > self._refine_lock_sync_deadline:
-            # Tracker ID churn: re-pin only near the locked berry / cup-aim.
-            # Never fall back to unconstrained cam-nearest (20260807_142705 latched
-            # a far edge box after fresh center lock).
-            neu = self._pick_sync_repin_candidate(old_tid=int(tid))
-            if neu is not None:
-                old = tid
-                new_tid = int(neu.track_id)
-                self._refine_locked_track_id = new_tid if new_tid >= 0 else None
-                self._lock_pub.publish(neu)
-                self._refine_lock_sync_tid = new_tid if new_tid >= 0 else None
-                self._refine_lock_sync_streak = 0
-                self._refine_lock_sync_deadline = time.time() + 3.0
-                base = self._berry_base_xyz(neu)
-                if base is not None:
-                    self._refine_fruit_anchor = base
-                    self._last_berry_base = base
-                    self._last_berry_t = time.time()
-                self.get_logger().warn(
-                    f'REFINING target_lock re-pin {old}→{new_tid} '
-                    f'(sync timeout; live mode={getattr(neu, "depth_mode", "")} '
-                    f'conf={float(neu.confidence):.2f} '
-                    f'phase={self._refine_phase})')
-                return False
-            # After center / near: keep frozen berry_base rather than ERROR on coast.
-            if self._last_berry_base is not None and (
-                self._refine_phase in ('range_depth', 'near', 'post_center')
-                or self._state == 'REFINING_WAIT_NEAR'
-                or self._near_mode
-                or self._near_frozen_berry is not None
-            ):
-                self.get_logger().warn(
-                    f'REFINING target_lock sync timeout tid={tid} '
-                    f'phase={self._refine_phase}/{self._state} — '
-                    f'keep frozen berry_base, skip live re-pin')
-                self._refine_lock_sync_tid = None
-                self._refine_lock_sync_deadline = 0.0
-                return True
-            why = self._fine_reject_reason()
-            self._set_state('ERROR', f'target_lock sync timeout tid={tid} — {why}')
-        return False
 
     def _await_fine_tracker_reset_before_lock(self) -> bool:
         """True when still waiting for fine BoT-SORT reset after clear_lock."""
@@ -1722,7 +1900,7 @@ class ReachFsmNode(Node):
             return None
         try:
             tf = self._tf_buffer.lookup_transform(
-                'camera_fixed_optical_frame', self._args.base_frame, rclpy.time.Time())
+                'camera_fixed_color_optical_frame', self._args.base_frame, rclpy.time.Time())
         except Exception:
             return None
         T = _matrix_from_tf(tf)
@@ -2686,9 +2864,8 @@ class ReachFsmNode(Node):
             return
         # Pixel-coast without 3D update is still skipped; mono / depth / iou_pin OK.
         if mode in ('coast',) and not self._berry_has_rgbd(berry):
-            # 'coast' here means prior blend in cam frame without fresh measure —
-            # still allow if z_mono present (mono scheme).
-            if float(getattr(berry, 'z_mono_m', -1.0)) <= 1e-4:
+            # Pixel-coast without fresh RGB-D — skip unless depth still valid.
+            if not self._berry_depth_trusted(berry):
                 self.get_logger().debug(
                     f'REFINING skip remember mode={mode} '
                     f'z_d={float(getattr(berry, "z_depth_m", -1)):.3f} '
@@ -2755,10 +2932,8 @@ class ReachFsmNode(Node):
         z: Optional[float] = float(z_cam) if z_cam is not None else None
         if z is None or z <= 1e-4:
             if berry is not None:
-                z = float(getattr(berry, 'z_mono_m', -1.0))
-                if z <= 1e-4:
-                    z = float(getattr(berry, 'z_depth_m', -1.0))
-                if z <= 1e-4:
+                z, _zsrc = self._berry_range_z_m(berry)
+                if z is None or z <= 1e-4:
                     cam_b = self._berry_cam_xyz(berry)
                     if cam_b is not None and cam_b[2] > 1e-4:
                         z = float(cam_b[2])
@@ -3426,8 +3601,8 @@ class ReachFsmNode(Node):
             if uv is not None:
                 if cam is None or cam[2] <= 1e-4:
                     fx, fy, cx, cy = self._wrist_intrinsics()
-                    z = float(getattr(berry, 'z_mono_m', -1.0))
-                    if z <= 1e-4 and self._last_z_cam:
+                    z, _ = self._berry_range_z_m(berry)
+                    if (z is None or z <= 1e-4) and self._last_z_cam:
                         z = float(self._last_z_cam)
                     if z > 1e-4:
                         cam = (
@@ -3838,10 +4013,15 @@ class ReachFsmNode(Node):
         )
 
     def _apply_probe_tri_mono_chord_scale(self) -> Optional[str]:
-        """Scheme G: frozen tri 3D + reproject-UV neighborhood min-mono chord scale."""
+        """Legacy: chord-scale tri depth via min-mono (disabled when RGB-D trusted)."""
         if self._probe_tri_chord_applied:
             return 'probe_tri_mono_chord'
-        if not bool(getattr(self._args, 'refine_probe_tri_mono_chord', True)):
+        if not bool(getattr(self._args, 'refine_probe_tri_mono_chord', False)):
+            return None
+        live = self._pick_probe_live_berry()
+        if live is not None and self._berry_depth_trusted(live):
+            self.get_logger().info(
+                'REFINING probe tri mono chord: skip — wrist depth_raw trusted')
             return None
         if not self._center_probe_tri_ok or self._last_berry_base is None:
             return None
@@ -4203,19 +4383,13 @@ class ReachFsmNode(Node):
     ) -> Tuple[Optional[float], str]:
         """Fresh depth on the live UV ray after center oneshot (arrive pose).
 
-        Prefer RGB-D, else live mono/cam at the *current* pose.
+        Prefer wrist RGB-D when valid; mono only when depth is unavailable.
         """
         del uv  # ray built by caller; z only here
         if berry is not None:
-            zd = float(getattr(berry, 'z_depth_m', -1.0))
-            # Orbbec often returns far background / hole fills as "depth" on
-            # small berries (155633 z=1.14m poisoned live-replan). Cap to
-            # mid-range picking workspace.
-            if 0.08 < zd < 0.55:
-                return zd, 'live_rgbd'
-            zm = float(getattr(berry, 'z_mono_m', -1.0))
-            if 0.08 < zm < 1.2:
-                return zm, 'live_mono'
+            z, src = self._berry_range_z_m(berry)
+            if z is not None and 0.08 < z < 1.5:
+                return z, src
         if cam is not None and 0.08 < float(cam[2]) < 1.2:
             return float(cam[2]), 'live_cam'
         if self._last_z_cam is not None and 0.08 < float(self._last_z_cam) < 1.2:
@@ -4626,8 +4800,8 @@ class ReachFsmNode(Node):
             return None, None, 'none'
         if cam is None or cam[2] <= 1e-4:
             fx, fy, cx, cy = self._wrist_intrinsics()
-            z = float(getattr(live, 'z_mono_m', -1.0))
-            if z <= 1e-4 and self._last_z_cam:
+            z, _ = self._berry_range_z_m(live)
+            if (z is None or z <= 1e-4) and self._last_z_cam:
                 z = float(self._last_z_cam)
             if z > 1e-4:
                 cam = (
@@ -4687,9 +4861,6 @@ class ReachFsmNode(Node):
         tid = int(neu.track_id)
         self._refine_locked_track_id = tid
         self._lock_pub.publish(neu)
-        self._refine_lock_sync_tid = tid if tid >= 0 else None
-        self._refine_lock_sync_streak = 0
-        self._refine_lock_sync_deadline = time.time() + 3.0
 
         ok3d, z_src = self._correct_berry_3d_from_fresh_lock(
             neu, reason=f'fresh_lock_{reason}')
@@ -5164,7 +5335,956 @@ class ReachFsmNode(Node):
         # then wrist frames every 0.5 s during SERVO.
         self._fused_map = FusedApproachMap(max_age_s=4.0)
         self._pbvs_last_wrist_map_t = 0.0
-        self.get_logger().info('PBVS loop initialised (FusedApproachMap ready)')
+        # Global RGB-D → map must succeed; entry-time TF races are retried in tick.
+        self._pbvs_global_map_ok = False
+        self._pbvs_global_retry_t = 0.0
+        self._pbvs_stream_log_t = 0.0
+        self._pbvs_stream_snap_t = 0.0
+        # Conditioned PBVS setpoint (decoupled from raw KF posterior).
+        self._pbvs_target_cmd: Optional[np.ndarray] = None
+        self._pbvs_frozen_target: Optional[np.ndarray] = None  # QA legacy only
+        self._pbvs_cam_snapshot: Optional[Dict] = None
+        self._pbvs_approach_blind = False
+        self._pbvs_vision_lost_streak = 0
+        self._pbvs_had_live_near = False
+        self._pbvs_near_logged = False
+        self._pbvs_kf_reject_streak = 0
+        self._pbvs_last_v_norm = 0.0
+        self._pbvs_gate_log_t = 0.0
+        self._pbvs_frozen_approach_dir: Optional[np.ndarray] = None
+        self._pbvs_contact_sent = False
+        self._pbvs_contact_finished = False
+        self._pbvs_contact_sent_t = 0.0
+        self._pbvs_blind_warn_t = 0.0
+        self._pbvs_probe_started_t = 0.0
+        self._pbvs_probe_return_pending = False
+        self._pbvs_probe_last_t = 0.0
+        self._pbvs_probe_entry_obs = None
+        self._pbvs_lock_depth_mode = ''
+        self._pbvs_entry_lock_xyz: Optional[np.ndarray] = None
+        self._pbvs_probe_success_n = 0
+        self._pbvs_probe_fail_n = 0
+        self._pbvs_frozen_berry: Optional[np.ndarray] = None
+        self._pbvs_oneshot_pending: Optional[str] = None  # 'approach' | 'final' | 'direct'
+        self._pbvs_direct_shot_n = 0
+        self._pbvs_depth_final_running = False
+        self._pbvs_motion_min_d_cam: Optional[float] = None
+        self._ensure_pbvs_qa_recorder()
+        mode = str(getattr(self._args, 'pbvs_mode', 'stream') or 'stream')
+        self._pbvs_qa_log_event('init', {
+            'reason': 'pbvs_loop_start',
+            'pbvs_mode': mode,
+        })
+        self.get_logger().info(
+            f'PBVS loop initialised (mode={mode}, FusedApproachMap ready)')
+
+    def _pbvs_oneshot_mode(self) -> bool:
+        """Open-loop PBVS (blocking traj): ``single``/``oneshot``/``twostage``."""
+        mode = str(getattr(self._args, 'pbvs_mode', 'single') or 'single')
+        return self._use_pbvs and mode in ('oneshot', 'single', 'twostage')
+
+    def _pbvs_direct_mode(self) -> bool:
+        """Canonical path: lock → tip→surface oneshot(s) → WAIT_CONFIRM.
+
+        ``oneshot`` is an alias of ``single``. Motion is open-loop to the frozen
+        lock point (no live tracking). After each segment settles, cup↔frozen is
+        checked; if still > exec_tol (0.5 mm), up to ``pbvs_direct_max_shots``
+        residual pushes run **before** WAIT_CONFIRM. Human ``confirm_reset`` only
+        after the arm has finished all pushes.
+        """
+        mode = str(getattr(self._args, 'pbvs_mode', 'single') or 'single')
+        return self._use_pbvs and mode in ('oneshot', 'single')
+
+    def _pbvs_twostage_mode(self) -> bool:
+        """Legacy opt-in: pre-grasp then depth_final."""
+        mode = str(getattr(self._args, 'pbvs_mode', 'single') or 'single')
+        return self._use_pbvs and mode == 'twostage'
+
+    def _tick_pbvs_rate(self) -> None:
+        """25 Hz PBVS execution; skip while a blocking traj (probe) is in flight."""
+        if self._state != 'REFINING' or not self._use_pbvs:
+            return
+        if self._move_phase is not None:
+            return
+        if self._pbvs_oneshot_mode():
+            self._tick_refining_pbvs_oneshot()
+        else:
+            self._tick_refining_pbvs()
+        self._record_pbvs_tick()
+
+    def _stream_joint_goal(self, q: Sequence[float], *, traj_s: float = 0.15) -> None:
+        """Fire-and-forget short FollowJointTrajectory (teleop-style streaming).
+
+        Does NOT set ``_move_phase``, so the 25 Hz PBVS timer keeps running.
+        """
+        if not self._arm.server_is_ready():
+            return
+        goal = FollowJointTrajectory.Goal()
+        goal.trajectory.joint_names = list(ARM_JOINTS)
+        pt = JointTrajectoryPoint()
+        pt.positions = [float(v) for v in list(q)[:6]]
+        dt = float(max(0.05, traj_s))
+        pt.time_from_start.sec = int(dt)
+        pt.time_from_start.nanosec = int((dt - int(dt)) * 1e9)
+        goal.trajectory.points = [pt]
+        fut = self._arm.send_goal_async(goal)
+
+        def _on_sent(f) -> None:
+            try:
+                gh = f.result()
+            except Exception:
+                return
+            if gh is None or not gh.accepted:
+                return
+            prev = self._arm_goal_handle
+            self._arm_goal_handle = gh
+            if prev is not None and prev != gh:
+                try:
+                    prev.cancel_goal_async()
+                except Exception:
+                    pass
+
+        fut.add_done_callback(_on_sent)
+
+    def _pbvs_mono_depth_mode(self, mode: str) -> bool:
+        m = str(mode or '').lower()
+        return m in ('mono', 'mono_fallback')
+
+    def _pbvs_rgbd_depth_mode(self, mode: str) -> bool:
+        m = str(mode or '').lower()
+        return m in (
+            'rgbd', 'fused_rgbd', 'da2', 'fused_da2', 'depth', 'depth_raw',
+            'iou_pin')
+
+    def _pbvs_depth_trusted(
+        self, mode: str, berry: Optional[DetectedBerry] = None,
+    ) -> bool:
+        if self._pbvs_rgbd_depth_mode(mode):
+            return True
+        return berry is not None and self._berry_has_rgbd(berry)
+
+    def _pbvs_slew_target_cmd(
+        self,
+        raw: np.ndarray,
+        *,
+        max_step_m: float,
+    ) -> np.ndarray:
+        """Rate-limit PBVS setpoint changes (safety even if KF glitches)."""
+        raw = np.asarray(raw, dtype=np.float64).flatten()[:3]
+        if self._pbvs_target_cmd is None:
+            self._pbvs_target_cmd = raw.copy()
+            return self._pbvs_target_cmd
+        delta = raw - self._pbvs_target_cmd
+        dist = float(np.linalg.norm(delta))
+        step = float(max(1e-6, max_step_m))
+        if dist <= step:
+            self._pbvs_target_cmd = raw.copy()
+        else:
+            self._pbvs_target_cmd = self._pbvs_target_cmd + delta * (step / dist)
+        return self._pbvs_target_cmd
+
+    def _pbvs_control_target(self) -> Optional[np.ndarray]:
+        """PBVS setpoint: live/KF while vision up; last snapshot only for blind oneshot."""
+        if (self._pbvs_approach_blind
+                and self._pbvs_cam_snapshot is not None
+                and self._pbvs_cam_snapshot.get('berry_base') is not None):
+            return np.asarray(
+                self._pbvs_cam_snapshot['berry_base'], dtype=np.float64)
+        if self._pbvs_target_cmd is not None:
+            return self._pbvs_target_cmd.copy()
+        if hasattr(self, '_pbvs_kf') and self._pbvs_kf.initialized:
+            return self._pbvs_kf.position
+        return None
+
+    def _pbvs_finish_contact(
+        self,
+        metric_m: float,
+        *,
+        tag: str,
+        d_cam_m: Optional[float] = None,
+    ) -> None:
+        if getattr(self, '_pbvs_contact_finished', False):
+            return
+        self._pbvs_contact_finished = True
+        tcp_d = None
+        snap = getattr(self, '_pbvs_cam_snapshot', None) or {}
+        berry_ref = snap.get('berry_base')
+        if berry_ref is not None:
+            tcp_d = self._cup_berry_dist_from(np.asarray(berry_ref, dtype=np.float64))
+        self.get_logger().info(
+            f'PBVS DONE ({tag}): d_cam={(d_cam_m if d_cam_m is not None else metric_m)*1000:.1f} mm '
+            f'metric={metric_m*1000:.1f} mm '
+            f'tcp_dist={(tcp_d if tcp_d is not None else -1)*1000:.1f} mm')
+        self._pbvs_qa_log_event('done', {
+            'tag': tag,
+            'd_cam_m': float(d_cam_m if d_cam_m is not None else metric_m),
+            'cup_gap_m': float(metric_m),
+            'cup_dist_m': float(tcp_d) if tcp_d is not None else None,
+            'snapshot_berry': berry_ref,
+            'approach_blind': bool(getattr(self, '_pbvs_approach_blind', False)),
+        })
+        self._record_pbvs_tick(
+            source='contact_done',
+            cup_dist_m=tcp_d,
+            cup_gap_m=metric_m,
+            d_cam_m=d_cam_m,
+        )
+        self._pbvs_state = 'DONE'
+        from std_msgs.msg import Bool as _BoolMsg
+        reached = _BoolMsg()
+        reached.data = True
+        self._reached_pub.publish(reached)
+        if self._data_collector is not None:
+            self._data_collector.mark_success()
+            self._data_collector.end_episode()
+        self._set_state('WAIT_CONFIRM', 'pbvs_contact')
+
+    def _log_pbvs_handoff_diag(
+        self,
+        *,
+        frozen: np.ndarray,
+        frozen_src: str,
+        depth_mode: str,
+        berry_xyz_base: Optional[np.ndarray],
+        berry: Optional[DetectedBerry],
+        cup_gap: Optional[float],
+        tcp_dist: Optional[float],
+        approach_dir: np.ndarray,
+    ) -> None:
+        """Rich handoff snapshot for frozen-anchor XY/Z forensics."""
+        entry = getattr(self, '_pbvs_entry_lock_xyz', None)
+        if entry is None and self._refine_fruit_anchor is not None:
+            entry = np.asarray(self._refine_fruit_anchor, dtype=np.float64)
+        kf = (self._pbvs_kf.position.copy()
+              if hasattr(self, '_pbvs_kf') and self._pbvs_kf.initialized else None)
+        target_cmd = (self._pbvs_target_cmd.copy()
+                      if self._pbvs_target_cmd is not None else None)
+        live = (np.asarray(berry_xyz_base, dtype=np.float64).copy()
+                if berry_xyz_base is not None else None)
+        frozen_a = np.asarray(frozen, dtype=np.float64).flatten()[:3]
+        tcp = self._tcp_or_ee_xyz()
+        cup_open = self._cup_open_xyz()
+        tip = None
+        q = self._joint_positions_rad()
+        if q is not None:
+            tip = tip_xyz(q.tolist())
+
+        def _delta_mm(a: Optional[np.ndarray], b: Optional[np.ndarray]) -> Optional[Dict]:
+            if a is None or b is None:
+                return None
+            d = np.asarray(a, dtype=np.float64) - np.asarray(b, dtype=np.float64)
+            return {
+                'dxyz_mm': [float(x * 1000) for x in d],
+                'xy_mm': float(np.linalg.norm(d[:2]) * 1000),
+                'dz_mm': float(d[2] * 1000),
+                'norm_mm': float(np.linalg.norm(d) * 1000),
+            }
+
+        geo = None
+        if tcp is not None and live is not None:
+            geo = self._cup_berry_geometry(
+                tuple(float(v) for v in live),
+                tcp,
+            )
+
+        live_mode_raw = ''
+        live_conf = None
+        if berry is not None:
+            live_mode_raw = str(getattr(berry, 'depth_mode', '') or '')
+            live_conf = float(berry.confidence)
+
+        diag: Dict = {
+            'track_id': self._refine_locked_track_id,
+            'frozen_source': frozen_src,
+            'depth_mode_handoff': depth_mode,
+            'live_depth_mode_raw': live_mode_raw,
+            'live_conf': live_conf,
+            'entry_lock_xyz': entry.tolist() if entry is not None else None,
+            'live_handoff_xyz': live.tolist() if live is not None else None,
+            'kf_xyz': kf.tolist() if kf is not None else None,
+            'target_cmd_xyz': target_cmd.tolist() if target_cmd is not None else None,
+            'frozen_xyz': frozen_a.tolist(),
+            'approach_dir': np.asarray(approach_dir, dtype=np.float64).tolist(),
+            'cup_gap_m': cup_gap,
+            'tcp_dist_m': tcp_dist,
+            'cup_open_xyz': cup_open.tolist() if cup_open is not None else None,
+            'tip_xyz': tip.tolist() if tip is not None else None,
+            'tcp_base': list(tcp) if tcp is not None else None,
+            'delta_frozen_vs_entry': _delta_mm(frozen_a, entry),
+            'delta_live_vs_entry': _delta_mm(live, entry),
+            'delta_frozen_vs_live': _delta_mm(frozen_a, live),
+            'delta_frozen_vs_kf': _delta_mm(frozen_a, kf),
+            'delta_frozen_vs_target_cmd': _delta_mm(frozen_a, target_cmd),
+            'berry_rel_cup': geo.get('berry_rel_cup') if geo else None,
+            'berry_uv': geo.get('berry_uv') if geo else None,
+            'cup_uv': geo.get('cup_uv') if geo else None,
+            'kf_uncertainty': (
+                float(self._pbvs_kf.uncertainty())
+                if hasattr(self, '_pbvs_kf') and self._pbvs_kf.initialized
+                else None),
+            'kf_reject_streak': int(getattr(self, '_pbvs_kf_reject_streak', 0)),
+        }
+        self._write_qa_json('pbvs_handoff.json', diag)
+        self._pbvs_qa_log_event('approach_handoff', diag)
+        dfe = diag.get('delta_frozen_vs_entry') or {}
+        dfl = diag.get('delta_frozen_vs_live') or {}
+        self.get_logger().info(
+            'PBVS handoff diag: '
+            f'src={frozen_src} mode={depth_mode} '
+            f'cup_gap={(cup_gap if cup_gap is not None else -1)*1000:.1f}mm '
+            f'tcp_dist={(tcp_dist if tcp_dist is not None else -1)*1000:.1f}mm '
+            f'frozen_vs_entry_xy={dfe.get("xy_mm", -1):.1f}mm '
+            f'frozen_vs_live_xy={dfl.get("xy_mm", -1):.1f}mm '
+            f'frozen={np.round(frozen_a, 3)}')
+
+    def _pbvs_gap_approach_dir(self) -> Optional[np.ndarray]:
+        ad = getattr(self, '_pbvs_frozen_approach_dir', None)
+        if ad is None:
+            ad = getattr(self, '_pbvs_approach_dir_base', None)
+        if ad is None:
+            return None
+        a = np.asarray(ad, dtype=np.float64).flatten()[:3]
+        n = float(np.linalg.norm(a))
+        return a / n if n > 1e-6 else None
+
+    def _pbvs_axial_surface_gap(self, berry_base: np.ndarray) -> Optional[float]:
+        """Cup-axis gap to berry surface (m). Primary metric for oneshot depth_final."""
+        adir = self._pbvs_gap_approach_dir()
+        gap_axis = self._cup_gap_along_axis(
+            np.asarray(berry_base, dtype=np.float64), approach_dir=adir)
+        if gap_axis is None:
+            return None
+        return max(0.0, float(gap_axis[0]))
+
+    def _pbvs_measure_d_cam_surface(
+        self,
+        *,
+        live_only: bool = False,
+    ) -> Tuple[Optional[float], Optional[float]]:
+        """Cam-frame cup↔berry surface gap (m). Returns (d_surface, live_cam_or_none).
+
+        Oneshot / ``live_only``: never use frozen axial_gap — cam depth or cam-frame
+        reproject only (industry pre-grasp + depth-final pattern).
+        """
+        frozen = getattr(self, '_pbvs_frozen_berry', None)
+        tcp = self._tcp_or_ee_xyz()
+
+        berry = self._pick_probe_live_berry()
+        live_d = None
+        if berry is not None:
+            base = self._berry_base_xyz(berry)
+            if base is not None:
+                live_d = self._pbvs_live_d_cam_surface(
+                    berry, np.asarray(base, dtype=np.float64))
+
+        if self._pbvs_oneshot_mode() or live_only:
+            if live_d is not None:
+                return float(live_d), float(live_d)
+            if frozen is not None:
+                d_geom = self._pbvs_d_cam_surface_from_base(
+                    np.asarray(frozen, dtype=np.float64))
+                if d_geom is not None:
+                    return d_geom, None
+            return None, None
+
+        axial = None
+        if frozen is not None:
+            axial = self._pbvs_axial_surface_gap(np.asarray(frozen, dtype=np.float64))
+
+        if live_d is not None and tcp is not None and frozen is not None:
+            tcp_dist = float(np.linalg.norm(
+                np.asarray(frozen, dtype=np.float64) - np.asarray(tcp, dtype=np.float64)))
+            if live_d > 0.12 and tcp_dist < self._tip_contact_standoff_m() + 0.04:
+                if axial is not None:
+                    return axial, None
+            return float(live_d), float(live_d)
+
+        if axial is not None:
+            return axial, None
+
+        if frozen is not None:
+            d_geom = self._pbvs_d_cam_surface_from_base(
+                np.asarray(frozen, dtype=np.float64))
+            if d_geom is not None:
+                return d_geom, None
+        return None, None
+
+    def _pbvs_send_cup_axis_oneshot(
+        self,
+        berry: np.ndarray,
+        travel_m: float,
+        *,
+        tag: str,
+        pending: str,
+        d_cam_surface: Optional[float] = None,
+        lookat: bool = True,
+        allow_tip_residual: bool = True,
+    ) -> bool:
+        """Blocking cup_axis oneshot; ``pending`` identifies phase on settle."""
+        if not self._arm.server_is_ready():
+            return False
+        travel = float(travel_m)
+        min_travel = self._pbvs_min_oneshot_travel_m()
+        if travel < min_travel:
+            return False
+        tcp = self._tcp_or_ee_xyz()
+        ee = self._current_ee_pose()
+        if tcp is None or ee is None:
+            return False
+        berry_t = tuple(float(v) for v in np.asarray(berry, dtype=np.float64).flatten()[:3])
+        if self._pbvs_direct_mode():
+            planned = self._plan_tip_to_surface_delta(berry_t, travel)
+        elif self._pbvs_oneshot_mode():
+            planned = self._plan_cup_axis_oneshot_delta(berry_t, travel)
+        else:
+            planned = self._plan_near_oneshot_delta(berry_t, tcp, travel)
+        if planned is None:
+            self.get_logger().warn(f'PBVS {tag}: cup-axis plan failed')
+            return False
+        _d_cam, d_base, method, _plan_meta = planned
+        ee0 = np.array([
+            float(ee.pose.position.x),
+            float(ee.pose.position.y),
+            float(ee.pose.position.z),
+        ], dtype=np.float64)
+        tcp0 = np.array([float(tcp[0]), float(tcp[1]), float(tcp[2])], dtype=np.float64)
+        tcp_goal = tcp0 + np.asarray(d_base, dtype=np.float64)
+        joints = None
+        ik_method = 'keep_orient'
+        use_cup_lookat = lookat and (
+            self._pbvs_oneshot_mode() or travel >= 0.03)
+        if use_cup_lookat:
+            T_l6c = self._lookup_T_link6_cam()
+            if T_l6c is None:
+                T_l6c = np.eye(4, dtype=np.float64)
+                T_l6c[:3, 3] = [0.0, -0.08, -0.04]
+            joints = self._approach_axis_ik_for_tcp_goal(
+                tcp_goal=tcp_goal,
+                berry=berry_t,
+                T_l6c=T_l6c,
+                seed=list(self._joints),
+                d_base=d_base,
+                contact_m=self._tip_contact_standoff_m(),
+                allow_tip_residual=allow_tip_residual,
+            )
+            if joints is not None:
+                ik_method = 'cup_axis_lookat'
+        if joints is None:
+            tgt_xyz = tuple((ee0 + d_base).tolist())
+            joints = position_ik_keep_orient(tgt_xyz, self._joints)
+            if joints is None:
+                joints = position_ik_keep_orient_chunked(tgt_xyz, self._joints)
+                ik_method = 'keep_orient_chunked'
+        if joints is None:
+            self.get_logger().warn(f'PBVS {tag}: IK failed')
+            return False
+        target = self._clamp_servo_target(list(joints))
+        if tag == 'pbvs_single':
+            traj_s = float(self._args.align_traj_s)
+        elif tag == 'pbvs_single_residual':
+            traj_s = float(self._args.servo_traj_s)
+        else:
+            traj_s = max(0.8, min(4.0, float(travel) / 0.04))
+        ok = self._send_joint_servo_goal(
+            target,
+            tag=tag,
+            traj_s=traj_s,
+            extra=(
+                f'{ik_method} travel={travel:.3f}m plan={method} '
+                f'traj={traj_s:.1f}s '
+                f'd_cam={(d_cam_surface if d_cam_surface is not None else -1):.3f}'))
+        if ok:
+            self._pbvs_oneshot_pending = pending
+            pkg = {
+                'berry_base': list(berry_t),
+                'tcp_start': list(tcp0),
+                'tcp_goal': list(tcp_goal),
+                'travel_m': float(travel),
+                'd_cam_surface_m': float(d_cam_surface) if d_cam_surface is not None else None,
+                'method': str(method),
+                'traj_s': float(traj_s),
+                'phase': pending,
+            }
+            self._write_qa_json(f'pbvs_{pending}.json', pkg)
+            self._pbvs_qa_log_event(f'oneshot_{pending}', pkg)
+            self.get_logger().info(
+                f'PBVS {tag}: travel={travel*1000:.1f}mm '
+                f'd_cam={(d_cam_surface if d_cam_surface is not None else -1)*1000:.1f}mm '
+                f'traj={traj_s:.1f}s')
+        return ok
+
+    def _pbvs_start_approach_oneshot(
+        self,
+        berry: np.ndarray,
+        *,
+        d_cam_surface: Optional[float] = None,
+    ) -> bool:
+        """Pre-grasp approach: cup_axis oneshot until cam d_cam_surface ≈ pre-grasp."""
+        berry_a = np.asarray(berry, dtype=np.float64).flatten()[:3]
+        pre = self._pbvs_pre_grasp_d_cam_m()
+        d_cam = d_cam_surface
+        if d_cam is None:
+            live = self._pick_probe_live_berry()
+            base = self._berry_base_xyz(live) if live is not None else None
+            if live is not None and base is not None:
+                d_cam = self._pbvs_live_d_cam_surface(live, np.asarray(base))
+            if d_cam is None:
+                snap = getattr(self, '_pbvs_cam_snapshot', None) or {}
+                d_cam = snap.get('d_cam_surface_m')
+        if d_cam is None:
+            self.get_logger().warn('PBVS approach: no d_cam_surface at lock')
+            return False
+        travel = float(d_cam) - pre
+        if travel < 0.002:
+            self.get_logger().info(
+                f'PBVS approach skip: d_cam={d_cam*1000:.1f}mm '
+                f'≤ pre_grasp={pre*1000:.1f}mm')
+            return False
+        return self._pbvs_send_cup_axis_oneshot(
+            berry_a, travel,
+            tag='pbvs_approach',
+            pending='approach',
+            d_cam_surface=float(d_cam),
+            lookat=True,
+            allow_tip_residual=False,
+        )
+
+    def _pbvs_travel_to_surface_m(
+        self,
+        berry: np.ndarray,
+    ) -> Optional[float]:
+        """3D cup-opening → locked surface contact point (m).
+
+        ``berry`` is the depth-backprojected surface point at bbox center, not a
+        sphere center — travel is full cup↔point distance minus clearance only."""
+        cup = self._cup_open_xyz()
+        if cup is None:
+            return None
+        berry_a = np.asarray(berry, dtype=np.float64).flatten()[:3]
+        cup_a = np.asarray(cup, dtype=np.float64).flatten()[:3]
+        dist = float(np.linalg.norm(berry_a - cup_a))
+        return dist - self._tip_contact_standoff_m()
+
+    def _pbvs_start_direct_oneshot(
+        self,
+        berry: np.ndarray,
+        *,
+        d_cam_surface: Optional[float] = None,
+    ) -> bool:
+        """Single segment: lock → oneshot with tip on berry surface."""
+        berry_a = np.asarray(berry, dtype=np.float64).flatten()[:3]
+        travel = self._pbvs_travel_to_surface_m(berry_a)
+        if travel is None:
+            self.get_logger().warn('PBVS direct: no cup opening')
+            return False
+        standoff = self._tip_contact_standoff_m()
+        exec_tol = self._pbvs_contact_exec_tol_m()
+        if travel < exec_tol:
+            self.get_logger().info(
+                f'PBVS direct skip: already at surface '
+                f'(cup↔lock<{exec_tol*1000:.1f}mm standoff={standoff*1000:.1f}mm)')
+            return False
+        axis = self._cup_axis_base()
+        tcp = self._tcp_or_ee_xyz()
+        cup = self._cup_open_xyz()
+        plan_diag = {
+            'berry_base': list(berry_a),
+            'd_cam_surface_lock_m': (
+                float(d_cam_surface) if d_cam_surface is not None else None),
+            'tip_standoff_m': float(standoff),
+            'surface_clearance_m': self._cup_surface_clearance_m(),
+            'berry_radius_m': self._berry_radius_m(),
+            'travel_m': float(travel),
+            'plan_method': 'tip_to_surface',
+            'cup_axis_base': axis.tolist() if axis is not None else None,
+            'cup_open_start': list(cup) if cup is not None else None,
+            'tcp_start': list(tcp) if tcp is not None else None,
+        }
+        self._write_qa_json('pbvs_direct_plan.json', plan_diag)
+        self._pbvs_qa_log_event('direct_plan', plan_diag)
+        self.get_logger().info(
+            f'PBVS single PLAN  tip→surface travel={travel*1000:.1f}mm '
+            f'(standoff={standoff*1000:.1f}mm = r+clearance)')
+        if d_cam_surface is not None:
+            self._pbvs_motion_min_d_cam = float(d_cam_surface)
+        self._pbvs_direct_shot_n = 1
+        return self._pbvs_send_cup_axis_oneshot(
+            berry_a, travel,
+            tag='pbvs_single',
+            pending='direct',
+            d_cam_surface=(
+                float(d_cam_surface) if d_cam_surface is not None else None),
+            lookat=True,
+            allow_tip_residual=True,
+        )
+
+    def _pbvs_run_depth_final(self) -> None:
+        """After approach oneshot: one depth sample → short final oneshot or DONE."""
+        if self._move_phase is not None or getattr(self, '_pbvs_depth_final_running', False):
+            return
+        self._pbvs_depth_final_running = True
+        try:
+            surface = self._cup_surface_clearance_m()
+            d_surf, live_d = self._pbvs_measure_d_cam_surface(live_only=True)
+            if d_surf is None:
+                self._set_state('ERROR', 'pbvs: depth_final — no d_cam (live or TF)')
+                return
+            self._pbvs_qa_log_event('depth_final_sample', {
+                'd_cam_surface_m': float(d_surf),
+                'live': live_d is not None,
+                'pre_grasp_d_cam_m': self._pbvs_pre_grasp_d_cam_m(),
+            })
+            self.get_logger().info(
+                f'PBVS depth_final sample: d_cam_surface={d_surf*1000:.1f}mm '
+                f'live_cam={(live_d if live_d is not None else -1)*1000:.1f}mm '
+                f'({"live" if live_d is not None else "cam_reproj"})')
+            if d_surf <= surface + 0.002:
+                self._snap_qa(f'servo_{self._servo_step_idx:02d}_contact')
+                self._pbvs_finish_contact(
+                    float(d_surf), tag='depth_at_standoff', d_cam_m=live_d or d_surf)
+                return
+            frozen = getattr(self, '_pbvs_frozen_berry', None)
+            if frozen is None:
+                self._set_state('ERROR', 'pbvs: depth_final — no frozen berry')
+                return
+            travel = float(d_surf) - surface
+            # No hard 50mm cap: open-loop final must close the measured gap.
+            # (Former 50mm safety cap left ~3cm short when pre-grasp residual was large.)
+            if travel > 0.20:
+                self.get_logger().warn(
+                    f'PBVS depth_final travel large: {travel*1000:.0f}mm '
+                    f'(still executing; check depth)')
+            self._pbvs_state = 'FINAL_ONESHOT'
+            if not self._pbvs_send_cup_axis_oneshot(
+                    frozen, travel,
+                    tag='pbvs_depth_final',
+                    pending='final',
+                    d_cam_surface=d_surf,
+                    lookat=True,
+                    allow_tip_residual=True):
+                self._set_state('ERROR', 'pbvs: depth_final oneshot failed')
+        finally:
+            if self._pbvs_state not in ('FINAL_ONESHOT', 'DONE'):
+                self._pbvs_depth_final_running = False
+
+    def _pbvs_on_oneshot_settle(self, pending: str) -> None:
+        """Called from _poll_wrist_servo when a PBVS oneshot traj finishes."""
+        if pending == 'direct':
+            surface = self._cup_surface_clearance_m()
+            d_surf, live_d = self._pbvs_measure_d_cam_surface(live_only=True)
+            min_d = getattr(self, '_pbvs_motion_min_d_cam', None)
+            frozen = getattr(self, '_pbvs_frozen_berry', None)
+            tcp = self._tcp_or_ee_xyz()
+            cup = self._cup_open_xyz()
+            tcp_dist = None
+            cup_berry_dist = None
+            cup_berry_dxyz = None
+            axial_gap = None
+            if frozen is not None and tcp is not None:
+                tcp_dist = float(np.linalg.norm(
+                    np.asarray(frozen, dtype=np.float64) - np.asarray(tcp, dtype=np.float64)))
+                axial_gap = self._pbvs_axial_surface_gap(
+                    np.asarray(frozen, dtype=np.float64))
+            if frozen is not None and cup is not None:
+                dvec = np.asarray(frozen, dtype=np.float64).flatten()[:3] - np.asarray(
+                    cup, dtype=np.float64).flatten()[:3]
+                cup_berry_dxyz = [float(v) for v in dvec]
+                cup_berry_dist = float(np.linalg.norm(dvec))
+            live_berry_base = None
+            cup_live_dist = None
+            cup_live_dxyz = None
+            live = self._pick_probe_live_berry()
+            if live is not None and cup is not None:
+                try:
+                    live_base = self._berry_base_xyz(live)
+                    if live_base is not None:
+                        live_berry_base = list(live_base)
+                        dvec_l = np.asarray(live_base, dtype=np.float64).flatten()[:3] - np.asarray(
+                            cup, dtype=np.float64).flatten()[:3]
+                        cup_live_dxyz = [float(v) for v in dvec_l]
+                        cup_live_dist = float(np.linalg.norm(dvec_l))
+                except Exception:
+                    pass
+            self._snap_qa(f'servo_{self._servo_step_idx:02d}_direct_arrive')
+            self._servo_step_idx += 1
+            arrive = {
+                'd_cam_surface_settle_m': float(d_surf) if d_surf is not None else None,
+                'd_cam_surface_live_m': live_d,
+                'd_cam_surface_min_motion_m': min_d,
+                'surface_clearance_m': float(surface),
+                'tcp_dist_frozen_m': tcp_dist,
+                'cup_berry_dist_m': cup_berry_dist,
+                'cup_berry_dxyz_m': cup_berry_dxyz,
+                'contact_exec_tol_m': self._pbvs_contact_exec_tol_m(),
+                'live_berry_base': live_berry_base,
+                'cup_live_berry_dist_m': cup_live_dist,
+                'cup_live_berry_dxyz_m': cup_live_dxyz,
+                'axial_gap_frozen_m': axial_gap,
+                'shot_n': int(getattr(self, '_pbvs_direct_shot_n', 1) or 1),
+                'berry_base_frozen': (
+                    np.asarray(frozen, dtype=np.float64).tolist()
+                    if frozen is not None else None),
+                'tcp_base': list(tcp) if tcp is not None else None,
+                'cup_open_xyz': list(cup) if cup is not None else None,
+            }
+            self._write_qa_json('pbvs_direct_arrive.json', arrive)
+            self._pbvs_qa_log_event('direct_arrive', arrive)
+            shot_n = int(getattr(self, '_pbvs_direct_shot_n', 1) or 1)
+            max_shots = self._pbvs_direct_max_shots()
+            exec_tol = self._pbvs_contact_exec_tol_m()
+            contact_slack = max(exec_tol, float(surface) + exec_tol)
+            residual_ok = (
+                frozen is not None
+                and shot_n < max_shots
+                and (
+                    (cup_berry_dist is not None and cup_berry_dist > contact_slack)
+                    or (axial_gap is not None and float(axial_gap) > contact_slack)
+                )
+            )
+            if residual_ok:
+                travel = self._pbvs_travel_to_surface_m(
+                    np.asarray(frozen, dtype=np.float64))
+                min_travel = self._pbvs_min_oneshot_travel_m()
+                if travel is not None and float(travel) >= min_travel:
+                    travel = min(float(travel), 0.04)
+                    self.get_logger().info(
+                        'PBVS direct residual  '
+                        f'cup↔lock={(cup_berry_dist if cup_berry_dist is not None else -1)*1000:.1f}mm '
+                        f'axial_gap={(axial_gap if axial_gap is not None else -1)*1000:.1f}mm '
+                        f'travel={travel*1000:.1f}mm '
+                        f'shot={shot_n + 1}/{max_shots} '
+                        f'(tol={exec_tol*1000:.1f}mm)')
+                    self._pbvs_direct_shot_n = shot_n + 1
+                    if self._pbvs_send_cup_axis_oneshot(
+                            np.asarray(frozen, dtype=np.float64),
+                            travel,
+                            tag='pbvs_single_residual',
+                            pending='direct',
+                            d_cam_surface=(
+                                float(d_surf) if d_surf is not None else None),
+                            lookat=True,
+                            allow_tip_residual=True):
+                        return
+                    self.get_logger().warn(
+                        'PBVS direct residual oneshot failed — '
+                        'arrive check at current pose')
+            self.get_logger().info(
+                'PBVS direct ARRIVE  '
+                f'd_cam_settle={(d_surf if d_surf is not None else -1)*1000:.1f}mm '
+                f'd_cam_min={(min_d if min_d is not None else -1)*1000:.1f}mm '
+                f'cup↔lock={(cup_berry_dist if cup_berry_dist is not None else -1)*1000:.1f}mm '
+                f'tcp↔lock={(tcp_dist if tcp_dist is not None else -1)*1000:.1f}mm '
+                f'axial_gap={(axial_gap if axial_gap is not None else -1)*1000:.1f}mm '
+                f'shot={shot_n}/{max_shots} tol={exec_tol*1000:.1f}mm '
+                f'(target clearance={surface*1000:.1f}mm) '
+                f'→ WAIT_CONFIRM')
+            self._set_state('WAIT_CONFIRM', 'pbvs_direct_arrive')
+            return
+        if pending == 'approach':
+            self._pbvs_state = 'DEPTH_FINAL'
+            self._pbvs_depth_final_running = False
+            self._snap_qa(f'servo_{self._servo_step_idx:02d}_after_approach')
+            self._servo_step_idx += 1
+            self._pbvs_run_depth_final()
+        elif pending == 'final':
+            surface = self._cup_surface_clearance_m()
+            d_surf, live_d = self._pbvs_measure_d_cam_surface(live_only=True)
+            self._snap_qa(f'servo_{self._servo_step_idx:02d}_contact')
+            self._servo_step_idx += 1
+            self._pbvs_depth_final_running = False
+            if d_surf is None:
+                self._set_state('ERROR', 'pbvs: no depth after final oneshot')
+                return
+            self._pbvs_qa_log_event('depth_final_done', {
+                'd_cam_surface_m': float(d_surf),
+                'live_cam_m': live_d,
+            })
+            if d_surf > surface + 0.010:
+                self._set_state(
+                    'ERROR',
+                    f'pbvs: final short of surface '
+                    f'd_cam_surface={d_surf*1000:.1f}mm '
+                    f'(need ≤{(surface+0.002)*1000:.1f}mm)')
+                return
+            self._pbvs_finish_contact(
+                float(d_surf), tag='depth_final', d_cam_m=live_d or d_surf)
+
+    def _pbvs_start_contact_oneshot(
+        self,
+        berry: np.ndarray,
+        d_cam_surface: float,
+        *,
+        approach_dir: Optional[np.ndarray] = None,
+    ) -> bool:
+        """Stream-mode terminal oneshot (legacy PBVS path)."""
+        if self._pbvs_contact_sent or not self._arm.server_is_ready():
+            return False
+        surface = self._cup_surface_clearance_m()
+        if d_cam_surface <= surface + 1e-4:
+            return False
+        travel = float(d_cam_surface) - surface
+        if travel < 0.002:
+            return False
+        ok = self._pbvs_send_cup_axis_oneshot(
+            np.asarray(berry, dtype=np.float64),
+            travel,
+            tag='pbvs_contact',
+            pending='contact',
+            d_cam_surface=float(d_cam_surface),
+        )
+        if ok:
+            self._pbvs_contact_sent = True
+            self._pbvs_contact_sent_t = time.time()
+            self._pbvs_state = 'CONTACT'
+        return ok
+
+    def _tick_refining_pbvs_oneshot(self) -> None:
+        """Open-loop PBVS tick.
+
+        ``single`` (and alias ``oneshot``): fruit lock → one or more cup-axis
+        pushes to frozen surface (auto residual until cup↔lock ≤ 0.5 mm or max
+        shots) → WAIT_CONFIRM → human confirm_reset. No pre-grasp / depth_final.
+        ``twostage``: legacy approach + depth_final.
+        """
+        if not hasattr(self, '_pbvs_kf'):
+            self._init_pbvs()
+
+        now = time.time()
+        if not getattr(self, '_pbvs_global_map_ok', False):
+            if now - getattr(self, '_pbvs_global_retry_t', 0.0) >= 0.5:
+                self._pbvs_global_retry_t = now
+                self._build_approach_map_from_global(wait_tf_s=0.75)
+
+        if self._pbvs_state == 'DONE':
+            return
+
+        if self._refine_fruit_anchor is None:
+            if self._await_fine_tracker_reset_before_lock():
+                return
+            self._init_refine_fruit_lock()
+            if self._refine_fruit_anchor is None:
+                if now - getattr(self, '_pbvs_init_log_t', 0.0) > 1.0:
+                    self._pbvs_init_log_t = now
+                    self.get_logger().info(
+                        f'PBVS waiting fruit lock: {self._fine_reject_reason()}')
+                return
+
+        berry = self._pick_probe_live_berry()
+        berry_xyz_base = None
+        depth_mode = ''
+        if self._pbvs_direct_mode() and self._refine_fruit_anchor is not None:
+            berry_xyz_base = np.asarray(
+                self._refine_fruit_anchor, dtype=np.float64).flatten()[:3]
+            depth_mode = str(getattr(self, '_pbvs_lock_depth_mode', '') or '')
+        if berry is not None and berry_xyz_base is None:
+            try:
+                base = self._berry_base_xyz(berry)
+                if base is not None:
+                    berry_xyz_base = np.array(base, dtype=np.float64)
+                    depth_mode = str(getattr(berry, 'depth_mode', 'mono') or 'mono')
+            except Exception:
+                pass
+
+        if self._pbvs_state == 'INIT':
+            if berry_xyz_base is None:
+                if now - getattr(self, '_pbvs_init_log_t', 0.0) > 1.0:
+                    self._pbvs_init_log_t = now
+                    self.get_logger().info(
+                        f'PBVS INIT waiting berry: {self._fine_reject_reason()}')
+                return
+            self._pbvs_frozen_berry = berry_xyz_base.copy()
+            self._pbvs_entry_lock_xyz = berry_xyz_base.copy()
+            if berry is not None:
+                depth_mode = str(getattr(berry, 'depth_mode', depth_mode) or depth_mode)
+            self._pbvs_lock_depth_mode = depth_mode
+            # Sticky lock id for QA (avoid re-assoc overwriting to small ints).
+            self._pbvs_lock_track_id = self._refine_locked_track_id
+            cam_m = (
+                self._pbvs_cam_metrics(berry, berry_xyz_base)
+                if berry is not None else None)
+            tcp = self._tcp_or_ee_xyz()
+            adir = self._pbvs_approach_dir_base
+            if adir is None and tcp is not None:
+                d = berry_xyz_base - np.asarray(tcp, dtype=np.float64)
+                n = float(np.linalg.norm(d))
+                adir = d / n if n > 1e-6 else np.array([0.0, 0.0, 1.0])
+            if adir is not None:
+                self._pbvs_frozen_approach_dir = np.asarray(
+                    adir, dtype=np.float64).copy()
+            if cam_m:
+                self._pbvs_save_cam_snapshot(
+                    berry, berry_xyz_base,
+                    approach_dir=self._pbvs_frozen_approach_dir,
+                    depth_mode=depth_mode,
+                )
+            d_cam = cam_m.get('d_cam_surface_m') if cam_m else None
+            tcp_d = float(np.linalg.norm(
+                berry_xyz_base - np.asarray(tcp, dtype=np.float64))) if tcp else None
+            travel_surf = self._pbvs_travel_to_surface_m(berry_xyz_base)
+            standoff = self._tip_contact_standoff_m()
+
+            # Canonical single path (oneshot is the same).
+            if self._pbvs_direct_mode():
+                self.get_logger().info(
+                    f'PBVS single LOCK  berry={np.round(berry_xyz_base, 3)} '
+                    f'tid={self._refine_locked_track_id} mode={depth_mode} '
+                    f'd_cam={(d_cam if d_cam is not None else -1)*1000:.1f}mm '
+                    f'travel→surface='
+                    f'{(travel_surf if travel_surf is not None else -1)*1000:.1f}mm '
+                    f'standoff={standoff*1000:.1f}mm '
+                    f'tcp_dist={None if tcp_d is None else round(tcp_d, 3)}')
+                if travel_surf is None:
+                    self._set_state('ERROR', 'pbvs: lock — no cup→surface travel')
+                    return
+                if travel_surf < self._pbvs_contact_exec_tol_m():
+                    self._snap_qa(f'servo_{self._servo_step_idx:02d}_direct_arrive')
+                    self._set_state('WAIT_CONFIRM', 'pbvs_single_at_surface')
+                    return
+                self._pbvs_state = 'DIRECT_ONESHOT'
+                if not self._pbvs_start_direct_oneshot(
+                        berry_xyz_base,
+                        d_cam_surface=(float(d_cam) if d_cam is not None else None)):
+                    self._set_state('ERROR', 'pbvs: single oneshot failed')
+                return
+
+            # Legacy twostage only.
+            if not self._pbvs_twostage_mode():
+                self._set_state('ERROR', f'pbvs: unknown mode={getattr(self._args, "pbvs_mode", "")}')
+                return
+            pre = self._pbvs_pre_grasp_d_cam_m()
+            self.get_logger().info(
+                f'PBVS twostage LOCK  berry={np.round(berry_xyz_base, 3)} '
+                f'tid={self._refine_locked_track_id} mode={depth_mode} '
+                f'd_cam={(d_cam if d_cam is not None else -1)*1000:.1f}mm '
+                f'pre_grasp={pre*1000:.1f}mm '
+                f'tcp_dist={None if tcp_d is None else round(tcp_d, 3)}')
+            self._pbvs_state = 'APPROACH_ONESHOT'
+            if d_cam is None:
+                self._set_state('ERROR', 'pbvs: lock — no d_cam_surface')
+                return
+            travel = float(d_cam) - pre
+            if travel >= 0.002:
+                if not self._pbvs_start_approach_oneshot(
+                        berry_xyz_base, d_cam_surface=float(d_cam)):
+                    self._set_state('ERROR', 'pbvs: approach oneshot failed')
+                return
+            self._pbvs_state = 'DEPTH_FINAL'
+            self._pbvs_run_depth_final()
+            return
+
+        if self._pbvs_state in (
+                'DIRECT_ONESHOT', 'APPROACH_ONESHOT', 'FINAL_ONESHOT', 'DEPTH_FINAL'):
+            if self._move_phase is not None:
+                live = self._pick_probe_live_berry()
+                base = self._berry_base_xyz(live) if live is not None else None
+                if live is not None and base is not None:
+                    ld = self._pbvs_live_d_cam_surface(
+                        live, np.asarray(base, dtype=np.float64))
+                    if ld is not None:
+                        prev = getattr(self, '_pbvs_motion_min_d_cam', None)
+                        self._pbvs_motion_min_d_cam = (
+                            float(ld) if prev is None else min(float(prev), float(ld)))
+            return
 
     def _tick_refining_pbvs(self) -> None:
         """Continuous PBVS loop: track berry in 3-D, servo to standoff, approach.
@@ -5180,73 +6300,235 @@ class ReachFsmNode(Node):
         dt = min(now - self._pbvs_last_tick, 0.2)
         self._pbvs_last_tick = now
 
+        # Global fixed-cam map: do not permanently fall back to EE→berry after a
+        # one-shot TF discovery race at REFINING entry.
+        if not getattr(self, '_pbvs_global_map_ok', False):
+            if now - getattr(self, '_pbvs_global_retry_t', 0.0) >= 0.5:
+                self._pbvs_global_retry_t = now
+                self._build_approach_map_from_global(wait_tf_s=0.75)
+
         # ── Constants ──────────────────────────────────────────────────
-        STANDOFF_M = 0.07          # desired cup-to-berry standoff
-        READY_THRESH = 8e-4        # trace(P) below this → enter APPROACH
-        CONTACT_DIST_M = 0.015     # cup-to-berry triggers DONE
-        PROBE_STEP_DEG = 3.0       # lateral probe delta (joint1)
-        SERVO_DUR_S = 0.15         # trajectory duration per PBVS step
+        STANDOFF_M = 0.07
+        D_NEAR_M = float(getattr(self._args, 'servo_near_handoff_dist_m', 0.08))
+        READY_THRESH = 8e-4
+        SURFACE_M = self._cup_surface_clearance_m()
+        TIP_STANDOFF_M = self._tip_contact_standoff_m()
+        PROBE_STEP_DEG = 3.0
+        # Continuous PBVS (velocity-style): e → v = λ e → diff-IK → move_j
+        PBVS_DT = 0.04
+        PBVS_LAMBDA = 1.2
+        PBVS_V_MAX = 0.08          # m/s mid-range
+        PBVS_V_MAX_NEAR = 0.045    # m/s near contact
+        PBVS_MAX_DQ = 0.05         # rad per tick
+        PBVS_TARGET_SLEW_M = 0.010   # max setpoint step per 25 Hz tick
+        PBVS_GATE_ABORT_STREAK = 15
+        PBVS_SAFETY_TIP_TARGET_M = 0.35
+        PBVS_MONO_V_REJECT_MPS = 0.02
+        PBVS_PROBE_MIN_CUP_M = D_NEAR_M + 0.06   # no active probe near handoff
+        PBVS_CUP_ONESHOT_M = 0.04                # switch to cup_axis below 4 cm
+        PBVS_PROBE_TIMEOUT_S = 3.0
+        PBVS_PROBE_COOLDOWN_S = 4.0
+        PBVS_RGBD_PROBE_MIN_CUP_M = 0.20
+        VISION_LOST_N = int(getattr(self._args, 'pbvs_vision_lost_frames', 3))
+        Z_CAM_NEAR_M = float(getattr(self._args, 'pbvs_vision_z_cam_min', 0.08))
+        NEAR_D_CAM_M = float(getattr(self._args, 'pbvs_near_d_cam_m', 0.12))
+        PBVS_BLIND_CONFIRM_TIMEOUT_S = 20.0
 
         # Depth-source → measurement sigma mapping.
         _DEPTH_SIGMA = {
             'rgbd': 0.005, 'fused_rgbd': 0.005,
+            'depth': 0.012, 'depth_raw': 0.012,
             'da2': 0.012,  'fused_da2': 0.012,
+            'iou_pin': 0.012,
             'mono': 0.025, 'mono_fallback': 0.025,
         }
 
-        # ── 1. Gather latest wrist detection ──────────────────────────
-        # DetectedBerry.pose is PoseStamped → position via .pose.pose.position
-        berries = self._fine if self._fine_is_fresh() else None
+        # ── 0. Fruit lock (same association as legacy refine path) ─────
+        if self._refine_fruit_anchor is None:
+            if self._await_fine_tracker_reset_before_lock():
+                return
+            self._init_refine_fruit_lock()
+            if self._refine_fruit_anchor is None:
+                if now - getattr(self, '_pbvs_init_log_t', 0.0) > 1.0:
+                    self._pbvs_init_log_t = now
+                    self.get_logger().info(
+                        f'PBVS waiting fruit lock: {self._fine_reject_reason()}')
+                return
+
+        # ── 1. Gather locked-track detection (never berries[0]) ───────
+        berry = self._pick_probe_live_berry()
         berry_xyz_base = None
         berry_sigma = 0.025
-        depth_img = getattr(self, '_last_wrist_depth', None)
-        K_wrist = getattr(self, '_wrist_camera_K', None)
-
-        if berries is not None and len(berries.berries) > 0:
-            b = berries.berries[0]
-            # b.pose is PoseStamped in camera/base frame; transform to base_link.
+        depth_mode = ''
+        if berry is not None:
             try:
-                T_base_cam = self._tf_base_cam()
-                if T_base_cam is not None:
-                    p_cam = np.array([b.pose.pose.position.x,
-                                      b.pose.pose.position.y,
-                                      b.pose.pose.position.z, 1.0])
-                    p_base = T_base_cam @ p_cam
-                    berry_xyz_base = p_base[:3]
-                    src = str(getattr(b, 'depth_mode', 'mono'))
-                    berry_sigma = _DEPTH_SIGMA.get(src, 0.020)
+                base = self._berry_base_xyz(berry)
+                if base is not None:
+                    berry_xyz_base = np.array(base, dtype=np.float64)
+                    depth_mode = str(getattr(berry, 'depth_mode', 'mono') or 'mono')
+                    berry_sigma = _DEPTH_SIGMA.get(depth_mode, 0.020)
             except Exception:
                 pass
 
         # ── 2. INIT state: wait for first valid detection ──────────────
         if self._pbvs_state == 'INIT':
             if berry_xyz_base is None:
+                if now - getattr(self, '_pbvs_init_log_t', 0.0) > 1.0:
+                    self._pbvs_init_log_t = now
+                    self.get_logger().info(
+                        f'PBVS INIT waiting berry: {self._fine_reject_reason()}')
                 return
-            self._pbvs_kf.initialize(berry_xyz_base, sigma_init=berry_sigma * 3)
+            lock_sigma = (berry_sigma if self._pbvs_depth_trusted(depth_mode, berry)
+                          else berry_sigma * 3)
+            self._pbvs_kf.initialize(berry_xyz_base, sigma_init=lock_sigma)
+            self._pbvs_lock_depth_mode = depth_mode
+            self._pbvs_entry_lock_xyz = berry_xyz_base.copy()
+            self._pbvs_target_cmd = berry_xyz_base.copy()
+            self._pbvs_kf_reject_streak = 0
             self._pbvs_state = 'SERVO'
             self.get_logger().info(
-                f'PBVS INIT → SERVO  berry_base={berry_xyz_base}')
+                f'PBVS INIT → SERVO  berry_base={np.round(berry_xyz_base, 3)} '
+                f'tid={self._refine_locked_track_id} mode={depth_mode}')
             return
 
-        # ── 3. KF predict + update ────────────────────────────────────
-        self._pbvs_kf.predict(dt)
-        if berry_xyz_base is not None:
-            self._pbvs_kf.update(berry_xyz_base, berry_sigma)
+        # ── CONTACT / DONE ─────────────────────────────────────────────
+        if self._pbvs_state == 'DONE':
+            return
+
+        if self._pbvs_state == 'CONTACT':
+            live_d = self._pbvs_live_d_cam_surface(berry, berry_xyz_base)
+            if live_d is not None and live_d <= SURFACE_M + 0.002:
+                self._snap_qa(f'servo_{self._servo_step_idx:02d}_contact')
+                self._pbvs_finish_contact(
+                    float(live_d), tag='live_cam', d_cam_m=live_d)
+                return
+            if self._pbvs_approach_blind and self._pbvs_contact_sent:
+                sent_t = getattr(self, '_pbvs_contact_sent_t', 0.0)
+                oneshot_done = self._move_phase is None
+                if oneshot_done and sent_t > 0.0:
+                    elapsed = now - sent_t
+                    if live_d is not None and live_d > SURFACE_M + 0.015:
+                        if now - getattr(self, '_pbvs_blind_warn_t', 0.0) >= 2.0:
+                            self._pbvs_blind_warn_t = now
+                            self.get_logger().warn(
+                                f'PBVS blind: oneshot done but live d_cam={live_d*1000:.1f}mm '
+                                f'(need ≤{(SURFACE_M+0.002)*1000:.1f}mm)')
+                    if elapsed > PBVS_BLIND_CONFIRM_TIMEOUT_S:
+                        self._set_state(
+                            'ERROR',
+                            f'pbvs: blind contact unconfirmed '
+                            f'(live d_cam={(live_d if live_d is not None else -1)*1000:.0f}mm '
+                            f'after {elapsed:.0f}s)')
+            return
+
+        # ── 3. KF predict + gated update (SERVO + live APPROACH) ───────
+        if self._pbvs_state in ('SERVO', 'APPROACH') and not self._pbvs_approach_blind:
+            self._pbvs_kf.predict(dt)
+            kf_update = None
+            if berry_xyz_base is not None:
+                skip_meas = False
+                skip_reason = ''
+                if (self._pbvs_mono_depth_mode(depth_mode)
+                        and self._pbvs_last_v_norm > PBVS_MONO_V_REJECT_MPS):
+                    skip_meas = True
+                    skip_reason = 'mono_while_moving'
+                elif str(depth_mode) == 'base_coast':
+                    skip_meas = True
+                    skip_reason = 'base_coast'
+
+                if skip_meas:
+                    if now - self._pbvs_gate_log_t >= 1.0:
+                        self._pbvs_gate_log_t = now
+                        self.get_logger().debug(
+                            f'PBVS KF skip update: {skip_reason} '
+                            f'mode={depth_mode} v={self._pbvs_last_v_norm:.3f}')
+                else:
+                    tip_ref = self._tcp_or_ee_xyz()
+                    cup_dist_ref = None
+                    if tip_ref is not None:
+                        cup_dist_ref = float(np.linalg.norm(
+                            berry_xyz_base - np.asarray(tip_ref, dtype=np.float64)))
+                    physical_max = max(0.08, 0.5 * cup_dist_ref) if (
+                        cup_dist_ref is not None) else 0.12
+                    kf_update = self._pbvs_kf.gated_update(
+                        berry_xyz_base,
+                        berry_sigma,
+                        physical_max_m=physical_max,
+                    )
+                    if kf_update.accepted:
+                        self._pbvs_kf_reject_streak = 0
+                    else:
+                        self._pbvs_kf_reject_streak += 1
+                        if now - self._pbvs_gate_log_t >= 1.0:
+                            self._pbvs_gate_log_t = now
+                            self.get_logger().warn(
+                                f'PBVS KF gated: {kf_update.reason} '
+                                f'|innov|={kf_update.innov_norm:.3f}m '
+                                f'mahal={kf_update.mahal_sq:.1f} '
+                                f'mode={depth_mode} streak={self._pbvs_kf_reject_streak}')
+
+            if self._pbvs_kf_reject_streak >= PBVS_GATE_ABORT_STREAK:
+                self._set_state(
+                    'ERROR',
+                    f'pbvs: {self._pbvs_kf_reject_streak} consecutive KF rejects '
+                    f'(target drift protection)')
+                return
+
+            kf_pos = self._pbvs_kf.position
+            if kf_pos is not None:
+                self._pbvs_slew_target_cmd(kf_pos, max_step_m=PBVS_TARGET_SLEW_M)
+
+        depth_img = getattr(self, '_last_wrist_depth', None)
+        K_wrist = getattr(self, '_wrist_camera_K', None)
 
         # ── 4. PROBE state: active lateral triangulation ──────────────
         if self._pbvs_state == 'PROBE':
             self._tick_pbvs_probe(PROBE_STEP_DEG, berry_xyz_base)
             return
 
-        # Decide whether to trigger an active probe.
+        # Decide whether to trigger an active probe (mid-range only).
+        cup_for_probe = None
+        if self._pbvs_target_cmd is not None:
+            cup_for_probe = self._cup_berry_dist_from(self._pbvs_target_cmd)
         if (self._pbvs_state == 'SERVO'
                 and self._pbvs_kf.needs_active_probe(READY_THRESH * 4)
-                and self._pbvs_probe_q_before is None):
-            self._start_pbvs_probe(PROBE_STEP_DEG)
+                and self._pbvs_probe_q_before is None
+                and (now - getattr(self, '_pbvs_probe_last_t', 0.0)
+                     >= PBVS_PROBE_COOLDOWN_S)
+                and (cup_for_probe is None or cup_for_probe > PBVS_PROBE_MIN_CUP_M)):
+            allow_probe = True
+            lock_mode = str(getattr(self, '_pbvs_lock_depth_mode', '') or '')
+            depth_trusted = (
+                (berry is not None and self._pbvs_depth_trusted(depth_mode, berry))
+                or self._pbvs_depth_trusted(lock_mode))
+            if (depth_trusted
+                    and cup_for_probe is not None
+                    and cup_for_probe > PBVS_RGBD_PROBE_MIN_CUP_M):
+                allow_probe = False
+                if now - self._pbvs_gate_log_t >= 1.0:
+                    self._pbvs_gate_log_t = now
+                    self.get_logger().info(
+                        'PBVS probe suppressed: trusted RGB-D lock still far '
+                        f'(cup={cup_for_probe:.3f}m mode={depth_mode or lock_mode})')
+            if berry_xyz_base is None:
+                allow_probe = False
+            if allow_probe:
+                self._start_pbvs_probe(PROBE_STEP_DEG, berry_xyz_base)
+                return
+
+        target_xyz = self._pbvs_control_target()
+        if target_xyz is None:
             return
 
-        target_xyz = self._pbvs_kf.position
-        if target_xyz is None:
+        tip_now_pre = tip_xyz(self._joint_positions_rad().tolist()) if (
+            self._joint_positions_rad() is not None) else None
+        if (tip_now_pre is not None
+                and float(np.linalg.norm(target_xyz - tip_now_pre))
+                > PBVS_SAFETY_TIP_TARGET_M):
+            self._set_state(
+                'ERROR',
+                f'pbvs: target-tip {float(np.linalg.norm(target_xyz - tip_now_pre)):.3f}m '
+                f'> {PBVS_SAFETY_TIP_TARGET_M:.2f}m safety limit')
             return
 
         # ── 5. Update fused map with wrist frame (every 0.5 s during SERVO) ─
@@ -5286,102 +6568,156 @@ class ReachFsmNode(Node):
                 approach_dir = d / n if n > 1e-6 else np.array([0.0, 0.0, 1.0])
             else:
                 approach_dir = np.array([0.0, 0.0, 1.0])  # last resort: +Z
+        if (self._pbvs_state in ('APPROACH', 'CONTACT')
+                and self._pbvs_approach_blind
+                and self._pbvs_frozen_approach_dir is not None):
+            approach_dir = self._pbvs_frozen_approach_dir
 
-        # ── 6. Check contact / transition to APPROACH ─────────────────
+        # ── 6. Cam metrics, live PBVS setpoint, vision-loss blind ────
         cup_dist = self._cup_berry_dist_from(target_xyz)
-        if cup_dist is not None and cup_dist < CONTACT_DIST_M:
-            self.get_logger().info(f'PBVS DONE: cup_dist={cup_dist*1000:.1f} mm')
-            self._pbvs_state = 'DONE'
-            self._reach_reached_pub.publish(self._bool_msg(True))
-            if self._data_collector is not None:
-                self._data_collector.mark_success()
-                self._data_collector.end_episode()
-            self._set_state('WAIT_CONFIRM', 'pbvs_contact')
+        cup_gap = None
+        gap_axis = self._cup_gap_along_axis(
+            target_xyz, approach_dir=approach_dir)
+        if gap_axis is not None:
+            cup_gap, _ = gap_axis
+
+        cam_m = None
+        d_cam_surface = None
+        if (berry is not None and berry_xyz_base is not None
+                and not self._pbvs_approach_blind):
+            cam_m = self._pbvs_cam_metrics(berry, berry_xyz_base)
+            if cam_m is not None:
+                d_cam_surface = cam_m.get('d_cam_surface_m')
+                self._pbvs_save_cam_snapshot(
+                    berry, berry_xyz_base,
+                    approach_dir=np.asarray(approach_dir, dtype=np.float64),
+                    depth_mode=depth_mode,
+                )
+                self._pbvs_vision_lost_streak = 0
+                z_d = cam_m.get('z_depth_m')
+                near = (
+                    (d_cam_surface is not None and d_cam_surface <= NEAR_D_CAM_M)
+                    or (z_d is not None and z_d <= Z_CAM_NEAR_M))
+                if near:
+                    self._pbvs_had_live_near = True
+                slew = PBVS_TARGET_SLEW_M * (
+                    2.0 if self._pbvs_state == 'APPROACH' else 1.0)
+                self._pbvs_slew_target_cmd(berry_xyz_base, max_step_m=slew)
+                if (self._pbvs_state == 'SERVO' and near
+                        and not getattr(self, '_pbvs_near_logged', False)):
+                    self._pbvs_state = 'APPROACH'
+                    self._pbvs_near_logged = True
+                    self.get_logger().info(
+                        f'PBVS SERVO → APPROACH (live)  d_cam={d_cam_surface*1000:.1f}mm '
+                        f'tcp={cup_dist*1000:.1f}mm z_depth={(z_d or -1)*1000:.0f}mm '
+                        f'pix_err={cam_m.get("pix_err_px")}')
+                    self._pbvs_log_vision_event('near_enter', {
+                        'd_cam_surface_m': d_cam_surface,
+                        'tcp_dist_m': cup_dist,
+                        'cup_gap_m': cup_gap,
+                        'depth_mode': depth_mode,
+                    })
+                if (self._pbvs_state == 'APPROACH'
+                        and d_cam_surface is not None
+                        and not self._pbvs_contact_sent):
+                    surface = self._cup_surface_clearance_m()
+                    if d_cam_surface <= surface + 0.002:
+                        self._pbvs_finish_contact(
+                            float(d_cam_surface), tag='live_cam', d_cam_m=d_cam_surface)
+                        return
+                    if d_cam_surface <= PBVS_CUP_ONESHOT_M:
+                        if self._pbvs_start_contact_oneshot(
+                                berry_xyz_base, float(d_cam_surface),
+                                approach_dir=np.asarray(
+                                    approach_dir, dtype=np.float64)):
+                            return
+        elif not self._pbvs_approach_blind:
+            if self._pbvs_blind_eligible(
+                    getattr(self, '_pbvs_cam_snapshot', None),
+                    near_d_cam_m=NEAR_D_CAM_M,
+                    z_cam_near_m=Z_CAM_NEAR_M):
+                self._pbvs_vision_lost_streak += 1
+                if self._pbvs_vision_lost_streak >= VISION_LOST_N:
+                    if self._pbvs_enter_blind_approach(
+                            np.asarray(approach_dir, dtype=np.float64),
+                            near_d_cam_m=NEAR_D_CAM_M,
+                            z_cam_near_m=Z_CAM_NEAR_M):
+                        return
+            elif self._pbvs_vision_lost_streak > 0:
+                self._pbvs_vision_lost_streak = 0
+
+        if self._pbvs_approach_blind or self._pbvs_contact_sent:
+            if self._pbvs_state == 'CONTACT':
+                return
+            # Blind segment handled by oneshot; skip streaming PBVS.
             return
 
-        if (self._pbvs_state == 'SERVO'
-                and not self._pbvs_kf.needs_active_probe(READY_THRESH)
-                and cup_dist is not None
-                and cup_dist < STANDOFF_M * 1.3):
-            self._pbvs_state = 'APPROACH'
-            self.get_logger().info(
-                f'PBVS SERVO → APPROACH  dist={cup_dist*100:.1f} cm')
+        target_xyz = self._pbvs_control_target()
+        if target_xyz is None:
+            return
 
-        # ── 7. IK and execution ───────────────────────────────────────
+        # ── 7. Continuous velocity PBVS: v=λe → diff-IK → stream ──────
+        q_current = self._joint_positions_rad()
+        if q_current is None:
+            return
+        # Always trust joint feedback (never open-loop integrate commanded q).
+        tip_now = tip_xyz(q_current.tolist())
+
         if self._pbvs_state == 'APPROACH':
-            # Freeze KF: go straight to berry, cup axis auto-aimed by IK.
-            standoff_xyz = target_xyz.copy()
-            q_current = self._joint_positions_rad()
-            if q_current is None:
-                return
-            try:
-                from piper_position_ik import cup_axis_ik
-                q_target = cup_axis_ik(
-                    tuple(standoff_xyz.tolist()), tuple(target_xyz.tolist()), q_current)
-            except Exception as exc:
-                self.get_logger().warn(f'PBVS APPROACH IK failed: {exc}')
-                return
+            p_des = target_xyz - approach_dir * float(TIP_STANDOFF_M)
+            v_max = PBVS_V_MAX_NEAR
         else:
-            # SERVO: aim for standoff point; cup axis auto-aimed toward berry by IK.
-            standoff_xyz = target_xyz - approach_dir * STANDOFF_M
-            q_current = self._joint_positions_rad()
-            if q_current is None:
-                return
-            try:
-                from piper_position_ik import cup_axis_ik
-                q_target = cup_axis_ik(
-                    tuple(standoff_xyz.tolist()), tuple(target_xyz.tolist()), q_current)
-            except Exception as exc:
-                self.get_logger().warn(f'PBVS SERVO IK failed: {exc}')
-                return
+            # Mid: tip standoff along approach direction.
+            p_des = target_xyz - approach_dir * STANDOFF_M
+            v_max = PBVS_V_MAX
 
-        if q_target is None:
+        err = np.asarray(p_des, dtype=np.float64) - tip_now
+        err_n = float(np.linalg.norm(err))
+        if err_n < 1e-4:
             return
-        self._send_joint_servo_goal(q_target, duration_s=SERVO_DUR_S)
+        # Classical PBVS: v = λ (p_des − p); never invert this sign.
+        v = PBVS_LAMBDA * err
+        speed = float(np.linalg.norm(v))
+        if speed > v_max:
+            v *= v_max / speed
+        self._pbvs_last_v_norm = float(min(speed, v_max))
 
-        # Goal 4: log REFINING step for visualisation.
-        if self._data_collector is not None and self._data_collector.active:
+        q_new = cartesian_velocity_step(
+            q_current.tolist(), v, dt=PBVS_DT, max_dq=PBVS_MAX_DQ)
+        # Short preemptible traj (~teleop), not blocking settle.
+        self._stream_joint_goal(q_new, traj_s=max(0.12, PBVS_DT * 3.0))
+
+        if now - getattr(self, '_pbvs_stream_log_t', 0.0) >= 1.0:
+            self._pbvs_stream_log_t = now
+            self.get_logger().info(
+                f'PBVS stream {self._pbvs_state}: '
+                f'd_cam={None if d_cam_surface is None else round(d_cam_surface, 3)} '
+                f'gap={None if cup_gap is None else round(cup_gap, 3)} '
+                f'tcp={None if cup_dist is None else round(cup_dist, 3)} '
+                f'|e|={err_n:.3f} |v|={min(speed, v_max):.3f} '
+                f'tip={np.round(tip_now, 3)} des={np.round(p_des, 3)}')
+
+        if now - getattr(self, '_pbvs_stream_snap_t', 0.0) >= 2.0:
+            self._pbvs_stream_snap_t = now
+            tag = f'servo_{self._servo_step_idx:02d}_stream'
+            self._snap_qa(tag)
+            self._servo_step_idx += 1
+
+        # Goal 4: sparse BC log (not every 25 Hz tick).
+        if (self._data_collector is not None and self._data_collector.active
+                and int(now * 5) != int((now - PBVS_DT) * 5)):
             iw, ih = self._wrist_image_wh()
-            _joints = self._joints or []
-            refine_obs: dict = {
-                'joint1_deg': math.degrees(_joints[0]) if len(_joints) > 0 else 0.0,
-                'joint2_deg': math.degrees(_joints[1]) if len(_joints) > 1 else 0.0,
-                'joint3_deg': math.degrees(_joints[2]) if len(_joints) > 2 else 0.0,
-                'joint5_deg': math.degrees(_joints[4]) if len(_joints) > 4 else 0.0,
-                'fine_cx': float(iw / 2),
-                'fine_cy': float(ih / 2),
+            refine_obs = {
+                'joint1_deg': math.degrees(q_new[0]),
+                'joint2_deg': math.degrees(q_new[1]),
+                'joint3_deg': math.degrees(q_new[2]),
+                'joint5_deg': math.degrees(q_new[4]),
                 'cup_dist_m': float(cup_dist) if cup_dist is not None else 0.0,
                 'kf_uncertainty': float(self._pbvs_kf.uncertainty()),
-                'fine_viz_annotated': 1.0,  # wrist image already has bbox overlay
+                'kf_reject_streak': int(self._pbvs_kf_reject_streak),
+                'err_m': err_n,
+                'v_mps': float(min(speed, v_max)),
             }
-            if target_xyz is not None:
-                refine_obs.update({'kf_px': float(target_xyz[0]),
-                                   'kf_py': float(target_xyz[1]),
-                                   'kf_pz': float(target_xyz[2])})
-            if berries is not None and len(berries.berries) > 0:
-                b = berries.berries[0]
-                fu, fv = float(b.image_u), float(b.image_v)
-                if fu >= 0 and fv >= 0:
-                    refine_obs.update({
-                        'fine_visible': 1.0,
-                        'fine_u': fu, 'fine_v': fv,
-                        'fine_du': float(fu - iw / 2),
-                        'fine_dv': float(fv - ih / 2),
-                        'fine_confidence': float(b.confidence),
-                    })
-                else:
-                    refine_obs['fine_visible'] = 0.0
-            else:
-                refine_obs['fine_visible'] = 0.0
-
-            refine_action = {
-                'action': 'servo',
-                'phase': 'refining',
-                'source': 'pbvs',
-                'reason': (f'{self._pbvs_state}'
-                           + (f' cup={cup_dist*100:.1f}cm' if cup_dist else '')),
-            }
-            # Prefer fine_viz (already has YOLO overlay) for wrist image.
             wrist_img = (self._qa_rgb_fine_viz if self._qa_rgb_fine_viz is not None
                          else self._qa_rgb_wrist)
             if wrist_img is not None and self._qa_rgb_fixed is not None:
@@ -5389,100 +6725,480 @@ class ReachFsmNode(Node):
                     global_img=self._qa_rgb_fixed,
                     wrist_img=wrist_img,
                     obs=refine_obs,
-                    action=refine_action,
+                    action={
+                        'action': 'pbvs_stream',
+                        'phase': self._pbvs_state,
+                        'source': 'diff_ik',
+                    },
                 )
 
-    def _start_pbvs_probe(self, step_deg: float) -> None:
+    def _joint_positions_rad(self) -> Optional[np.ndarray]:
+        """Current arm joints as float64 rad vector (len 6), or None if unset."""
+        if not self._joints or len(self._joints) < 6:
+            return None
+        return np.array([float(v) for v in self._joints[:6]], dtype=np.float64)
+
+    def _start_pbvs_probe(self, step_deg: float,
+                          berry_xyz_base: Optional[np.ndarray] = None) -> None:
         """Initiate a lateral probe step to triangulate berry 3-D position."""
         q = self._joint_positions_rad()
         if q is None:
             return
         self._pbvs_probe_q_before = q.copy()
         self._pbvs_probe_obs_list = []
+        if berry_xyz_base is not None:
+            self._pbvs_probe_entry_obs = np.asarray(
+                berry_xyz_base, dtype=np.float64).copy()
+            self._pbvs_probe_obs_list.append(self._pbvs_probe_entry_obs.copy())
+        else:
+            self._pbvs_probe_entry_obs = None
+        self._pbvs_probe_return_pending = False
+        self._pbvs_probe_started_t = time.time()
+        self._pbvs_probe_last_t = self._pbvs_probe_started_t
         self._pbvs_state = 'PROBE'
         # Step joint1 laterally.
         q_probe = q.copy()
         q_probe[0] += float(np.radians(step_deg))
-        self._send_joint_servo_goal(q_probe, duration_s=0.4)
-        self.get_logger().info(f'PBVS active probe: step_deg={step_deg}')
+        self._send_joint_servo_goal(
+            [float(v) for v in q_probe.tolist()],
+            tag='pbvs_probe', traj_s=0.4)
+        self._pbvs_qa_log_event('probe_start', {
+            'step_deg': float(step_deg),
+            'entry_obs': (self._pbvs_probe_entry_obs.tolist()
+                          if self._pbvs_probe_entry_obs is not None else None),
+        })
+        self.get_logger().info(
+            f'PBVS active probe: step_deg={step_deg} '
+            f'entry_obs={len(self._pbvs_probe_obs_list)}')
 
     def _tick_pbvs_probe(self, step_deg: float,
                          berry_xyz_base) -> None:
         """Collect probe observation and return to original pose."""
-        if berry_xyz_base is not None:
-            self._pbvs_probe_obs_list.append(berry_xyz_base)
+        del step_deg  # fixed step configured at start
+        now = time.time()
+        if self._pbvs_probe_q_before is None:
+            self._pbvs_state = 'SERVO'
+            return
 
-        # After one lateral step and one observation: update KF with average.
-        if len(self._pbvs_probe_obs_list) >= 1 and self._pbvs_probe_q_before is not None:
+        if berry_xyz_base is not None:
+            obs = np.asarray(berry_xyz_base, dtype=np.float64).copy()
+            if not self._pbvs_probe_obs_list:
+                self._pbvs_probe_obs_list.append(obs)
+            else:
+                prev = np.asarray(self._pbvs_probe_obs_list[-1], dtype=np.float64)
+                if float(np.linalg.norm(obs - prev)) > 1e-4:
+                    self._pbvs_probe_obs_list.append(obs)
+
+        elapsed = now - float(getattr(self, '_pbvs_probe_started_t', now))
+
+        if not self._pbvs_probe_return_pending:
+            if self._move_phase is not None:
+                return
+            if elapsed < 0.45:
+                return
             if len(self._pbvs_probe_obs_list) >= 2:
                 triangulated = np.mean(self._pbvs_probe_obs_list, axis=0)
-                self._pbvs_kf.update_triangulated(triangulated, sigma_meas=0.004)
+                gate = self._pbvs_kf.gated_update_triangulated(
+                    triangulated, sigma_meas=0.004, physical_max_m=0.10)
+                if gate.accepted:
+                    kf_pos = self._pbvs_kf.position
+                    if kf_pos is not None:
+                        self._pbvs_slew_target_cmd(kf_pos, max_step_m=0.015)
+                    self._pbvs_probe_success_n += 1
+                else:
+                    self._pbvs_probe_fail_n += 1
+                self._pbvs_qa_log_event('probe_triangulated', {
+                    'accepted': bool(gate.accepted),
+                    'reason': gate.reason,
+                    'n_obs': int(len(self._pbvs_probe_obs_list)),
+                    'triangulated': np.asarray(triangulated).tolist(),
+                    'mahal_sq': float(gate.mahal_sq),
+                    'innov_norm': float(gate.innov_norm),
+                    'uncertainty': float(self._pbvs_kf.uncertainty()),
+                })
                 self.get_logger().info(
                     f'PBVS probe triangulated: {triangulated}  '
-                    f'uncertainty→{self._pbvs_kf.uncertainty()*1e6:.1f} µm²')
-            # Return to original pose.
-            self._send_joint_servo_goal(self._pbvs_probe_q_before, duration_s=0.4)
-            self._pbvs_probe_q_before = None
-            self._pbvs_probe_obs_list = []
-            self._pbvs_state = 'SERVO'
+                    f'gate={gate.reason} uncertainty→'
+                    f'{self._pbvs_kf.uncertainty()*1e6:.1f} µm²')
+            elif elapsed > 3.0:
+                self._pbvs_probe_fail_n += 1
+                self._pbvs_qa_log_event('probe_timeout', {
+                    'elapsed_s': float(elapsed),
+                    'n_obs': int(len(self._pbvs_probe_obs_list)),
+                })
+                self.get_logger().warn(
+                    f'PBVS probe timeout ({elapsed:.1f}s, '
+                    f'n_obs={len(self._pbvs_probe_obs_list)}) — skip triangulation')
+            else:
+                return
+            q_back = [float(v) for v in list(self._pbvs_probe_q_before)[:6]]
+            self._send_joint_servo_goal(
+                q_back, tag='pbvs_probe_return', traj_s=0.4)
+            self._pbvs_probe_return_pending = True
+            return
+
+        if self._move_phase is not None:
+            return
+        self._pbvs_probe_q_before = None
+        self._pbvs_probe_obs_list = []
+        self._pbvs_probe_entry_obs = None
+        self._pbvs_probe_return_pending = False
+        self._pbvs_probe_started_t = 0.0
+        self._pbvs_state = 'SERVO'
+        self.get_logger().info('PBVS probe → SERVO')
+
+    def _cup_tip_offset_link6(self) -> np.ndarray:
+        """Soft-cup tip (= opening) in link6. GT-fit 20260812 (table Z − 12mm)."""
+        return np.array([0.0, 0.01883, 0.06152], dtype=np.float64)
+
+    def _cup_rim_z_m(self) -> float:
+        """Deprecated: tip IS the opening; kept only for CLI compat."""
+        return float(getattr(self._args, 'cup_rim_z', 0.0))
+
+    def _berry_radius_m(self) -> float:
+        return float(getattr(self._args, 'berry_radius', 0.008))
+
+    def _cup_surface_clearance_m(self) -> float:
+        return float(getattr(self._args, 'cup_surface_clearance_m', 0.003))
+
+    def _tip_contact_standoff_m(self) -> float:
+        """Cup↔locked contact point clearance (m).
+
+        Wrist depth at bbox/mask center is range to *surface* along the ray;
+        UV+depth back-project yields that surface point in base_link — not a
+        sphere center. Do not add/subtract berry_radius here."""
+        return self._cup_surface_clearance_m()
+
+    def _pbvs_contact_exec_tol_m(self) -> float:
+        """Open-loop execution: cup↔frozen lock residual trigger (m).
+
+        PBVS single runs blind after lock — no live tracking during motion."""
+        if self._pbvs_direct_mode():
+            return 0.0005
+        return 0.002
+
+    def _pbvs_direct_max_shots(self) -> int:
+        return max(2, int(getattr(self._args, 'pbvs_direct_max_shots', 4)))
+
+    def _pbvs_min_oneshot_travel_m(self) -> float:
+        if self._pbvs_direct_mode():
+            return 0.0005
+        return 0.002
+
+    def _pbvs_ik_tol_m(self) -> float:
+        if self._pbvs_direct_mode():
+            return 5e-4
+        return 2.5e-3
+
+    def _pbvs_pre_grasp_d_cam_m(self) -> float:
+        """Cam-frame cup↔berry surface distance for oneshot pre-grasp (m)."""
+        return float(getattr(self._args, 'pbvs_pre_grasp_d_cam_m', 0.08))
+
+    def _pbvs_d_cam_surface_from_base(self, berry_base: np.ndarray) -> Optional[float]:
+        """Cup↔locked surface contact gap in cam frame (m)."""
+        berry_cam = self._base_xyz_to_cam(
+            tuple(float(v) for v in np.asarray(berry_base, dtype=np.float64).flatten()[:3]))
+        cup_open = self._cup_open_cam_xyz()
+        if berry_cam is None or cup_open is None:
+            return None
+        d_cam = float(np.linalg.norm(
+            np.asarray(berry_cam, dtype=np.float64) - np.asarray(cup_open, dtype=np.float64)))
+        return d_cam - self._cup_surface_clearance_m()
+
+    def _link6_pose(self, q=None) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        if q is None:
+            q = self._joint_positions_rad()
+        if q is None:
+            return None
+        R, p = fk_link6(list(q))
+        return R, np.asarray(p, dtype=np.float64)
+
+    def _cup_axis_base(self, q=None) -> Optional[np.ndarray]:
+        lp = self._link6_pose(q)
+        if lp is None:
+            return None
+        R, _ = lp
+        axis = R @ np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        n = float(np.linalg.norm(axis))
+        return axis / n if n > 1e-6 else None
+
+    def _cup_open_cam_xyz(self) -> Optional[np.ndarray]:
+        """Cup opening (not TCP) in wrist optical frame."""
+        cup = self._cup_open_xyz()
+        if cup is None:
+            return None
+        cam = self._base_xyz_to_cam(tuple(float(v) for v in cup))
+        if cam is None:
+            return None
+        return np.asarray(cam, dtype=np.float64)
+
+    def _pbvs_cam_metrics(
+        self,
+        berry: Optional[DetectedBerry],
+        berry_xyz_base: Optional[np.ndarray],
+    ) -> Optional[Dict]:
+        """Camera-frame cup_open↔berry distance (primary PBVS near metric)."""
+        if berry is None or berry_xyz_base is None:
+            return None
+        berry_cam = self._berry_cam_xyz(berry)
+        cup_open_cam = self._cup_open_cam_xyz()
+        tcp = self._tcp_or_ee_xyz()
+        geo = None
+        if tcp is not None:
+            geo = self._cup_berry_geometry(
+                tuple(float(v) for v in np.asarray(berry_xyz_base).flatten()[:3]),
+                tcp,
+                berry_cam,
+            )
+        d_cam = None
+        d_cam_surface = None
+        if berry_cam is not None and cup_open_cam is not None:
+            bc = np.asarray(berry_cam, dtype=np.float64)
+            cc = np.asarray(cup_open_cam, dtype=np.float64)
+            d_cam = float(np.linalg.norm(bc - cc))
+            d_cam_surface = d_cam - self._cup_surface_clearance_m()
+        z_d = float(getattr(berry, 'z_depth_m', -1.0))
+        z_m = float(getattr(berry, 'z_mono_m', -1.0))
+        pix_err = None
+        if geo and geo.get('berry_uv') and geo.get('cup_uv'):
+            bu, bv = geo['berry_uv']
+            cu, cv_ = geo['cup_uv']
+            pix_err = float(math.hypot(bu - cu, bv - cv_))
+        return {
+            'd_cam_m': d_cam,
+            'd_cam_surface_m': d_cam_surface,
+            'berry_cam': geo.get('berry_cam') if geo else (
+                list(berry_cam) if berry_cam else None),
+            'cup_open_cam': list(cup_open_cam) if cup_open_cam is not None else None,
+            'cup_cam': geo.get('cup_cam') if geo else None,
+            'berry_uv': geo.get('berry_uv') if geo else None,
+            'cup_uv': geo.get('cup_uv') if geo else None,
+            'pix_err_px': pix_err,
+            'z_depth_m': z_d if z_d > 1e-4 else None,
+            'z_mono_m': z_m if z_m > 1e-4 else None,
+            'berry_base': np.asarray(
+                berry_xyz_base, dtype=np.float64).flatten()[:3].tolist(),
+        }
+
+    def _pbvs_save_cam_snapshot(
+        self,
+        berry: DetectedBerry,
+        berry_xyz_base: np.ndarray,
+        *,
+        approach_dir: np.ndarray,
+        depth_mode: str,
+    ) -> None:
+        cam_m = self._pbvs_cam_metrics(berry, berry_xyz_base)
+        if cam_m is None:
+            return
+        self._pbvs_cam_snapshot = {
+            **cam_m,
+            'approach_dir': np.asarray(approach_dir, dtype=np.float64).tolist(),
+            'depth_mode': depth_mode,
+            'track_id': self._refine_locked_track_id,
+            't': time.time(),
+        }
+
+    def _pbvs_live_d_cam_surface(
+        self,
+        berry: Optional[DetectedBerry],
+        berry_xyz_base: Optional[np.ndarray],
+    ) -> Optional[float]:
+        if berry is None or berry_xyz_base is None:
+            return None
+        cam_m = self._pbvs_cam_metrics(berry, berry_xyz_base)
+        if not cam_m:
+            return None
+        d = cam_m.get('d_cam_surface_m')
+        return float(d) if d is not None else None
+
+    def _pbvs_blind_eligible(
+        self,
+        snap: Optional[Dict],
+        *,
+        near_d_cam_m: float,
+        z_cam_near_m: float,
+    ) -> bool:
+        """Blind oneshot only after genuine near-phase live vision."""
+        if not getattr(self, '_pbvs_had_live_near', False):
+            return False
+        if self._pbvs_state != 'APPROACH':
+            return False
+        if not snap or snap.get('berry_base') is None:
+            return False
+        d_cam = snap.get('d_cam_surface_m')
+        if d_cam is None:
+            d_cam = snap.get('d_cam_m')
+        if d_cam is None or float(d_cam) > float(near_d_cam_m):
+            return False
+        z_d = snap.get('z_depth_m')
+        if z_d is not None and float(z_d) > float(z_cam_near_m):
+            return False
+        return True
+
+    def _pbvs_log_vision_event(self, kind: str, extra: Optional[Dict] = None) -> None:
+        snap = dict(self._pbvs_cam_snapshot or {})
+        if extra:
+            snap.update(extra)
+        snap['event'] = kind
+        fname = 'pbvs_vision_lost.json' if kind == 'vision_lost' else 'pbvs_vision_snapshot.json'
+        self._write_qa_json(fname, snap)
+        self._pbvs_qa_log_event(kind, snap)
+
+    def _pbvs_enter_blind_approach(
+        self,
+        approach_dir: np.ndarray,
+        *,
+        near_d_cam_m: float,
+        z_cam_near_m: float,
+    ) -> bool:
+        """Vision lost in near range: blind cup_axis oneshot from last cam snapshot."""
+        if self._pbvs_approach_blind or self._pbvs_contact_sent:
+            return False
+        snap = self._pbvs_cam_snapshot
+        if not self._pbvs_blind_eligible(
+                snap, near_d_cam_m=near_d_cam_m, z_cam_near_m=z_cam_near_m):
+            d_cam = (snap or {}).get('d_cam_surface_m')
+            self.get_logger().warn(
+                'PBVS blind rejected: need APPROACH+near live snapshot '
+                f'(had_near={self._pbvs_had_live_near} state={self._pbvs_state} '
+                f'd_cam={(d_cam if d_cam is not None else -1)*1000:.0f}mm '
+                f'z={(snap or {}).get("z_depth_m")})')
+            return False
+        self._pbvs_approach_blind = True
+        self._pbvs_state = 'APPROACH'
+        self._pbvs_frozen_approach_dir = np.asarray(
+            approach_dir, dtype=np.float64).copy()
+        d_cam = snap.get('d_cam_surface_m')
+        if d_cam is None:
+            d_cam = snap.get('d_cam_m')
+        berry = np.asarray(snap['berry_base'], dtype=np.float64)
+        self._pbvs_log_vision_event('vision_lost', {
+            'vision_lost_streak': int(self._pbvs_vision_lost_streak),
+            'd_cam_at_loss_m': d_cam,
+        })
+        self.get_logger().info(
+            f'PBVS vision lost → blind oneshot  d_cam={(d_cam if d_cam is not None else -1)*1000:.1f}mm '
+            f'z_depth={(snap.get("z_depth_m") or -1)*1000:.0f}mm '
+            f'pix_err={snap.get("pix_err_px")}')
+        surface = self._cup_surface_clearance_m()
+        if d_cam is not None and d_cam <= surface + 0.002:
+            self._pbvs_finish_contact(float(d_cam), tag='blind_at_loss', d_cam_m=d_cam)
+            return True
+        if d_cam is not None and d_cam <= near_d_cam_m:
+            return self._pbvs_start_contact_oneshot(
+                berry, float(d_cam), approach_dir=self._pbvs_frozen_approach_dir)
+        return False
+
+    def _cup_open_xyz(self, q=None) -> Optional[np.ndarray]:
+        """Cup opening in base_link — same point as tip (TCP), link6+[0,0,0.075]."""
+        lp = self._link6_pose(q)
+        if lp is None:
+            return None
+        R, p = lp
+        return p + R @ self._cup_tip_offset_link6()
+
+    def _cup_gap_along_axis(
+        self,
+        berry_xyz_base: np.ndarray,
+        *,
+        approach_dir: Optional[np.ndarray] = None,
+        q=None,
+    ) -> Optional[Tuple[float, np.ndarray]]:
+        """Cup opening → locked surface contact gap along approach axis (m).
+
+        ``berry_xyz_base`` is the depth-backprojected surface point (bbox center),
+        not a modeled sphere center."""
+        cup = self._cup_open_xyz(q)
+        if cup is None:
+            return None
+        berry = np.asarray(berry_xyz_base, dtype=np.float64).flatten()[:3]
+        axis = None
+        if approach_dir is not None:
+            axis = np.asarray(approach_dir, dtype=np.float64).flatten()[:3]
+        if axis is None or float(np.linalg.norm(axis)) < 1e-6:
+            axis = self._cup_axis_base(q)
+        if axis is None or float(np.linalg.norm(axis)) < 1e-6:
+            axis = berry - cup
+        n = float(np.linalg.norm(axis))
+        if n < 1e-6:
+            return None
+        axis = axis / n
+        axial = float(np.dot(berry - cup, axis))
+        gap = axial - self._cup_surface_clearance_m()
+        return gap, axis
 
     def _cup_berry_dist_from(self, berry_xyz_base: np.ndarray) -> float | None:
-        """Distance from TCP to a given berry position in base_link frame."""
+        """Legacy TCP↔berry-center Euclidean distance (m)."""
         tcp = self._tcp_or_ee_xyz()
         if tcp is None:
             return None
         diff = np.array(berry_xyz_base) - np.array(tcp)
         return float(np.linalg.norm(diff))
 
-    def _tf_base_cam(self):
-        """Look up T_base_cam (4×4) from TF2, returns None on failure."""
+    def _tf_base_cam(self, *, wait_s: float = 0.25):
+        """Look up T_base←wrist_optical (4×4)."""
+        parent = self._args.base_frame
+        child = getattr(
+            self._args, 'wrist_camera_frame', 'camera_wrist_color_optical_frame')
         try:
-            from tf2_ros import TransformException
+            if not self._tf_buffer.can_transform(
+                    parent, child, rclpy.time.Time(),
+                    timeout=rclpy.duration.Duration(seconds=max(0.0, float(wait_s)))):
+                return None
             tf_msg = self._tf_buffer.lookup_transform(
-                self._base_frame,
-                getattr(self, '_wrist_camera_frame', 'camera_wrist_color_optical_frame'),
-                rclpy.time.Time(),
-                timeout=rclpy.duration.Duration(seconds=0.05),
-            )
-            from picking_perception.perception_utils import matrix_from_tf
-            return matrix_from_tf(tf_msg.transform)
+                parent, child, rclpy.time.Time())
+            return _matrix_from_tf(tf_msg)
         except Exception:
             return None
 
-    def _tf_fixed_cam(self):
-        """Look up T_base_fixed_cam (4×4) from TF2, returns None on failure."""
+    def _tf_fixed_cam(self, *, wait_s: float = 0.25):
+        """Look up T_base←fixed_optical (4×4). wait_s blocks until TF is ready."""
+        parent = self._args.base_frame
+        child = self._fixed_camera_frame
         try:
+            # can_transform blocks up to wait_s — covers listener discovery race.
+            if not self._tf_buffer.can_transform(
+                    parent, child, rclpy.time.Time(),
+                    timeout=rclpy.duration.Duration(seconds=max(0.0, float(wait_s)))):
+                self.get_logger().warn(
+                    f'FusedApproachMap: TF not ready {parent}←{child} '
+                    f'after {wait_s:.2f}s')
+                return None
             tf_msg = self._tf_buffer.lookup_transform(
-                self._base_frame,
-                self._fixed_camera_frame,
-                rclpy.time.Time(),
-                timeout=rclpy.duration.Duration(seconds=0.05),
-            )
-            from picking_perception.perception_utils import matrix_from_tf
-            return matrix_from_tf(tf_msg.transform)
-        except Exception:
+                parent, child, rclpy.time.Time())
+            # TransformStamped — local helper expects .transform.translation
+            return _matrix_from_tf(tf_msg)
+        except Exception as exc:
+            self.get_logger().warn(
+                f'FusedApproachMap: TF {parent}←{child} failed: {exc}')
             return None
 
-    def _build_approach_map_from_global(self) -> None:
+    def _build_approach_map_from_global(self, *, wait_tf_s: float = 0.25) -> None:
         """Feed global RGB-D frame into fused map and update approach direction.
 
-        Skipped silently when no global depth is available or _fused_map hasn't
-        been created yet (non-PBVS mode / align_only).
+        Skipped when no global depth is available or _fused_map hasn't been
+        created yet (non-PBVS mode / align_only). On TF race, leaves
+        ``_pbvs_global_map_ok`` False so PBVS ticks can retry.
         """
         fused_map = getattr(self, '_fused_map', None)
         if fused_map is None:
             return
         if self._last_fixed_depth is None or self._fixed_camera_K is None:
-            self.get_logger().info(
-                'FusedApproachMap: skipped global frame (no depth/K yet)')
+            if time.time() - getattr(self, '_pbvs_global_retry_t', 0.0) < 0.05:
+                # Avoid log spam when called from rapid entry+tick.
+                pass
+            else:
+                self.get_logger().info(
+                    'FusedApproachMap: waiting for global depth/K')
             return
         if self._locked is None:
+            self.get_logger().warn(
+                'FusedApproachMap: skipped global frame (no locked berry)')
             return
         try:
-            T = self._tf_fixed_cam()
+            T = self._tf_fixed_cam(wait_s=wait_tf_s)
             if T is None:
-                self.get_logger().warn(
-                    'FusedApproachMap: TF camera_fixed→base_link unavailable')
                 return
             p = self._locked.pose.pose.position
             berry = np.array([float(p.x), float(p.y), float(p.z)])
@@ -5490,6 +7206,7 @@ class ReachFsmNode(Node):
             n = fused_map.add_frame(
                 self._last_fixed_depth, self._fixed_camera_K, T, berry)
             self._pbvs_approach_dir_base = fused_map.get_approach_dir(berry, ee)
+            self._pbvs_global_map_ok = True
             self.get_logger().info(
                 f'FusedApproachMap: +{n} pts from global cam '
                 f'(total {fused_map.n_points}), '
@@ -5530,9 +7247,6 @@ class ReachFsmNode(Node):
             self._set_state(
                 'ERROR',
                 f'refine/servo timeout — need wrist fine berry + contact; {why}')
-            return
-
-        if not self._locked_track_live_synced():
             return
 
         # No small-step range: plan center oneshot from current mono lock immediately.
@@ -5697,7 +7411,8 @@ class ReachFsmNode(Node):
         traj_s: Optional[float] = None,
     ) -> bool:
         max_dj = max(abs(target[i] - self._joints[i]) for i in range(6))
-        if max_dj < math.radians(0.12):
+        min_dj = math.radians(0.12)
+        if max_dj < min_dj:
             self.get_logger().info(f'REFINING {tag}: joint delta tiny — waiting')
             if tag == 'servo':
                 self._servo_pending_record = None
@@ -5799,6 +7514,72 @@ class ReachFsmNode(Node):
         target[5] = 0.0
         return self._clamp_servo_target(target)
 
+    def _plan_tip_to_surface_delta(
+        self,
+        berry: Tuple[float, float, float],
+        step_m: float,
+    ) -> Optional[Tuple[np.ndarray, np.ndarray, str, Dict]]:
+        """Single/direct: translate tip along cup→berry by ``step_m``.
+
+        Landing is the surface point on the current tip→berry ray
+        (berry − standoff × dir). Same geometry as the old tip-residual nudge,
+        computed once instead of after a cup-axis slide.
+        """
+        tcp = self._tcp_or_ee_xyz()
+        cup = self._cup_open_xyz()
+        origin = cup if cup is not None else tcp
+        if origin is None or step_m < 1e-4:
+            return None
+        berry_a = np.asarray(berry, dtype=np.float64).flatten()[:3]
+        p0 = np.asarray(origin, dtype=np.float64).flatten()[:3]
+        rel = berry_a - p0
+        dist = float(np.linalg.norm(rel))
+        if dist < 1e-4:
+            return None
+        d_base = rel * (float(step_m) / dist)
+        T = self._lookup_T_base_cam()
+        if T is not None:
+            d_cam = T[:3, :3].T @ d_base
+        else:
+            d_cam = np.array([0.0, 0.0, float(step_m)], dtype=np.float64)
+        meta: Dict = {
+            'dir_base': (rel / dist).tolist(),
+            'dist_center_m': dist,
+            'cup_open': p0.tolist(),
+        }
+        return d_cam, d_base, 'tip_to_surface', meta
+
+    def _plan_cup_axis_oneshot_delta(
+        self,
+        berry: Tuple[float, float, float],
+        step_m: float,
+    ) -> Optional[Tuple[np.ndarray, np.ndarray, str, Dict]]:
+        """Legacy twostage: translate along link6 +Z (cup axis) toward berry."""
+        axis = self._cup_axis_base()
+        cup = self._cup_open_xyz()
+        if axis is None or cup is None or step_m < 1e-4:
+            return None
+        berry_a = np.asarray(berry, dtype=np.float64)
+        cup_a = np.asarray(cup, dtype=np.float64)
+        rel = berry_a - cup_a
+        sign = 1.0 if float(np.dot(rel, axis)) >= 0.0 else -1.0
+        d_base = axis * (sign * float(step_m))
+        T = self._lookup_T_base_cam()
+        if T is not None:
+            R_c_b = T[:3, :3].T
+            d_cam = R_c_b @ d_base
+        else:
+            d_cam = np.array([0.0, 0.0, float(step_m)], dtype=np.float64)
+        berry_cam = self._base_xyz_to_cam(berry)
+        cup_cam = self._cup_cam_xyz()
+        meta: Dict = {
+            'cup_axis_base': axis.tolist(),
+            'sign': sign,
+            'berry_cam': list(berry_cam) if berry_cam is not None else None,
+            'cup_cam': list(cup_cam) if cup_cam is not None else None,
+        }
+        return d_cam, d_base, 'cup_axis', meta
+
     def _plan_near_oneshot_delta(
         self,
         berry: Tuple[float, float, float],
@@ -5857,6 +7638,7 @@ class ReachFsmNode(Node):
         seed: List[float],
         d_base: np.ndarray,
         contact_m: float,
+        allow_tip_residual: bool = True,
     ) -> Optional[List[float]]:
         """Near contact: cup axis aimed at berry, tip to contact.
 
@@ -5881,21 +7663,24 @@ class ReachFsmNode(Node):
         # EE target that would put tip at contact if attitude held.
         ee_tgt = ee0 + np.asarray(d_base, dtype=np.float64)
         berry_a = np.asarray(berry, dtype=np.float64)
+        ik_kw = {'tol_m': self._pbvs_ik_tol_m()}
 
         joints = cup_axis_ik_chunked(
-            tuple(ee_tgt.tolist()), berry, seed, tip_offset_link6=off_l6)
+            tuple(ee_tgt.tolist()), berry, seed,
+            tip_offset_link6=off_l6, **ik_kw)
         method = 'cup_axis_chunked'
         if joints is None:
             joints = cup_axis_ik(
-                tuple(ee_tgt.tolist()), berry, seed, tip_offset_link6=off_l6)
+                tuple(ee_tgt.tolist()), berry, seed,
+                tip_offset_link6=off_l6, **ik_kw)
             method = 'cup_axis'
         if joints is None:
             joints = approach_axis_ik_chunked(
-                tuple(ee_tgt.tolist()), berry, seed, T_l6c)
+                tuple(ee_tgt.tolist()), berry, seed, T_l6c, **ik_kw)
             method = 'approach_axis_chunked'
         if joints is None:
             joints = approach_axis_ik(
-                tuple(ee_tgt.tolist()), berry, seed, T_l6c)
+                tuple(ee_tgt.tolist()), berry, seed, T_l6c, **ik_kw)
             method = 'approach_axis'
         if joints is None:
             return None
@@ -5903,21 +7688,27 @@ class ReachFsmNode(Node):
         T_m = fk_link6_T(joints)
         tcp_m = T_m[:3, 3] + T_m[:3, :3] @ off_l6
         dist_m = float(np.linalg.norm(berry_a - tcp_m))
+        exec_tol = self._pbvs_contact_exec_tol_m()
         self.get_logger().info(
             f'REFINING near lookat[{method}]: tcp-berry={dist_m*1000:.1f}mm '
-            f'(contact={contact_m*1000:.0f}mm)')
+            f'(contact={contact_m*1000:.0f}mm tol={exec_tol*1000:.1f}mm)')
 
-        if dist_m <= contact_m + 0.008:
+        slack_m = exec_tol if self._pbvs_direct_mode() else 0.002
+        if dist_m <= contact_m + slack_m:
+            return list(joints)
+
+        if not allow_tip_residual:
             return list(joints)
 
         # Tip still short: one more cup_axis (or keep_orient) residual.
         travel2 = dist_m - float(contact_m)
-        if travel2 < 0.002:
+        min_travel = self._pbvs_min_oneshot_travel_m()
+        if travel2 < min_travel:
             return list(joints)
         direction = (berry_a - tcp_m) / dist_m
         ee_final = tuple((fk_xyz(joints) + direction * travel2).tolist())
         joints_f = cup_axis_ik(
-            ee_final, berry, joints, tip_offset_link6=off_l6)
+            ee_final, berry, joints, tip_offset_link6=off_l6, **ik_kw)
         if joints_f is None:
             joints_f = position_ik_keep_orient(ee_final, joints)
         if joints_f is None:
@@ -5925,7 +7716,7 @@ class ReachFsmNode(Node):
         if joints_f is None:
             self.get_logger().warn(
                 'REFINING near lookat mid OK but tip residual failed — '
-                'using mid (may finish short; near oneshot max≥2)')
+                'using mid (may finish short; arrive residual may retry)')
             return list(joints)
 
         T_f = fk_link6_T(joints_f)
@@ -5934,7 +7725,12 @@ class ReachFsmNode(Node):
         self.get_logger().info(
             f'REFINING near tip residual: '
             f'tcp-berry {dist_m*1000:.1f}→{dist_f*1000:.1f}mm')
-        return list(joints_f)
+        if dist_f <= dist_m + 1e-4:
+            return list(joints_f)
+        self.get_logger().warn(
+            f'REFINING near tip residual worse '
+            f'({dist_m*1000:.1f}→{dist_f*1000:.1f}mm) — keep mid')
+        return list(joints)
 
     def _start_near_oneshot_step(self, dist_cup: Optional[float]) -> bool:
         """Near terminal: one open-loop traj along cup→berry to contact.
@@ -6013,13 +7809,8 @@ class ReachFsmNode(Node):
         use_lookat = float(step_m) >= 0.03
         if use_lookat:
             if T_l6c is None:
-                # Fallback matches CAMERA_MOUNT_* (Rx≈-23.5deg optical pitch down).
+                # Fallback matches CAMERA_MOUNT_* (Gemini: R=I until pitch GT fit).
                 T_l6c = np.eye(4, dtype=np.float64)
-                a = -0.410152
-                ca, sa = math.cos(a), math.sin(a)
-                T_l6c[:3, :3] = np.array(
-                    [[1.0, 0.0, 0.0], [0.0, ca, -sa], [0.0, sa, ca]],
-                    dtype=np.float64)
                 T_l6c[:3, 3] = [0.0, -0.08, -0.04]
             joints = self._approach_axis_ik_for_tcp_goal(
                 tcp_goal=tcp_goal,
@@ -6488,6 +8279,12 @@ class ReachFsmNode(Node):
             self._servo_motion_frames = []
             self._servo_motion_last_t = 0.0
             self._servo_step_idx += 1
+            # PBVS oneshot mode: approach / depth_final blocking trajs.
+            pbvs_pending = getattr(self, '_pbvs_oneshot_pending', None)
+            if pbvs_pending and self._pbvs_oneshot_mode():
+                self._pbvs_oneshot_pending = None
+                self._pbvs_on_oneshot_settle(pbvs_pending)
+                return
             # Center lookat finished → residual or depth/stop.
             if self._refine_phase == 'center_oneshot':
                 self._finish_center_oneshot()
@@ -6586,6 +8383,19 @@ class ReachFsmNode(Node):
                 return (
                     f'assoc fail nearest={nearest:.3f}m > fine_assoc_max_m={max_d:.3f}m '
                     f'lock=({lx:.3f},{ly:.3f},{lz:.3f}) frame={lock_frame!r}; '
+                    + '; '.join(parts))
+        max_y = float(getattr(self._args, 'refine_lock_max_base_y_m', 0.42))
+        if max_y > 0:
+            high_y = []
+            for b in berries:
+                base = self._berry_base_xyz(b)
+                if base is not None and float(base[1]) > max_y:
+                    high_y.append(
+                        f'id={int(b.track_id)} y={float(base[1]):.3f}m')
+            if high_y:
+                return (
+                    f'have n={len(berries)} but pick rejected '
+                    f'(base_y>{max_y:.2f}m: {", ".join(high_y[:5])}); '
                     + '; '.join(parts))
         return f'have n={len(berries)} but pick rejected; ' + '; '.join(parts)
 
@@ -6687,40 +8497,6 @@ class ReachFsmNode(Node):
         if ranked[0][0] > 120.0:
             return None
         return ranked[0][1]
-
-    def _pick_sync_repin_candidate(self, *, old_tid: int) -> Optional[DetectedBerry]:
-        """Sync-timeout re-pin: UV continuity / cup-aim only — never cam-range free pick."""
-        max_pix = float(getattr(self._args, 'refine_fresh_lock_max_pix_px', 80.0))
-        track_min = float(getattr(self._args, 'refine_track_min_conf', 0.12))
-        uv_ref: Optional[Tuple[float, float]] = None
-        if self._fine is not None and self._fine.berries:
-            for b in self._fine.berries:
-                if int(b.track_id) != int(old_tid):
-                    continue
-                uv_ref = self._berry_image_uv(b)
-                if uv_ref is not None:
-                    break
-        if uv_ref is None and self._last_berry_base is not None:
-            T = self._lookup_T_base_cam()
-            if T is not None:
-                pb = np.array(
-                    [self._last_berry_base[0], self._last_berry_base[1],
-                     self._last_berry_base[2], 1.0],
-                    dtype=float)
-                try:
-                    T_inv = np.linalg.inv(T)
-                    cam = (T_inv @ pb)[:3]
-                    if float(cam[2]) > 1e-4:
-                        uv_ref = self._berry_uv_from_cam(
-                            (float(cam[0]), float(cam[1]), float(cam[2])))
-                except Exception:
-                    uv_ref = None
-        if uv_ref is not None:
-            neu = self._pick_live_near_uv(uv_ref)
-            if neu is not None:
-                return neu
-        # Cup-aim neighborhood (same radius as fresh lock).
-        return self._pick_live_nearest_optical(max_pix=max_pix, min_conf=track_min)
 
     def _relock_sight_center(self, *, reason: str) -> Optional[DetectedBerry]:
         """After centering: lock the berry nearest cup-axis aim for depth/contact."""
@@ -6950,7 +8726,21 @@ def main() -> int:
     parser.add_argument('--base-frame', default='base_link')
     parser.add_argument('--cup-contact-offset', type=float,
                         default=float(os.environ.get('PICK_CUP_CONTACT_OFFSET', '0.015')),
-                        help='Final tip↔berry-center standoff (0 = tip on berry center)')
+                        help='Legacy tip↔berry-center standoff for non-PBVS refine path')
+    parser.add_argument('--cup-surface-clearance-m', type=float, default=0.003,
+                        help='PBVS: cup rim ↔ berry surface gap at contact (m)')
+    parser.add_argument('--cup-rim-z', type=float, default=0.0,
+                        help='Deprecated (tip=opening); ignored for cup geometry')
+    parser.add_argument('--berry-radius', type=float, default=0.008,
+                        help='PBVS: nominal berry radius for cup_gap (m)')
+    parser.add_argument('--pbvs-vision-lost-frames', type=int, default=3,
+                        help='PBVS: consecutive lost live frames before blind oneshot')
+    parser.add_argument('--pbvs-vision-z-cam-min', type=float, default=0.08,
+                        help='PBVS: z_depth (m) below which near phase begins')
+    parser.add_argument('--pbvs-near-d-cam-m', type=float, default=0.12,
+                        help='PBVS stream: cam-frame cup↔berry surface distance for near phase (m)')
+    parser.add_argument('--pbvs-pre-grasp-d-cam-m', type=float, default=0.08,
+                        help='PBVS oneshot: segment-1 stop when d_cam_surface reaches this (m)')
     parser.add_argument('--refine-skip-center', dest='refine_skip_center',
                         action='store_true', default=False,
                         help='After mono_probe orbit+depth: skip center oneshot; '
@@ -6996,7 +8786,11 @@ def main() -> int:
                         help='When wrist blind and EE angle exceeds this, use face_plant_yaw')
     # pbvs-vlm-reach-v2
     parser.add_argument('--use-pbvs', action='store_true', default=False,
-                        help='Use continuous PBVS+KF refining loop instead of center_oneshot→range_depth')
+                        help='Use PBVS refining loop instead of center_oneshot→range_depth')
+    parser.add_argument('--pbvs-mode', choices=('single', 'oneshot', 'twostage', 'stream'),
+                        default='single',
+                        help='single(=oneshot alias): lock→1×cup_axis to berry surface; '
+                             'twostage: legacy pre-grasp+depth_final; stream: 25Hz PBVS')
     # Goal 4: BC training data collection
     parser.add_argument('--collect-data', action='store_true', default=False,
                         help='Enable AlignDataCollector: log every ALIGNING episode')
@@ -7064,8 +8858,8 @@ def main() -> int:
     parser.add_argument('--servo-near-handoff-z', type=float, default=0.05,
                         help='Switch to pose+fixed-mono only below this wrist z_cam (m). '
                              'With cam retracted ~4cm, wrist usable to ~3cm before fruit.')
-    parser.add_argument('--servo-near-handoff-dist-m', type=float, default=0.12,
-                        help='Max cup↔berry dist for near handoff (with image centered)')
+    parser.add_argument('--servo-near-handoff-dist-m', type=float, default=0.08,
+                        help='Max cup-gap (m) for PBVS near handoff / freeze')
     parser.add_argument('--servo-near-pix-tol-px', type=float, default=55.0,
                         help='Max pixel error for cup+image near handoff gate')
     parser.add_argument('--servo-near-ang-tol-deg', type=float, default=8.0,
@@ -7118,8 +8912,10 @@ def main() -> int:
                         help='Auto-enter near mode without user confirm_near')
     parser.add_argument('--refine-fruit-assoc-max-m', type=float, default=0.12,
                         help='Max 3D distance from REFINING entry fruit lock to accept detections')
-    parser.add_argument('--refine-lock-min-conf', type=float, default=0.5,
+    parser.add_argument('--refine-lock-min-conf', type=float, default=0.20,
                         help='Min YOLO/BoT-SORT confidence to lock a fruit at REFINING entry')
+    parser.add_argument('--refine-lock-max-base-y-m', type=float, default=0.42,
+                        help='Skip REFINING entry lock when berry base_link Y exceeds this (m); 0=off')
     parser.add_argument('--refine-track-min-conf', type=float, default=0.12,
                         help='After lock: min conf for ranging/track obs (box on locked id; << lock gate)')
     parser.add_argument('--refine-fresh-lock-max-pix-px', type=float, default=80.0,
@@ -7135,11 +8931,11 @@ def main() -> int:
                         action='store_false',
                         help='Require live YOLO fresh lock after center (legacy ERROR on miss)')
     parser.add_argument('--refine-probe-tri-mono-chord', dest='refine_probe_tri_mono_chord',
-                        action='store_true', default=True,
-                        help='After center probe tri: chord-scale depth via reproject-UV min-mono')
+                        action='store_true', default=False,
+                        help='Legacy: chord-scale probe tri via min-mono (off when wrist depth valid)')
     parser.add_argument('--no-refine-probe-tri-mono-chord', dest='refine_probe_tri_mono_chord',
                         action='store_false',
-                        help='Keep raw probe tri 3D without mono chord scale')
+                        help='Keep raw probe tri / depth (default for Gemini wrist)')
     parser.add_argument('--refine-mono-chord-scale-min', type=float, default=0.45,
                         help='Min z_mono/z_cam scale for probe tri mono chord')
     parser.add_argument('--refine-mono-chord-scale-max', type=float, default=1.05,
