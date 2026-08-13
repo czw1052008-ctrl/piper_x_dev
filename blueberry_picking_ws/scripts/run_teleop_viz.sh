@@ -95,7 +95,7 @@ _open_view /perception/fine/detection_viz wrist_yolo
 _open_view /perception/wrist/depth_viz wrist_depth
 
 if [[ "${SHOW_RAW}" == "true" ]]; then
-  _open_view /camera_fixed/image_raw fixed_raw
+  _open_view /camera_fixed/color/image_raw fixed_raw
   _open_view /camera_wrist/color/image_raw wrist_raw
 fi
 

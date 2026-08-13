@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro">
 
-  <!-- Vacuum suction cup: link6 +Z 5cm to eef; cup opens along +Z (real robot / eye-in-hand). -->
+  <!-- Vacuum suction cup: link6 +Z 7cm to eef; cup opens along +Z (real robot / eye-in-hand). -->
   <link name="eef_link">
     <visual>
       <origin xyz="0 0 0.02" rpy="0 0 0"/>
@@ -21,7 +21,7 @@
   <joint name="eef_joint" type="fixed">
     <parent link="link6"/>
     <child link="eef_link"/>
-    <origin xyz="0 0 0.05" rpy="0 0 0"/>
+    <origin xyz="0 0 0.07" rpy="0 0 0"/>
   </joint>
 
 </robot>

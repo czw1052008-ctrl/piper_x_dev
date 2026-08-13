@@ -1,9 +1,8 @@
 <?xml version="1.0"?>
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro">
 
-  <!-- Wrist Orbbec DaBai on Piper X flange (link6 = 坐标系7 / end-effector fixture).
-       Physical mount: camera on CS7 -Y (~8cm), -Z (~4cm).
-       Optical axis pitched down vs link6 +Z ~23.5deg (roll X); GT fit 20260807_171055. -->
+  <!-- Wrist Orbbec Gemini 305 on Piper X flange (link6).
+       Tape 2026-08-11: (0, -0.07, +0.04). Optical pitch Rx=0 until REFINE tip–berry GT. -->
   <link name="camera_wrist_link">
     <visual>
       <geometry><box size="0.04 0.02 0.02"/></geometry>
@@ -21,7 +20,7 @@
   <joint name="camera_wrist_joint" type="fixed">
     <parent link="link6"/>
     <child link="camera_wrist_link"/>
-    <origin xyz="0 -0.08 -0.04" rpy="-0.410152 0 0"/>
+    <origin xyz="-0.006962964237819408 -0.06433722264599194 0.04" rpy="-0.365480 0.013079 0.094110"/>
   </joint>
 
   <link name="camera_wrist_color_optical_frame"/>

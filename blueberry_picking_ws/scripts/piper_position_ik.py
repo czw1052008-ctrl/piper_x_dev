@@ -263,6 +263,63 @@ def position_ik_keep_orient(
     return None
 
 
+def tip_xyz(
+    q: Sequence[float],
+    *,
+    tip_offset_link6: Sequence[float] = (0.0, 0.01883, 0.06152),
+) -> np.ndarray:
+    """Soft-cup tip (= opening) position in base from joints (link6 + R@offset)."""
+    R, p = fk_link6(q)
+    off = np.asarray(tip_offset_link6, dtype=float).reshape(3)
+    return p + R @ off
+
+
+def cartesian_velocity_step(
+    q: Sequence[float],
+    v_base: Sequence[float],
+    *,
+    dt: float,
+    tip_offset_link6: Sequence[float] = (0.0, 0.01883, 0.06152),
+    damp: float = 2e-3,
+    max_dq: float = 0.06,
+    eps: float = 1e-4,
+) -> List[float]:
+    """One differential-IK step realizing tip velocity ``v_base`` over ``dt``.
+
+    Solves damped LS on joints 1–5 (j6 locked). Always returns a joint vector
+    (clamped); never ``None`` — shrinks step near singularities via damping /
+    ``max_dq``.
+    """
+    q0 = clamp_joints(q)
+    v = np.asarray(v_base, dtype=float).reshape(3)
+    dt = float(max(1e-4, dt))
+    dp = v * dt
+    if float(np.linalg.norm(dp)) < 1e-7:
+        return list(q0)
+
+    p0 = tip_xyz(q0, tip_offset_link6=tip_offset_link6)
+    J = np.zeros((3, 5), dtype=float)
+    for i in range(5):
+        dq = list(q0)
+        dq[i] = float(dq[i] + eps)
+        pi = tip_xyz(dq, tip_offset_link6=tip_offset_link6)
+        J[:, i] = (pi - p0) / eps
+
+    A = J @ J.T + float(damp) * np.eye(3)
+    try:
+        dq5 = J.T @ np.linalg.solve(A, dp)
+    except np.linalg.LinAlgError:
+        return list(q0)
+    n = float(np.linalg.norm(dq5))
+    if n > float(max_dq) and n > 1e-12:
+        dq5 *= float(max_dq) / n
+    q_new = list(q0)
+    for i in range(5):
+        q_new[i] = float(q_new[i] + dq5[i])
+    q_new[5] = 0.0
+    return clamp_joints(q_new)
+
+
 def position_ik_keep_orient_chunked(
     target_xyz: Sequence[float],
     seed_q: Sequence[float],
@@ -572,7 +629,7 @@ def cup_axis_ik(
     goal = np.asarray(target_xyz, dtype=float).reshape(3)
     berry = np.asarray(berry_base, dtype=float).reshape(3)
     off = np.asarray(
-        tip_offset_link6 if tip_offset_link6 is not None else (0.0, 0.0, 0.05),
+        tip_offset_link6 if tip_offset_link6 is not None else (0.0, 0.01883, 0.06152),
         dtype=float,
     ).reshape(3)
     q = clamp_joints(seed_q)

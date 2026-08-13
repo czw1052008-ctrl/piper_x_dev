@@ -5,7 +5,8 @@
 # Does NOT use REFINING_WAIT_NEAR / confirm_near — PBVS handles approach autonomously.
 #
 # Usage:
-#   bash scripts/_run_refine_pbvs.sh                  # single run
+#   bash scripts/_run_refine_pbvs.sh                  # single run (press off)
+#   bash scripts/_run_refine_pbvs.sh --pbvs-press-m 0.002   # 2mm press after settle
 #   bash scripts/_run_refine_pbvs.sh --loops 5        # stress-test
 #   bash scripts/_run_refine_pbvs.sh --no-restore     # arm already at entry pose
 #   bash scripts/_run_refine_pbvs.sh --collect-data   # enable BC data collection
@@ -17,8 +18,9 @@
 #
 # State progression (PBVS):
 #   confirm_reset (if WAIT_CONFIRM) → restore entry → start_refine
-#   REFINING lock → DIRECT_ONESHOT (cup→locked surface contact point)
-#                 → optional residual → WAIT_CONFIRM
+#   REFINING lock + surface n → DIRECT_ONESHOT 4s (cup axis ∥ −n)
+#                 → optional residual → optional press (−n) → SUCTION_HOLD
+#                 placeholder (no GPIO) → WAIT_CONFIRM
 # No pre-grasp / depth_final. Locked UV+depth = surface point; cup clearance only.
 set +e
 cd /home/user/codes/piper_x_dev/blueberry_picking_ws
@@ -66,12 +68,24 @@ _republish_wrist_tf
 RUNNER_ARGS=()
 COLLECT_DATA=0
 NO_RESTART=0
-for arg in "$@"; do
-  case "$arg" in
+PBVS_PRESS_M="${PBVS_PRESS_M:-0}"
+_args=("$@")
+_i=0
+while [[ $_i -lt ${#_args[@]} ]]; do
+  _a="${_args[$_i]}"
+  case "$_a" in
     --collect-data) COLLECT_DATA=1 ;;
     --no-restart) NO_RESTART=1 ;;
-    *) RUNNER_ARGS+=("$arg") ;;
+    --pbvs-press-m)
+      _i=$((_i + 1))
+      PBVS_PRESS_M="${_args[$_i]:-0}"
+      ;;
+    --pbvs-press-m=*)
+      PBVS_PRESS_M="${_a#--pbvs-press-m=}"
+      ;;
+    *) RUNNER_ARGS+=("$_a") ;;
   esac
+  _i=$((_i + 1))
 done
 
 if [[ "$NO_RESTART" == 1 ]]; then
@@ -132,7 +146,9 @@ FSM_CMD=(
   --refine-fresh-lock-min-conf 0.10
   --no-refine-probe-tri-mono-chord
   --qa-dir log/real_robot/qa
+  --pbvs-press-m "$PBVS_PRESS_M"
 )
+log "FSM pbvs-press-m=${PBVS_PRESS_M} (0=A/B off; 0.002=2mm press)"
 if [[ "$COLLECT_DATA" == 1 ]]; then
   FSM_CMD+=(--collect-data --collect-data-dir data/align_episodes)
   log '  BC data collection ENABLED → data/align_episodes/'

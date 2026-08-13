@@ -91,6 +91,9 @@ from refine_depth_util import (  # noqa: E402
     apply_mono_chord_scale,
     z_mono_near_reproject_from_sources,
 )
+from berry_surface_fit import (  # noqa: E402
+    fit_contact_surface,
+)
 
 ARM_JOINTS = ['joint1', 'joint2', 'joint3', 'joint4', 'joint5', 'joint6']
 HOME = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
@@ -726,6 +729,13 @@ class ReachFsmNode(Node):
                 'j3': math.degrees(self._joints[2]),
                 'j5': math.degrees(self._joints[4]),
             } if self._joints and len(self._joints) >= 6 else None,
+            'live_uv': (
+                list(self._berry_image_uv(berry))
+                if berry is not None and self._berry_image_uv(berry) is not None
+                else None),
+            'live_depth_mode': depth_mode or None,
+            'ray_scale_applied': (
+                getattr(self, '_pbvs_scaled_berry', None) is not None),
             'kf_uncertainty': (
                 float(self._pbvs_kf.uncertainty())
                 if hasattr(self, '_pbvs_kf') and self._pbvs_kf.initialized
@@ -5365,7 +5375,13 @@ class ReachFsmNode(Node):
         self._pbvs_probe_success_n = 0
         self._pbvs_probe_fail_n = 0
         self._pbvs_frozen_berry: Optional[np.ndarray] = None
-        self._pbvs_oneshot_pending: Optional[str] = None  # 'approach' | 'final' | 'direct'
+        self._pbvs_scaled_berry: Optional[np.ndarray] = None  # lock-ray 1-DOF
+        self._pbvs_lock_ray: Optional[Tuple[np.ndarray, np.ndarray]] = None
+        self._pbvs_ray_scale: Optional[Dict] = None
+        self._pbvs_frozen_normal: Optional[np.ndarray] = None  # outward, toward cup
+        self._pbvs_surface_fit: Optional[Dict] = None
+        self._pbvs_press_cup_start: Optional[np.ndarray] = None
+        self._pbvs_oneshot_pending: Optional[str] = None  # 'approach'|'final'|'direct'|'align_n'|'press'
         self._pbvs_direct_shot_n = 0
         self._pbvs_depth_final_running = False
         self._pbvs_motion_min_d_cam: Optional[float] = None
@@ -5384,13 +5400,14 @@ class ReachFsmNode(Node):
         return self._use_pbvs and mode in ('oneshot', 'single', 'twostage')
 
     def _pbvs_direct_mode(self) -> bool:
-        """Canonical path: lock → tip→surface oneshot(s) → WAIT_CONFIRM.
+        """Canonical path: lock → tip→surface oneshot(s) → press → WAIT_CONFIRM.
 
         ``oneshot`` is an alias of ``single``. Motion is open-loop to the frozen
         lock point (no live tracking). After each segment settles, cup↔frozen is
         checked; if still > exec_tol (0.5 mm), up to ``pbvs_direct_max_shots``
-        residual pushes run **before** WAIT_CONFIRM. Human ``confirm_reset`` only
-        after the arm has finished all pushes.
+        residual pushes run, then an optional short press along −n, then a
+        suction placeholder. Outer ``/reach/status`` stays REFINING until
+        WAIT_CONFIRM. Human ``confirm_reset`` only after that.
         """
         mode = str(getattr(self._args, 'pbvs_mode', 'single') or 'single')
         return self._use_pbvs and mode in ('oneshot', 'single')
@@ -5719,6 +5736,7 @@ class ReachFsmNode(Node):
         d_cam_surface: Optional[float] = None,
         lookat: bool = True,
         allow_tip_residual: bool = True,
+        dir_base: Optional[np.ndarray] = None,
     ) -> bool:
         """Blocking cup_axis oneshot; ``pending`` identifies phase on settle."""
         if not self._arm.server_is_ready():
@@ -5732,7 +5750,22 @@ class ReachFsmNode(Node):
         if tcp is None or ee is None:
             return False
         berry_t = tuple(float(v) for v in np.asarray(berry, dtype=np.float64).flatten()[:3])
-        if self._pbvs_direct_mode():
+        if dir_base is not None:
+            d = np.asarray(dir_base, dtype=np.float64).flatten()[:3]
+            nd = float(np.linalg.norm(d))
+            if nd < 1e-9:
+                return False
+            d_unit = d / nd
+            d_base = d_unit * float(travel)
+            T = self._lookup_T_base_cam()
+            if T is not None:
+                d_cam = T[:3, :3].T @ d_base
+            else:
+                d_cam = np.array([0.0, 0.0, float(travel)], dtype=np.float64)
+            method = 'along_normal'
+            _plan_meta = {'dir_base': d_unit.tolist()}
+            planned = (d_cam, d_base, method, _plan_meta)
+        elif self._pbvs_direct_mode():
             planned = self._plan_tip_to_surface_delta(berry_t, travel)
         elif self._pbvs_oneshot_mode():
             planned = self._plan_cup_axis_oneshot_delta(berry_t, travel)
@@ -5751,13 +5784,24 @@ class ReachFsmNode(Node):
         tcp_goal = tcp0 + np.asarray(d_base, dtype=np.float64)
         joints = None
         ik_method = 'keep_orient'
+        aim_t = berry_t
         use_cup_lookat = lookat and (
-            self._pbvs_oneshot_mode() or travel >= 0.03)
+            self._pbvs_oneshot_mode() or travel >= 0.03 or dir_base is not None)
         if use_cup_lookat:
             T_l6c = self._lookup_T_link6_cam()
             if T_l6c is None:
                 T_l6c = np.eye(4, dtype=np.float64)
                 T_l6c[:3, 3] = [0.0, -0.08, -0.04]
+            n_aim = getattr(self, '_pbvs_frozen_normal', None)
+            if n_aim is not None:
+                # Goal pose: cup at P, link6+Z ∥ −n (colinear cup / patch / center).
+                # One 4s traj interpolates both; do not rotate after arrive.
+                n_u = np.asarray(n_aim, dtype=np.float64).flatten()[:3]
+                nn = float(np.linalg.norm(n_u))
+                if nn > 1e-9:
+                    n_u = n_u / nn
+                    aim_t = tuple(
+                        (np.asarray(berry_t, dtype=np.float64) - n_u * 0.08).tolist())
             joints = self._approach_axis_ik_for_tcp_goal(
                 tcp_goal=tcp_goal,
                 berry=berry_t,
@@ -5766,9 +5810,10 @@ class ReachFsmNode(Node):
                 d_base=d_base,
                 contact_m=self._tip_contact_standoff_m(),
                 allow_tip_residual=allow_tip_residual,
+                aim_xyz=aim_t,
             )
             if joints is not None:
-                ik_method = 'cup_axis_lookat'
+                ik_method = 'cup_axis_lookat_n' if n_aim is not None else 'cup_axis_lookat'
         if joints is None:
             tgt_xyz = tuple((ee0 + d_base).tolist())
             joints = position_ik_keep_orient(tgt_xyz, self._joints)
@@ -5804,6 +5849,13 @@ class ReachFsmNode(Node):
                 'method': str(method),
                 'traj_s': float(traj_s),
                 'phase': pending,
+                'n_base': (
+                    np.asarray(self._pbvs_frozen_normal, dtype=np.float64).tolist()
+                    if getattr(self, '_pbvs_frozen_normal', None) is not None else None),
+                'dir_base': (
+                    np.asarray(dir_base, dtype=np.float64).tolist()
+                    if dir_base is not None else None),
+                'aim_base': list(aim_t) if lookat else None,
             }
             self._write_qa_json(f'pbvs_{pending}.json', pkg)
             self._pbvs_qa_log_event(f'oneshot_{pending}', pkg)
@@ -5865,6 +5917,400 @@ class ReachFsmNode(Node):
         dist = float(np.linalg.norm(berry_a - cup_a))
         return dist - self._tip_contact_standoff_m()
 
+    def _pbvs_direct_travel_m(self, berry: np.ndarray) -> Optional[float]:
+        """Main-push travel: cup opening → locked point P (position first)."""
+        return self._pbvs_travel_to_surface_m(berry)
+
+    def _pbvs_press_m(self) -> float:
+        v = float(getattr(self._args, 'pbvs_press_m', 0.0) or 0.0)
+        return max(0.0, min(0.005, v))
+
+    def _pbvs_try_ray_scale(self, live: Optional[DetectedBerry]) -> None:
+        """During 4s oneshot: if live UV + baseline, 1-DOF scale lock ray → P1.
+
+        Does not cancel the 4s traj. P1 is consumed by residual shots.
+        """
+        if getattr(self, '_pbvs_scaled_berry', None) is not None:
+            return
+        ray = getattr(self, '_pbvs_lock_ray', None)
+        P0 = getattr(self, '_pbvs_frozen_berry', None)
+        if ray is None or P0 is None or live is None:
+            return
+        mode = str(getattr(live, 'depth_mode', '') or '')
+        if mode == 'base_coast':
+            return
+        uv = self._berry_image_uv(live)
+        T1 = self._lookup_T_base_cam()
+        if uv is None or T1 is None:
+            return
+        from pbvs_ray_scale import scale_lock_ray
+        o0, d0 = ray
+        rec = scale_lock_ray(
+            o0, d0, T1, uv, self._wrist_intrinsics(),
+            np.asarray(P0, dtype=np.float64),
+            min_lat_m=0.030, max_gap_m=0.010, max_dp_m=0.012)
+        rec['live_uv'] = [float(uv[0]), float(uv[1])]
+        rec['live_mode'] = mode
+        rec['live_conf'] = float(getattr(live, 'confidence', 0.0) or 0.0)
+        self._pbvs_ray_scale = rec
+        if rec.get('ok') and rec.get('apply') and rec.get('P1') is not None:
+            self._pbvs_scaled_berry = np.asarray(rec['P1'], dtype=np.float64)
+            self._write_qa_json('pbvs_ray_scale.json', rec)
+            self._pbvs_qa_log_event('ray_scale', rec)
+            self.get_logger().info(
+                f'PBVS ray-scale APPLY |ΔP|={float(rec["dp_m"])*1000:.1f}mm '
+                f'lat={float(rec["lat_m"])*1000:.1f}mm '
+                f'skew={float(rec["gap_m"])*1000:.1f}mm '
+                f's {float(rec["s0_m"])*1000:.0f}→{float(rec["s1_m"])*1000:.0f}mm')
+        elif rec.get('lat_m', 0.0) >= 0.030:
+            self._write_qa_json('pbvs_ray_scale.json', rec)
+
+    def _pbvs_freeze_surface_normal(
+        self,
+        berry: Optional[DetectedBerry],
+        berry_xyz_base: np.ndarray,
+    ) -> None:
+        """Lock-time PCA plane; freeze outward n (toward cup) or skip."""
+        self._pbvs_frozen_normal = None
+        self._pbvs_surface_fit = None
+        qa: Dict = {'ok': False, 'skip': True, 'reason': ''}
+        depth = getattr(self, '_last_wrist_depth', None)
+        if depth is None:
+            qa['reason'] = 'no_wrist_depth'
+            self._write_qa_json('pbvs_surface_fit.json', qa)
+            self.get_logger().warn(
+                'PBVS surface_fit skip: no wrist depth — point contact')
+            return
+        uv = self._berry_image_uv(berry) if berry is not None else None
+        if uv is None:
+            cam = self._base_xyz_to_cam(
+                tuple(float(v) for v in berry_xyz_base.flatten()[:3]))
+            if cam is not None:
+                uv = self._berry_uv_from_cam(cam)
+        if uv is None:
+            qa['reason'] = 'no_uv'
+            self._write_qa_json('pbvs_surface_fit.json', qa)
+            self.get_logger().warn('PBVS surface_fit skip: no UV — point contact')
+            return
+        fx, fy, cx, cy = self._wrist_intrinsics()
+        T = self._lookup_T_base_cam()
+        if T is None:
+            qa['reason'] = 'no_tf'
+            self._write_qa_json('pbvs_surface_fit.json', qa)
+            self.get_logger().warn('PBVS surface_fit skip: no TF — point contact')
+            return
+        p = np.asarray(berry_xyz_base, dtype=np.float64).flatten()[:3]
+        cup = self._cup_open_xyz()
+        if cup is not None:
+            toward = np.asarray(cup, dtype=np.float64).flatten()[:3] - p
+        else:
+            toward = -(T[:3, :3] @ np.array([0.0, 0.0, 1.0], dtype=np.float64))
+        z_hint = None
+        if berry is not None:
+            bcam = self._berry_cam_xyz(berry)
+            if bcam is not None and float(bcam[2]) > 0.05:
+                z_hint = float(bcam[2])
+        qa_dir = self._qa_session_dir()
+        if qa_dir is not None:
+            try:
+                np.save(
+                    os.path.join(qa_dir, 'pbvs_surface_fit_depth.npy'),
+                    np.asarray(depth, dtype=np.float32))
+                qa['depth_npy'] = 'pbvs_surface_fit_depth.npy'
+                qa['depth_shape'] = [int(depth.shape[0]), int(depth.shape[1])]
+            except Exception:
+                pass
+        qa['K'] = [float(fx), float(fy), float(cx), float(cy)]
+        qa['T_base_cam'] = np.asarray(T, dtype=np.float64).tolist()
+        qa['toward_base'] = np.asarray(toward, dtype=np.float64).tolist()
+        fit = fit_contact_surface(
+            depth, float(uv[0]), float(uv[1]),
+            fx=fx, fy=fy, cx=cx, cy=cy,
+            T_base_cam=T,
+            toward_base=toward,
+            z_hint_m=z_hint,
+        )
+        qa.update(fit)
+        qa['skip'] = not bool(fit.get('ok'))
+        qa['lock_uv'] = [float(uv[0]), float(uv[1])]
+        qa['lock_berry_base'] = p.tolist()
+        if fit.get('ok') and fit.get('n_base') is not None:
+            n = np.asarray(fit['n_base'], dtype=np.float64).flatten()[:3]
+            nn = float(np.linalg.norm(n))
+            if nn > 1e-9:
+                n = n / nn
+            # Sign only: n outward toward cup. Do not clamp/skip vs cup−P or
+            # lock-time cup_axis — those are not fit quality. Orientation
+            # coincidence is a post-arrive traj.
+            self._pbvs_frozen_normal = n
+            qa['n_base'] = n.tolist()
+            qa['n_raw_base'] = n.tolist()
+            qa['ok'] = True
+            qa['skip'] = False
+            qa['reason'] = 'ok'
+            axis = self._cup_axis_base()
+            if axis is not None:
+                c = float(np.clip(np.dot(n, -axis), -1.0, 1.0))
+                qa['angle_to_cup_axis_at_lock_deg'] = math.degrees(math.acos(c))
+        self._pbvs_surface_fit = qa
+        self._write_qa_json('pbvs_surface_fit.json', qa)
+        if self._pbvs_frozen_normal is not None:
+            self.get_logger().info(
+                f'PBVS surface_fit n={np.round(self._pbvs_frozen_normal, 3)} '
+                f'inliers={qa.get("n_inliers")} '
+                f'ang_cup_lock={qa.get("angle_to_cup_axis_at_lock_deg")}deg')
+        else:
+            self.get_logger().warn(
+                f'PBVS surface_fit skip ({qa.get("reason")}) — point contact')
+
+    def _pbvs_angle_cup_to_neg_n_deg(self) -> Optional[float]:
+        axis = self._cup_axis_base()
+        n = getattr(self, '_pbvs_frozen_normal', None)
+        if axis is None or n is None:
+            return None
+        n_u = np.asarray(n, dtype=np.float64).flatten()[:3]
+        nn = float(np.linalg.norm(n_u))
+        if nn < 1e-9:
+            return None
+        c = float(np.clip(np.dot(axis, -n_u / nn), -1.0, 1.0))
+        return math.degrees(math.acos(c))
+
+    def _pbvs_start_align_n(self) -> bool:
+        """Hold cup position, rotate link6 +Z onto −n (colinear cup / patch / center)."""
+        n = getattr(self, '_pbvs_frozen_normal', None)
+        berry = getattr(self, '_pbvs_frozen_berry', None)
+        if n is None or berry is None:
+            return False
+        if not self._arm.server_is_ready():
+            return False
+        ang0 = self._pbvs_angle_cup_to_neg_n_deg()
+        if ang0 is not None and ang0 < 5.0:
+            self.get_logger().info(
+                f'PBVS align_n skip: already {ang0:.1f}deg (link6+Z ∥ −n)')
+            return False
+        ee = self._current_ee_pose()
+        tcp = self._tcp_or_ee_xyz()
+        if ee is None or tcp is None:
+            return False
+        n_u = np.asarray(n, dtype=np.float64).flatten()[:3]
+        n_u = n_u / max(float(np.linalg.norm(n_u)), 1e-12)
+        p = np.asarray(berry, dtype=np.float64).flatten()[:3]
+        # Aim through P along −n so cup / contact / sphere-center are colinear.
+        aim = tuple((p - n_u * 0.08).tolist())
+        ee_tgt = (
+            float(ee.pose.position.x),
+            float(ee.pose.position.y),
+            float(ee.pose.position.z),
+        )
+        seed = list(self._joints)
+        T0 = fk_link6_T(seed)
+        tcp0 = np.asarray(tcp, dtype=np.float64).flatten()[:3]
+        off_l6 = T0[:3, :3].T @ (tcp0 - T0[:3, 3])
+        ik_kw = {
+            'tol_m': self._pbvs_ik_tol_m(),
+            'w_pos': 0.5,
+            'w_dir': 1.0,
+            'tol_dir_rad': math.radians(4.0),
+        }
+        joints = cup_axis_ik(
+            ee_tgt, aim, seed, tip_offset_link6=off_l6, **ik_kw)
+        ik_method = 'cup_axis_hold_pos'
+        if joints is None:
+            joints = cup_axis_ik(ee_tgt, aim, seed, **ik_kw)
+            ik_method = 'cup_axis'
+        if joints is None:
+            self.get_logger().warn('PBVS align_n: IK failed')
+            return False
+        target = self._clamp_servo_target(list(joints))
+        traj_s = float(self._args.servo_traj_s)
+        ok = self._send_joint_servo_goal(
+            target, tag='pbvs_align_n', traj_s=traj_s,
+            extra=(
+                f'{ik_method} hold-pos axis→−n '
+                f'from={(ang0 if ang0 is not None else -1):.1f}deg '
+                f'traj={traj_s:.1f}s'))
+        if ok:
+            self._pbvs_oneshot_pending = 'align_n'
+            self._pbvs_state = 'ALIGN_N'
+            pkg = {
+                'n_base': n_u.tolist(),
+                'aim_base': list(aim),
+                'berry_base': p.tolist(),
+                'tcp_hold': tcp0.tolist(),
+                'ee_hold': list(ee_tgt),
+                'angle_before_deg': ang0,
+                'traj_s': traj_s,
+                'ik_method': ik_method,
+            }
+            self._write_qa_json('pbvs_align_n.json', pkg)
+            self._pbvs_qa_log_event('align_n_start', pkg)
+            self.get_logger().info(
+                f'PBVS align_n: rotate link6+Z onto −n '
+                f'({(ang0 if ang0 is not None else -1):.1f}deg) '
+                f'traj={traj_s:.1f}s hold position')
+        return ok
+
+    def _pbvs_on_align_n_settle(self) -> None:
+        ang = self._pbvs_angle_cup_to_neg_n_deg()
+        cup = self._cup_open_xyz()
+        tcp = self._tcp_or_ee_xyz()
+        frozen = getattr(self, '_pbvs_frozen_berry', None)
+        cup_lock = None
+        if cup is not None and frozen is not None:
+            cup_lock = float(np.linalg.norm(
+                np.asarray(frozen, dtype=np.float64).flatten()[:3]
+                - np.asarray(cup, dtype=np.float64).flatten()[:3]))
+        arrive = {
+            'angle_cup_axis_to_neg_n_deg': ang,
+            'n_base': (
+                np.asarray(self._pbvs_frozen_normal, dtype=np.float64).tolist()
+                if getattr(self, '_pbvs_frozen_normal', None) is not None else None),
+            'cup_axis_base': (
+                self._cup_axis_base().tolist()
+                if self._cup_axis_base() is not None else None),
+            'cup_berry_dist_m': cup_lock,
+            'tcp_base': list(tcp) if tcp is not None else None,
+            'cup_open_xyz': list(cup) if cup is not None else None,
+        }
+        self._snap_qa(f'servo_{self._servo_step_idx:02d}_align_n')
+        self._servo_step_idx += 1
+        self._write_qa_json('pbvs_align_n_arrive.json', arrive)
+        self._pbvs_qa_log_event('align_n_arrive', arrive)
+        self.get_logger().info(
+            'PBVS align_n ARRIVE  '
+            f'axis∠−n={(ang if ang is not None else -1):.1f}deg '
+            f'cup↔lock={(cup_lock if cup_lock is not None else -1)*1000:.1f}mm')
+        self._pbvs_after_align_n()
+
+    def _pbvs_start_press(self) -> bool:
+        """Short keep-orient traj: +press_m into fruit along −n."""
+        press = self._pbvs_press_m()
+        n = getattr(self, '_pbvs_frozen_normal', None)
+        if press < 1e-5 or n is None:
+            return False
+        if not self._arm.server_is_ready():
+            return False
+        ee = self._current_ee_pose()
+        tcp = self._tcp_or_ee_xyz()
+        cup = self._cup_open_xyz()
+        if ee is None or tcp is None:
+            return False
+        n_a = np.asarray(n, dtype=np.float64).flatten()[:3]
+        nn = float(np.linalg.norm(n_a))
+        if nn < 1e-9:
+            return False
+        n_a = n_a / nn
+        d_base = -n_a * press
+        ee0 = np.array([
+            float(ee.pose.position.x),
+            float(ee.pose.position.y),
+            float(ee.pose.position.z),
+        ], dtype=np.float64)
+        tgt = tuple((ee0 + d_base).tolist())
+        joints = position_ik_keep_orient(tgt, self._joints)
+        ik_method = 'keep_orient'
+        if joints is None:
+            joints = position_ik_keep_orient_chunked(tgt, self._joints)
+            ik_method = 'keep_orient_chunked'
+        if joints is None:
+            self.get_logger().warn('PBVS press: IK failed')
+            return False
+        target = self._clamp_servo_target(list(joints))
+        traj_s = 0.8
+        tcp0 = np.asarray(tcp, dtype=np.float64).flatten()[:3]
+        self._pbvs_press_cup_start = (
+            np.asarray(cup, dtype=np.float64).flatten()[:3].copy()
+            if cup is not None else None)
+        ok = self._send_joint_servo_goal(
+            target, tag='pbvs_press', traj_s=traj_s,
+            extra=(
+                f'{ik_method} press={press*1000:.1f}mm along -n '
+                f'traj={traj_s:.1f}s'))
+        if ok:
+            self._pbvs_oneshot_pending = 'press'
+            self._pbvs_state = 'PRESS'
+            pkg = {
+                'press_m': press,
+                'n_base': n_a.tolist(),
+                'd_base': d_base.tolist(),
+                'tcp_start': tcp0.tolist(),
+                'tcp_goal': (tcp0 + d_base).tolist(),
+                'cup_start': (
+                    self._pbvs_press_cup_start.tolist()
+                    if self._pbvs_press_cup_start is not None else None),
+                'traj_s': traj_s,
+                'ik_method': ik_method,
+            }
+            self._write_qa_json('pbvs_press.json', pkg)
+            self._pbvs_qa_log_event('press_start', pkg)
+            self.get_logger().info(
+                f'PBVS press: {press*1000:.1f}mm along -n traj={traj_s:.1f}s')
+        return ok
+
+    def _pbvs_on_press_settle(self) -> None:
+        n = getattr(self, '_pbvs_frozen_normal', None)
+        cup = self._cup_open_xyz()
+        cup0 = getattr(self, '_pbvs_press_cup_start', None)
+        along_n = None
+        into_m = None
+        if cup is not None and cup0 is not None and n is not None:
+            dcup = (np.asarray(cup, dtype=np.float64).flatten()[:3]
+                    - np.asarray(cup0, dtype=np.float64).flatten()[:3])
+            n_a = np.asarray(n, dtype=np.float64).flatten()[:3]
+            along_n = float(np.dot(dcup, n_a))
+            into_m = -along_n
+        arrive = {
+            'press_m_cmd': self._pbvs_press_m(),
+            'delta_cup_along_n_m': along_n,
+            'press_into_m': into_m,
+            'n_base': (
+                np.asarray(n, dtype=np.float64).tolist() if n is not None else None),
+            'cup_start': (
+                np.asarray(cup0, dtype=np.float64).tolist()
+                if cup0 is not None else None),
+            'cup_end': list(cup) if cup is not None else None,
+        }
+        self._snap_qa(f'servo_{self._servo_step_idx:02d}_press_arrive')
+        self._servo_step_idx += 1
+        self._write_qa_json('pbvs_press_arrive.json', arrive)
+        self._pbvs_qa_log_event('press_arrive', arrive)
+        self.get_logger().info(
+            'PBVS press ARRIVE  '
+            f'along_n={(along_n if along_n is not None else 0)*1000:.2f}mm '
+            f'into={(into_m if into_m is not None else 0)*1000:.2f}mm '
+            f'(cmd={self._pbvs_press_m()*1000:.1f}mm) — ignore cup↔lock')
+        self._pbvs_enter_suction_hold()
+
+    def _pbvs_enter_suction_hold(self) -> None:
+        self._pbvs_state = 'SUCTION_HOLD'
+        pkg = {
+            'gpio': False,
+            'placeholder': True,
+            'note': 'suction placeholder — no GPIO this round',
+        }
+        self._write_qa_json('pbvs_suction_hold.json', pkg)
+        self._pbvs_qa_log_event('suction_placeholder', pkg)
+        self.get_logger().info(
+            'PBVS SUCTION_HOLD placeholder (no GPIO) → WAIT_CONFIRM')
+        self._set_state('WAIT_CONFIRM', 'pbvs_suction_hold')
+
+    def _pbvs_after_direct_arrive(self) -> None:
+        """Main 4s traj already aimed −n; optional press then suction."""
+        self._pbvs_after_align_n()
+
+    def _pbvs_after_align_n(self) -> None:
+        press = self._pbvs_press_m()
+        n = getattr(self, '_pbvs_frozen_normal', None)
+        if press >= 1e-5 and n is not None:
+            if self._pbvs_start_press():
+                return
+            self.get_logger().warn(
+                'PBVS press send failed — suction placeholder at current pose')
+        elif press >= 1e-5 and n is None:
+            self.get_logger().info(
+                'PBVS press skip: no frozen normal — point contact')
+        self._pbvs_enter_suction_hold()
+
     def _pbvs_start_direct_oneshot(
         self,
         berry: np.ndarray,
@@ -5873,7 +6319,7 @@ class ReachFsmNode(Node):
     ) -> bool:
         """Single segment: lock → oneshot with tip on berry surface."""
         berry_a = np.asarray(berry, dtype=np.float64).flatten()[:3]
-        travel = self._pbvs_travel_to_surface_m(berry_a)
+        travel = self._pbvs_direct_travel_m(berry_a)
         if travel is None:
             self.get_logger().warn('PBVS direct: no cup opening')
             return False
@@ -5882,11 +6328,13 @@ class ReachFsmNode(Node):
         if travel < exec_tol:
             self.get_logger().info(
                 f'PBVS direct skip: already at surface '
-                f'(cup↔lock<{exec_tol*1000:.1f}mm standoff={standoff*1000:.1f}mm)')
+                f'(travel<{exec_tol*1000:.1f}mm standoff={standoff*1000:.1f}mm)')
             return False
         axis = self._cup_axis_base()
         tcp = self._tcp_or_ee_xyz()
         cup = self._cup_open_xyz()
+        n = getattr(self, '_pbvs_frozen_normal', None)
+        plan_method = 'tip_to_surface'
         plan_diag = {
             'berry_base': list(berry_a),
             'd_cam_surface_lock_m': (
@@ -5895,7 +6343,9 @@ class ReachFsmNode(Node):
             'surface_clearance_m': self._cup_surface_clearance_m(),
             'berry_radius_m': self._berry_radius_m(),
             'travel_m': float(travel),
-            'plan_method': 'tip_to_surface',
+            'plan_method': plan_method,
+            'n_base': (
+                np.asarray(n, dtype=np.float64).tolist() if n is not None else None),
             'cup_axis_base': axis.tolist() if axis is not None else None,
             'cup_open_start': list(cup) if cup is not None else None,
             'tcp_start': list(tcp) if tcp is not None else None,
@@ -5903,7 +6353,7 @@ class ReachFsmNode(Node):
         self._write_qa_json('pbvs_direct_plan.json', plan_diag)
         self._pbvs_qa_log_event('direct_plan', plan_diag)
         self.get_logger().info(
-            f'PBVS single PLAN  tip→surface travel={travel*1000:.1f}mm '
+            f'PBVS single PLAN  {plan_method} travel={travel*1000:.1f}mm '
             f'(standoff={standoff*1000:.1f}mm = r+clearance)')
         if d_cam_surface is not None:
             self._pbvs_motion_min_d_cam = float(d_cam_surface)
@@ -6007,6 +6457,15 @@ class ReachFsmNode(Node):
                     pass
             self._snap_qa(f'servo_{self._servo_step_idx:02d}_direct_arrive')
             self._servo_step_idx += 1
+            axis_now = self._cup_axis_base()
+            n_now = getattr(self, '_pbvs_frozen_normal', None)
+            ang_axis_n = None
+            if axis_now is not None and n_now is not None:
+                n_u = np.asarray(n_now, dtype=np.float64).flatten()[:3]
+                nn = float(np.linalg.norm(n_u))
+                if nn > 1e-9:
+                    c = float(np.clip(np.dot(axis_now, -n_u / nn), -1.0, 1.0))
+                    ang_axis_n = math.degrees(math.acos(c))
             arrive = {
                 'd_cam_surface_settle_m': float(d_surf) if d_surf is not None else None,
                 'd_cam_surface_live_m': live_d,
@@ -6024,8 +6483,17 @@ class ReachFsmNode(Node):
                 'berry_base_frozen': (
                     np.asarray(frozen, dtype=np.float64).tolist()
                     if frozen is not None else None),
+                'n_base': (
+                    np.asarray(n_now, dtype=np.float64).tolist()
+                    if n_now is not None else None),
                 'tcp_base': list(tcp) if tcp is not None else None,
                 'cup_open_xyz': list(cup) if cup is not None else None,
+                'cup_axis_base': axis_now.tolist() if axis_now is not None else None,
+                'angle_cup_axis_to_neg_n_deg': ang_axis_n,
+                'berry_base_scaled': (
+                    np.asarray(getattr(self, '_pbvs_scaled_berry'), dtype=np.float64).tolist()
+                    if getattr(self, '_pbvs_scaled_berry', None) is not None else None),
+                'ray_scale': getattr(self, '_pbvs_ray_scale', None),
             }
             self._write_qa_json('pbvs_direct_arrive.json', arrive)
             self._pbvs_qa_log_event('direct_arrive', arrive)
@@ -6033,30 +6501,47 @@ class ReachFsmNode(Node):
             max_shots = self._pbvs_direct_max_shots()
             exec_tol = self._pbvs_contact_exec_tol_m()
             contact_slack = max(exec_tol, float(surface) + exec_tol)
+            scaled = getattr(self, '_pbvs_scaled_berry', None)
+            residual_target = (
+                np.asarray(scaled, dtype=np.float64) if scaled is not None
+                else (np.asarray(frozen, dtype=np.float64) if frozen is not None else None))
+            cup_res_dist = cup_berry_dist
+            if scaled is not None and cup is not None:
+                dvec_s = residual_target.flatten()[:3] - np.asarray(
+                    cup, dtype=np.float64).flatten()[:3]
+                cup_res_dist = float(np.linalg.norm(dvec_s))
             residual_ok = (
-                frozen is not None
+                residual_target is not None
                 and shot_n < max_shots
                 and (
-                    (cup_berry_dist is not None and cup_berry_dist > contact_slack)
-                    or (axial_gap is not None and float(axial_gap) > contact_slack)
+                    (cup_res_dist is not None and cup_res_dist > contact_slack)
+                    or (
+                        scaled is None
+                        and axial_gap is not None
+                        and float(axial_gap) > contact_slack)
                 )
             )
             if residual_ok:
-                travel = self._pbvs_travel_to_surface_m(
-                    np.asarray(frozen, dtype=np.float64))
+                travel = self._pbvs_travel_to_surface_m(residual_target)
                 min_travel = self._pbvs_min_oneshot_travel_m()
                 if travel is not None and float(travel) >= min_travel:
                     travel = min(float(travel), 0.04)
                     self.get_logger().info(
                         'PBVS direct residual  '
+                        f'{"P1" if scaled is not None else "P0"} '
+                        f'cup↔tgt={(cup_res_dist if cup_res_dist is not None else -1)*1000:.1f}mm '
                         f'cup↔lock={(cup_berry_dist if cup_berry_dist is not None else -1)*1000:.1f}mm '
                         f'axial_gap={(axial_gap if axial_gap is not None else -1)*1000:.1f}mm '
                         f'travel={travel*1000:.1f}mm '
                         f'shot={shot_n + 1}/{max_shots} '
                         f'(tol={exec_tol*1000:.1f}mm)')
                     self._pbvs_direct_shot_n = shot_n + 1
+                    if scaled is not None:
+                        self._pbvs_frozen_berry = residual_target.copy()
+                        self._last_berry_base = tuple(
+                            float(v) for v in residual_target.tolist())
                     if self._pbvs_send_cup_axis_oneshot(
-                            np.asarray(frozen, dtype=np.float64),
+                            residual_target,
                             travel,
                             tag='pbvs_single_residual',
                             pending='direct',
@@ -6077,8 +6562,14 @@ class ReachFsmNode(Node):
                 f'axial_gap={(axial_gap if axial_gap is not None else -1)*1000:.1f}mm '
                 f'shot={shot_n}/{max_shots} tol={exec_tol*1000:.1f}mm '
                 f'(target clearance={surface*1000:.1f}mm) '
-                f'→ WAIT_CONFIRM')
-            self._set_state('WAIT_CONFIRM', 'pbvs_direct_arrive')
+                f'axis∠−n={(ang_axis_n if ang_axis_n is not None else -1):.1f}deg')
+            self._pbvs_after_direct_arrive()
+            return
+        if pending == 'align_n':
+            self._pbvs_on_align_n_settle()
+            return
+        if pending == 'press':
+            self._pbvs_on_press_settle()
             return
         if pending == 'approach':
             self._pbvs_state = 'DEPTH_FINAL'
@@ -6141,9 +6632,10 @@ class ReachFsmNode(Node):
     def _tick_refining_pbvs_oneshot(self) -> None:
         """Open-loop PBVS tick.
 
-        ``single`` (and alias ``oneshot``): fruit lock → one or more cup-axis
-        pushes to frozen surface (auto residual until cup↔lock ≤ 0.5 mm or max
-        shots) → WAIT_CONFIRM → human confirm_reset. No pre-grasp / depth_final.
+        ``single`` (and alias ``oneshot``): fruit lock + surface n freeze →
+        one or more cup-axis pushes (auto residual until cup↔lock ≤ 0.5 mm
+        or max shots) → optional press along −n → SUCTION_HOLD placeholder →
+        outer WAIT_CONFIRM → human confirm_reset. No pre-grasp / depth_final.
         ``twostage``: legacy approach + depth_final.
         """
         if not hasattr(self, '_pbvs_kf'):
@@ -6194,6 +6686,22 @@ class ReachFsmNode(Node):
                 return
             self._pbvs_frozen_berry = berry_xyz_base.copy()
             self._pbvs_entry_lock_xyz = berry_xyz_base.copy()
+            self._pbvs_scaled_berry = None
+            self._pbvs_ray_scale = None
+            self._pbvs_lock_ray = None
+            T_lock = self._lookup_T_base_cam()
+            uv_lock = self._berry_image_uv(berry) if berry is not None else None
+            if uv_lock is None:
+                cam0 = self._base_xyz_to_cam(
+                    tuple(float(v) for v in berry_xyz_base.tolist()))
+                if cam0 is not None:
+                    uv_lock = self._berry_uv_from_cam(cam0)
+            if T_lock is not None and uv_lock is not None:
+                from pbvs_ray_scale import ray_from_uv
+                o0, d0 = ray_from_uv(T_lock, uv_lock, self._wrist_intrinsics())
+                self._pbvs_lock_ray = (o0, d0)
+            if self._pbvs_direct_mode():
+                self._pbvs_freeze_surface_normal(berry, berry_xyz_base)
             if berry is not None:
                 depth_mode = str(getattr(berry, 'depth_mode', depth_mode) or depth_mode)
             self._pbvs_lock_depth_mode = depth_mode
@@ -6220,8 +6728,9 @@ class ReachFsmNode(Node):
             d_cam = cam_m.get('d_cam_surface_m') if cam_m else None
             tcp_d = float(np.linalg.norm(
                 berry_xyz_base - np.asarray(tcp, dtype=np.float64))) if tcp else None
-            travel_surf = self._pbvs_travel_to_surface_m(berry_xyz_base)
+            travel_surf = self._pbvs_direct_travel_m(berry_xyz_base)
             standoff = self._tip_contact_standoff_m()
+            n_lock = getattr(self, '_pbvs_frozen_normal', None)
 
             # Canonical single path (oneshot is the same).
             if self._pbvs_direct_mode():
@@ -6232,13 +6741,14 @@ class ReachFsmNode(Node):
                     f'travel→surface='
                     f'{(travel_surf if travel_surf is not None else -1)*1000:.1f}mm '
                     f'standoff={standoff*1000:.1f}mm '
+                    f'n={"ok" if n_lock is not None else "skip"} '
                     f'tcp_dist={None if tcp_d is None else round(tcp_d, 3)}')
                 if travel_surf is None:
                     self._set_state('ERROR', 'pbvs: lock — no cup→surface travel')
                     return
                 if travel_surf < self._pbvs_contact_exec_tol_m():
                     self._snap_qa(f'servo_{self._servo_step_idx:02d}_direct_arrive')
-                    self._set_state('WAIT_CONFIRM', 'pbvs_single_at_surface')
+                    self._pbvs_after_direct_arrive()
                     return
                 self._pbvs_state = 'DIRECT_ONESHOT'
                 if not self._pbvs_start_direct_oneshot(
@@ -6272,10 +6782,17 @@ class ReachFsmNode(Node):
             self._pbvs_run_depth_final()
             return
 
+        if self._pbvs_state == 'SUCTION_HOLD':
+            self._pbvs_enter_suction_hold()
+            return
+
         if self._pbvs_state in (
-                'DIRECT_ONESHOT', 'APPROACH_ONESHOT', 'FINAL_ONESHOT', 'DEPTH_FINAL'):
+                'DIRECT_ONESHOT', 'ALIGN_N', 'PRESS',
+                'APPROACH_ONESHOT', 'FINAL_ONESHOT', 'DEPTH_FINAL'):
             if self._move_phase is not None:
                 live = self._pick_probe_live_berry()
+                if self._pbvs_state == 'DIRECT_ONESHOT':
+                    self._pbvs_try_ray_scale(live)
                 base = self._berry_base_xyz(live) if live is not None else None
                 if live is not None and base is not None:
                     ld = self._pbvs_live_d_cam_surface(
@@ -7411,7 +7928,7 @@ class ReachFsmNode(Node):
         traj_s: Optional[float] = None,
     ) -> bool:
         max_dj = max(abs(target[i] - self._joints[i]) for i in range(6))
-        min_dj = math.radians(0.12)
+        min_dj = math.radians(0.03 if tag == 'pbvs_press' else 0.12)
         if max_dj < min_dj:
             self.get_logger().info(f'REFINING {tag}: joint delta tiny — waiting')
             if tag == 'servo':
@@ -7639,10 +8156,11 @@ class ReachFsmNode(Node):
         d_base: np.ndarray,
         contact_m: float,
         allow_tip_residual: bool = True,
+        aim_xyz: Optional[Tuple[float, float, float]] = None,
     ) -> Optional[List[float]]:
-        """Near contact: cup axis aimed at berry, tip to contact.
+        """Near contact: cup axis aimed at ``aim_xyz`` (default berry), tip to P.
 
-        Primary: chunked ``cup_axis_ik`` (link6 +Z from tip → berry). Camera
+        Primary: chunked ``cup_axis_ik`` (link6 +Z from tip → aim). Camera
         ``approach_axis`` is only a fallback — cam is ~8 cm off tip so cam-look
         ≠ cup-look near contact. keep_orient_chunked drifts R_des (161209).
         """
@@ -7663,24 +8181,27 @@ class ReachFsmNode(Node):
         # EE target that would put tip at contact if attitude held.
         ee_tgt = ee0 + np.asarray(d_base, dtype=np.float64)
         berry_a = np.asarray(berry, dtype=np.float64)
+        aim = aim_xyz if aim_xyz is not None else berry
         ik_kw = {'tol_m': self._pbvs_ik_tol_m()}
+        if aim_xyz is not None:
+            ik_kw['w_dir'] = 0.8
 
         joints = cup_axis_ik_chunked(
-            tuple(ee_tgt.tolist()), berry, seed,
+            tuple(ee_tgt.tolist()), aim, seed,
             tip_offset_link6=off_l6, **ik_kw)
         method = 'cup_axis_chunked'
         if joints is None:
             joints = cup_axis_ik(
-                tuple(ee_tgt.tolist()), berry, seed,
+                tuple(ee_tgt.tolist()), aim, seed,
                 tip_offset_link6=off_l6, **ik_kw)
             method = 'cup_axis'
         if joints is None:
             joints = approach_axis_ik_chunked(
-                tuple(ee_tgt.tolist()), berry, seed, T_l6c, **ik_kw)
+                tuple(ee_tgt.tolist()), aim, seed, T_l6c, **ik_kw)
             method = 'approach_axis_chunked'
         if joints is None:
             joints = approach_axis_ik(
-                tuple(ee_tgt.tolist()), berry, seed, T_l6c, **ik_kw)
+                tuple(ee_tgt.tolist()), aim, seed, T_l6c, **ik_kw)
             method = 'approach_axis'
         if joints is None:
             return None
@@ -7708,7 +8229,7 @@ class ReachFsmNode(Node):
         direction = (berry_a - tcp_m) / dist_m
         ee_final = tuple((fk_xyz(joints) + direction * travel2).tolist())
         joints_f = cup_axis_ik(
-            ee_final, berry, joints, tip_offset_link6=off_l6, **ik_kw)
+            ee_final, aim, joints, tip_offset_link6=off_l6, **ik_kw)
         if joints_f is None:
             joints_f = position_ik_keep_orient(ee_final, joints)
         if joints_f is None:
@@ -8791,6 +9312,14 @@ def main() -> int:
                         default='single',
                         help='single(=oneshot alias): lock→1×cup_axis to berry surface; '
                              'twostage: legacy pre-grasp+depth_final; stream: 25Hz PBVS')
+    parser.add_argument('--pbvs-press-m', type=float, default=0.0,
+                        help='After direct settle, extra press into fruit along -n (m). '
+                             '0=skip press (still SUCTION_HOLD placeholder). Cap 5mm.')
+    parser.add_argument('--pbvs-normal-max-deg', type=float, default=20.0,
+                        help='Clamp fitted n toward cup−P (not current cup_axis) if angle exceeds this')
+    parser.add_argument('--pbvs-normal-skip-deg', type=float, default=45.0,
+                        help='If raw n vs cup−P exceeds this, skip fit (point contact). '
+                             'Do not gate on lock-time cup_axis — that coincidence is the contact goal')
     # Goal 4: BC training data collection
     parser.add_argument('--collect-data', action='store_true', default=False,
                         help='Enable AlignDataCollector: log every ALIGNING episode')

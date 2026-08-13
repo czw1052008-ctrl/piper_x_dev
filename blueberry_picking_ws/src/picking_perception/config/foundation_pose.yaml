@@ -25,7 +25,8 @@ fine_detector_node:
     enable_tracking: true
     # Calibrated 2026-08-05: tape cam→berry ≈15cm while mono@0.015→~13cm; scale d.
     berry_diameter_m: 0.017
-    # Pose Z: mono (bbox) | depth (RGB-D blend). Gemini 305 has reliable close-range depth.
+    # Pose Z: depth_raw (mask median) | mono (bbox fallback). Gemini 305 depth
+    # is used directly when mask has valid pixels; mono only on depth miss.
     depth_pose_source: depth
     depth_min_m: 0.10
     depth_max_m: 1.5

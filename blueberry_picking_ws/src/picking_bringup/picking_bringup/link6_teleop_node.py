@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
-"""Keyboard teleop: link6 6-DOF velocity jog → MoveIt IK → arm_controller."""
+"""Keyboard teleop: link6 velocity jog → Piper 5-DOF IK → arm_controller.
+
+Piper X is effectively 5-DOF for absolute poses (see piper_position_ik).
+MoveIt 6-DOF GetPositionIK with fixed orientation fails for most base-frame
+translations (A/D/Q/E). Linear jog uses position_ik_keep_orient; angular keys
+nudge j4/j5/j1 in joint space.
+"""
 
 from __future__ import annotations
 
 import copy
 import math
+import os
 import select
 import sys
 import termios
@@ -19,17 +26,26 @@ from moveit_msgs.msg import (
     Constraints,
     JointConstraint,
     MotionPlanRequest,
-    MoveItErrorCodes,
     PlanningOptions,
-    RobotState,
 )
-from moveit_msgs.srv import GetPositionIK
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.time import Time
 from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectoryPoint
 from tf2_ros import Buffer, TransformListener
+
+# Workspace analytic IK (5-DOF).
+_SCRIPT_CANDIDATES = [
+    os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', 'scripts')),
+    os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', '..', 'scripts')),
+    '/home/user/codes/piper_x_dev/blueberry_picking_ws/scripts',
+]
+for _p in _SCRIPT_CANDIDATES:
+    if os.path.isfile(os.path.join(_p, 'piper_position_ik.py')) and _p not in sys.path:
+        sys.path.insert(0, _p)
+        break
+from piper_position_ik import clamp_joints, position_ik, position_ik_keep_orient  # type: ignore
 
 ARM_JOINTS = ['joint1', 'joint2', 'joint3', 'joint4', 'joint5', 'joint6']
 
@@ -50,9 +66,9 @@ KEY_DIRS: Dict[str, Tuple[float, float, float, float, float, float]] = {
 }
 
 KEY_HELP = """
-link6 teleop — hold to move, release to stop:
+link6 teleop — hold to move, release to stop (Piper 5-DOF IK):
   W/S  up/down (+Z)   A/D  left/right (+Y)   Q/E  forward/back (+X)  [base_link]
-  O/K  roll      I/J  pitch        U/H  yaw  [link6 tool frame]
+  O/K  j4 roll   I/J  j5 pitch   U/H  j1 yaw   (joint nudge)
   [ ]  speed  R   home (MoveIt plan)  Space vibrate toggle
   ?    help   Esc  quit
 """
@@ -137,9 +153,6 @@ class Link6TeleopNode(Node):
         self._joint_positions: Dict[str, float] = {}
         self._target: Optional[PoseStamped] = None
         self._key_last_seen: Dict[str, Time] = {}
-        self._ik_future = None
-        self._ik_rerun = False
-        self._latest_ik_target: Optional[PoseStamped] = None
         self._arm_goal_handle = None
         self._home_goal_handle = None
         self._home_in_progress = False
@@ -158,7 +171,6 @@ class Link6TeleopNode(Node):
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self)
 
-        self._ik_client = self.create_client(GetPositionIK, self.get_parameter('ik_service').value)
         self._arm_client = ActionClient(
             self, FollowJointTrajectory, '/arm_controller/follow_joint_trajectory')
         self._move_group_client = ActionClient(
@@ -175,13 +187,12 @@ class Link6TeleopNode(Node):
         self.create_timer(period, self._control_tick)
         self.create_timer(0.05, self._vibration_tick)
 
-        self.get_logger().info('link6_teleop waiting for IK + arm_controller...')
-        self._ik_client.wait_for_service(timeout_sec=60.0)
+        self.get_logger().info('link6_teleop waiting for arm_controller (5-DOF local IK)...')
         self._arm_client.wait_for_server(timeout_sec=60.0)
         self.get_logger().info(
             f'hold-to-jog: linear={self._linear_speed:.3f} m/s '
             f'angular={math.degrees(self._angular_speed):.1f} deg/s '
-            f'rate={rate:.0f} Hz linear_frame={self._linear_jog_frame}')
+            f'rate={rate:.0f} Hz linear_frame={self._linear_jog_frame} ik=piper_5dof')
         self.get_logger().info(KEY_HELP.strip())
 
     def destroy_node(self) -> bool:
@@ -302,51 +313,23 @@ class Link6TeleopNode(Node):
         return target
 
     def _request_ik(self, target: PoseStamped) -> None:
-        self._latest_ik_target = copy.deepcopy(target)
-        if self._ik_future is not None and not self._ik_future.done():
-            self._ik_rerun = True
-            return
-
-        req = GetPositionIK.Request()
-        req.ik_request.group_name = self._group
-        req.ik_request.ik_link_name = self._tip
-        req.ik_request.avoid_collisions = self._avoid_collisions
-        req.ik_request.pose_stamped = self._latest_ik_target
-
-        rs = RobotState()
-        js = JointState()
-        js.name = list(ARM_JOINTS)
-        js.position = [self._joint_positions.get(n, 0.0) for n in ARM_JOINTS]
-        rs.joint_state = js
-        req.ik_request.robot_state = rs
-
-        self._ik_future = self._ik_client.call_async(req)
-        self._ik_future.add_done_callback(self._on_ik_done)
-
-    def _on_ik_done(self, future) -> None:
-        target = self._latest_ik_target
-        if self._ik_rerun and target is not None:
-            self._ik_rerun = False
-            self._request_ik(target)
-            return
-
-        try:
-            res = future.result()
-        except Exception as exc:
-            self.get_logger().warn(f'IK service call failed: {exc}', throttle_duration_sec=2.0)
-            return
-        if res is None:
-            self.get_logger().warn('IK service returned no response', throttle_duration_sec=2.0)
-            return
-        if res.error_code.val != MoveItErrorCodes.SUCCESS:
+        """Solve Cartesian XYZ with Piper 5-DOF keep-orient IK (j6=0)."""
+        seed = [float(self._joint_positions.get(n, 0.0)) for n in ARM_JOINTS]
+        xyz = (
+            float(target.pose.position.x),
+            float(target.pose.position.y),
+            float(target.pose.position.z),
+        )
+        joints = position_ik_keep_orient(xyz, seed)
+        if joints is None:
+            joints = position_ik(xyz, seed)
+        if joints is None:
             self.get_logger().warn(
-                f'IK failed code={res.error_code.val}', throttle_duration_sec=2.0)
-            return
-
-        name_to_pos = dict(zip(
-            res.solution.joint_state.name, res.solution.joint_state.position))
-        joints = [name_to_pos[n] for n in ARM_JOINTS if n in name_to_pos]
-        if len(joints) != len(ARM_JOINTS) or target is None:
+                f'5-DOF IK failed for xyz=({xyz[0]:.3f},{xyz[1]:.3f},{xyz[2]:.3f})',
+                throttle_duration_sec=1.0)
+            live = self._current_link6_pose()
+            if live is not None:
+                self._target = live
             return
 
         self._send_trajectory(joints)
@@ -356,6 +339,19 @@ class Link6TeleopNode(Node):
             self._last_log_time = now
             p = target.pose.position
             self.get_logger().info(f'link6 -> ({p.x:.3f}, {p.y:.3f}, {p.z:.3f})')
+
+    def _nudge_joints(self, rpy_delta: Tuple[float, float, float]) -> None:
+        """Angular keys → joint-space nudge (roll=j4, pitch=j5, yaw=j1)."""
+        seed = [float(self._joint_positions.get(n, 0.0)) for n in ARM_JOINTS]
+        roll, pitch, yaw = rpy_delta
+        seed[3] = float(seed[3] + roll)
+        seed[4] = float(seed[4] + pitch)
+        seed[0] = float(seed[0] + yaw)
+        seed[5] = 0.0
+        self._send_trajectory(clamp_joints(seed))
+        live = self._current_link6_pose()
+        if live is not None:
+            self._target = live
 
     def _send_trajectory(self, positions: List[float]) -> None:
         goal = FollowJointTrajectory.Goal()
@@ -417,6 +413,13 @@ class Link6TeleopNode(Node):
             return
 
         self._was_jogging = True
+        # Angular-only → joint nudge (5-DOF cannot track absolute orientation).
+        lin_mag = sum(abs(v) for v in dpos)
+        ang_mag = sum(abs(v) for v in rpy)
+        if lin_mag < 1e-12 and ang_mag > 1e-12:
+            self._nudge_joints(rpy)
+            return
+
         target = self._integrate_target(dpos, rpy)
         if target is None:
             self.get_logger().warn('link6 TF not ready', throttle_duration_sec=2.0)

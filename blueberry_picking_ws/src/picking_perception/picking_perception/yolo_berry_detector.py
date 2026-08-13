@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -85,22 +85,37 @@ class YoloBerryDetector:
 
     def _passes_shape_filter(
         self, mask: np.ndarray, bbox: Tuple[int, int, int, int], h: int, w: int,
+        *,
+        min_circularity: Optional[float] = None,
+        border_margin_frac: Optional[float] = None,
+        max_aspect_ratio: Optional[float] = None,
     ) -> bool:
         x0, y0, x1, y1 = bbox
         bw, bh = max(x1 - x0, 1), max(y1 - y0, 1)
+        max_aspect = self._max_aspect if max_aspect_ratio is None else float(max_aspect_ratio)
+        min_circ = self._min_circ if min_circularity is None else float(min_circularity)
+        border = self._border_margin if border_margin_frac is None else float(border_margin_frac)
         aspect = max(bw / bh, bh / bw)
-        if aspect > self._max_aspect:
+        if aspect > max_aspect:
             return False
-        if _mask_circularity(mask) < self._min_circ:
+        if _mask_circularity(mask) < min_circ:
             return False
         cx, cy = (x0 + x1) * 0.5, (y0 + y1) * 0.5
-        mx, my = w * self._border_margin, h * self._border_margin
+        mx, my = w * border, h * border
         if cx < mx or cy < my or cx > w - mx or cy > h - my:
             return False
         return True
 
     def detect(
-        self, rgb: np.ndarray, *, conf: Optional[float] = None,
+        self,
+        rgb: np.ndarray,
+        *,
+        conf: Optional[float] = None,
+        min_area_px: Optional[int] = None,
+        max_detections: Optional[int] = None,
+        min_circularity: Optional[float] = None,
+        border_margin_frac: Optional[float] = None,
+        max_aspect_ratio: Optional[float] = None,
     ) -> List[YoloDetection]:
         if not self._ready or self._model is None:
             return []
@@ -117,9 +132,67 @@ class YoloBerryDetector:
         if not results:
             return []
 
-        tracked = self._parse_result_detections(results[0], h, w, with_track_id=False)
+        tracked = self._parse_result_detections(
+            results[0], h, w, with_track_id=False,
+            min_area_px=min_area_px,
+            min_circularity=min_circularity,
+            border_margin_frac=border_margin_frac,
+            max_aspect_ratio=max_aspect_ratio,
+        )
         tracked.sort(key=lambda d: d.confidence, reverse=True)
-        return tracked[: self._max_dets]
+        cap = self._max_dets if max_detections is None else int(max_detections)
+        return tracked[: max(1, cap)]
+
+    def detect_near_uv(
+        self,
+        rgb: np.ndarray,
+        uv: Sequence[float],
+        *,
+        half_px: int = 96,
+        conf: float = 0.05,
+        min_area_px: int = 40,
+    ) -> List[YoloDetection]:
+        """YOLO on a crop around ``uv``; boxes/masks mapped back to full image.
+
+        Lock-local path: no full-frame top-N. Crop is letterboxed to the
+        network size so a ~15 px berry is large enough to fire.
+        """
+        if not self._ready or self._model is None:
+            return []
+        h, w = rgb.shape[:2]
+        u = int(round(float(uv[0])))
+        v = int(round(float(uv[1])))
+        half = int(max(32, half_px))
+        x0 = max(0, u - half)
+        y0 = max(0, v - half)
+        x1 = min(w, u + half)
+        y1 = min(h, v + half)
+        if (x1 - x0) < 32 or (y1 - y0) < 32:
+            return []
+        crop = rgb[y0:y1, x0:x1]
+        dets = self.detect(
+            crop,
+            conf=float(conf),
+            min_area_px=int(min_area_px),
+            max_detections=20,
+            min_circularity=0.25,
+            border_margin_frac=0.0,
+        )
+        out: List[YoloDetection] = []
+        for det in dets:
+            bx0, by0, bx1, by1 = det.bbox_xyxy
+            full_mask = np.zeros((h, w), dtype=np.uint8)
+            mh, mw = int(det.mask.shape[0]), int(det.mask.shape[1])
+            full_mask[y0:y0 + mh, x0:x0 + mw] = det.mask[:mh, :mw]
+            out.append(YoloDetection(
+                mask=full_mask,
+                confidence=float(det.confidence),
+                bbox_xyxy=(
+                    int(bx0) + x0, int(by0) + y0,
+                    int(bx1) + x0, int(by1) + y0,
+                ),
+            ))
+        return out
 
     def reset_tracker(self) -> None:
         """Clear BoT-SORT state (FSM clear_lock / new REFINING pin).
@@ -143,10 +216,25 @@ class YoloBerryDetector:
                     pass
 
     def _parse_result_detections(
-        self, res, h: int, w: int, *, with_track_id: bool,
+        self,
+        res,
+        h: int,
+        w: int,
+        *,
+        with_track_id: bool,
+        min_area_px: Optional[int] = None,
+        min_circularity: Optional[float] = None,
+        border_margin_frac: Optional[float] = None,
+        max_aspect_ratio: Optional[float] = None,
     ) -> List[TrackedYoloDetection]:
         max_area = int(h * w * self._max_area_frac)
+        min_area = self._min_area if min_area_px is None else int(min_area_px)
         candidates: List[TrackedYoloDetection] = []
+        shape_kw = dict(
+            min_circularity=min_circularity,
+            border_margin_frac=border_margin_frac,
+            max_aspect_ratio=max_aspect_ratio,
+        )
 
         if res.masks is not None and len(res.masks):
             for i, mask_tensor in enumerate(res.masks.data):
@@ -163,9 +251,9 @@ class YoloBerryDetector:
                     mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
                 mask_u8 = (mask > 0.5).astype(np.uint8)
                 area = int(mask_u8.sum())
-                if area < self._min_area or area > max_area:
+                if area < min_area or area > max_area:
                     continue
-                if not self._passes_shape_filter(mask_u8, bbox, h, w):
+                if not self._passes_shape_filter(mask_u8, bbox, h, w, **shape_kw):
                     continue
                 candidates.append(TrackedYoloDetection(mask_u8, conf, bbox, tid))
         elif res.boxes is not None:
@@ -178,12 +266,12 @@ class YoloBerryDetector:
                     tid = int(res.boxes.id[bi].item())
                 bw, bh = max(x1 - x0, 1), max(y1 - y0, 1)
                 area = bw * bh
-                if area < self._min_area or area > max_area:
+                if area < min_area or area > max_area:
                     continue
                 mask = np.zeros((h, w), dtype=np.uint8)
                 cx, cy = (x0 + x1) // 2, (y0 + y1) // 2
                 cv2.ellipse(mask, (cx, cy), (bw // 2, bh // 2), 0, 0, 360, 1, -1)
-                if not self._passes_shape_filter(mask, bbox, h, w):
+                if not self._passes_shape_filter(mask, bbox, h, w, **shape_kw):
                     continue
                 candidates.append(TrackedYoloDetection(mask, conf, bbox, tid))
 

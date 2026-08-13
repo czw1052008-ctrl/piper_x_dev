@@ -25,6 +25,7 @@ ARGS=(--ros-args
   -p enable_foundation_pose:="${FP_FLAG}"
   -p publish_hz:=10.0
   -p mask_source:=yolo
+  -p depth_pose_source:="${DEPTH_POSE_SOURCE:-depth}"
 )
 
 YOLO_CFG="${ROOT}/src/picking_perception/config/foundation_pose.yaml"

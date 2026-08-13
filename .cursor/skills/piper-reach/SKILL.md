@@ -129,9 +129,11 @@ timeout 3 ros2 run tf2_ros tf2_echo base_link camera_fixed_color_optical_frame
 ```
 confirm_reset (若 WAIT_CONFIRM/ERROR) → restore 入口 → start_refine
   → YOLO lock (conf≥0.10, base_y≤0.42m, lock_bbox_file:=/dev/null)
-  → 单次 pbvs_single oneshot (traj=align_traj_s=4.0s)
-  → settle 0.7s → 量 cup↔frozen → 可选 residual (≤4 shot, servo_traj_s=2.2s)
-  → WAIT_CONFIRM
+  → 锁果冻结 P + 弧面法向 n（仅内点/深度失败才 skip）
+  → 单次 pbvs_single 4.0s：位置 cup→P，姿态 lookat −n（一条 traj 到位即对准）
+  → settle → 可选 residual（同样 aim −n）
+  → 可选 press 短 traj（--pbvs-press-m）
+  → SUCTION_HOLD 占位（无 GPIO）→ 外层 WAIT_CONFIRM
 ```
 
 ### Traj timing — do NOT break
@@ -140,6 +142,7 @@ confirm_reset (若 WAIT_CONFIRM/ERROR) → restore 入口 → start_refine
 |----|------|------|
 | 主推 `pbvs_single` | **4.0s 固定** | `--align-traj-s 4.0` |
 | 补推 `pbvs_single_residual` | **2.2s** | `--servo-traj-s 2.2` |
+| 压入 `pbvs_press` | **0.8s** 短 traj | `--pbvs-press-m`（默认 0；2mm=0.002，上限 5mm） |
 
 **禁止**用 `travel/0.04` 或 bulk/creep 拆分替代固定 4s — 会导致 traj=5s、多段 cancel、216mm 假 SUCCESS。
 
@@ -175,8 +178,13 @@ Replay: `python scripts/refine_replay.py --qa-dir log/real_robot/qa/<session>`
 --pbvs-mode single --align-traj-s 4.0 --servo-traj-s 2.2 --servo-settle-s 0.7
 --cup-surface-clearance-m 0.0 --berry-radius 0.0
 --refine-lock-min-conf 0.10 --refine-lock-max-base-y-m 0.42
+--pbvs-press-m 0               # 真机 A：法向主推、无压入；B 再 0.002
 -p lock_bbox_file:=/dev/null   # YOLO-only 锁果
 ```
+
+压入验收看 `pbvs_press_arrive.json` 的 `press_into_m`（沿 −n），**不要**用 cup↔lock 变小（压入后锁点会穿面）。拟合 QA：`pbvs_surface_fit.json`。泵 GPIO 未接，只打 `suction placeholder` 日志。
+
+**法向**：锁果只冻 n。主推 **一条 4s** 到 P 且 lookat −n（禁止到位后再原地转——132305 转姿态丢了 20 mm）。到位看 `pbvs_direct_arrive.json` 的 `angle_cup_axis_to_neg_n_deg` 和 cup↔lock。
 
 ## End of day — safe shutdown
 

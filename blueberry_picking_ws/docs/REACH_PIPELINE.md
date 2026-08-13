@@ -14,14 +14,15 @@
 | OS | Ubuntu 22.04 |
 | ROS | Humble |
 | 臂 | Piper X via `can0` (gs_usb, 1 Mbps) |
-| 手腕相机 | Orbbec DaBai (`camera_wrist`) |
-| 固定相机 | 4K USB → `/camera_fixed/image_raw` |
+| 手腕相机 | Orbbec **Gemini 305** → `/camera_wrist/color|depth/image_raw`（`OrbbecSDK_ROS2`） |
+| 固定相机 | Orbbec **DaBai** RGB-D → `/camera_fixed/color|depth/image_raw`（`OrbbecSDK_ROS2_main`） |
 
 ## Topic 约定
 
 | Topic | 类型 | 说明 |
 |-------|------|------|
-| `/camera_fixed/image_raw` | `sensor_msgs/Image` | 固定单目 |
+| `/camera_fixed/color/image_raw` | `sensor_msgs/Image` | 全局 DaBai 彩色 |
+| `/camera_fixed/depth/image_raw` | `sensor_msgs/Image` | 全局 DaBai 深度（FusedApproachMap） |
 | `/perception/global/berries` | `picking_msgs/DetectedBerryArray` | 全局候选（区域候选列表） |
 | `/perception/target_lock` | `picking_msgs/DetectedBerry` | FSM 发布的区域锁 / 精调果锁 |
 | `/perception/fine/berries` | `picking_msgs/DetectedBerryArray` | 手腕 YOLO+depth/mono ~2–5 Hz |

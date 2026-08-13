@@ -38,7 +38,7 @@ def make_cb(key):
 topics = [
     ('/perception/global/detection_viz', 'global_viz'),
     ('/perception/fine/detection_viz', 'fine_viz'),
-    ('/camera_fixed/image_raw', 'fixed'),
+    ('/camera_fixed/color/image_raw', 'fixed'),
     ('/camera_wrist/color/image_raw', 'wrist'),
 ]
 for t, k in topics:

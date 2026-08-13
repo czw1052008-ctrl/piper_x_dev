@@ -6,6 +6,7 @@ Model:  constant-position with small process noise for plant sway.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
@@ -16,6 +17,19 @@ _Q_RATE = 1e-4   # m²/s per axis
 
 # Threshold for triggering an active lateral probe.
 DEFAULT_PROBE_THRESHOLD = 8e-4   # trace(P) in m²
+
+# χ²(3 dof, 99%) — standard innovation gate for 3-D position updates.
+CHI2_3_DOF_99 = 11.345
+
+
+@dataclass(frozen=True)
+class KFUpdateResult:
+    """Outcome of a gated KF measurement update."""
+
+    accepted: bool
+    reason: str = ''
+    mahal_sq: float = 0.0
+    innov_norm: float = 0.0
 
 
 class BerryKFTracker:
@@ -76,10 +90,78 @@ class BerryKFTracker:
         self._x = self._x + K @ innov  # type: ignore[operator]
         self._P = (np.eye(3) - K @ H) @ self._P  # type: ignore[operator]
 
+    def gated_update(
+        self,
+        xyz_meas: np.ndarray,
+        sigma_meas: float,
+        *,
+        physical_max_m: Optional[float] = None,
+        chi2_threshold: float = CHI2_3_DOF_99,
+    ) -> KFUpdateResult:
+        """KF update with Mahalanobis + optional physical innovation gates.
+
+        Rejected measurements leave ``position`` unchanged (predict-only for
+        this step).  Returns diagnostics for logging / safety aborts.
+        """
+        if not self.initialized:
+            self.initialize(xyz_meas, sigma_init=sigma_meas * 3)
+            return KFUpdateResult(True, reason='init')
+
+        z = np.array(xyz_meas, dtype=np.float64).flatten()[:3]
+        H = np.eye(3, dtype=np.float64)
+        innov = z - H @ self._x  # type: ignore[operator]
+        innov_norm = float(np.linalg.norm(innov))
+
+        if physical_max_m is not None and innov_norm > float(physical_max_m):
+            return KFUpdateResult(
+                False, reason='physical', innov_norm=innov_norm)
+
+        R = np.eye(3, dtype=np.float64) * sigma_meas ** 2
+        S = H @ self._P @ H.T + R  # type: ignore[operator]
+        try:
+            S_inv = np.linalg.inv(S)
+            mahal_sq = float(innov.T @ S_inv @ innov)
+        except np.linalg.LinAlgError:
+            return KFUpdateResult(
+                False, reason='singular_S', innov_norm=innov_norm)
+
+        if mahal_sq > float(chi2_threshold):
+            return KFUpdateResult(
+                False,
+                reason='mahalanobis',
+                mahal_sq=mahal_sq,
+                innov_norm=innov_norm,
+            )
+
+        K = self._P @ H.T @ S_inv  # type: ignore[operator]
+        self._x = self._x + K @ innov  # type: ignore[operator]
+        self._P = (np.eye(3) - K @ H) @ self._P  # type: ignore[operator]
+        return KFUpdateResult(
+            True,
+            reason='ok',
+            mahal_sq=mahal_sq,
+            innov_norm=innov_norm,
+        )
+
     def update_triangulated(self, xyz_meas: np.ndarray,
                             sigma_meas: float = 0.003) -> None:
         """Higher-precision update from active lateral-probe triangulation."""
         self.update(xyz_meas, sigma_meas)
+
+    def gated_update_triangulated(
+        self,
+        xyz_meas: np.ndarray,
+        sigma_meas: float = 0.003,
+        *,
+        physical_max_m: Optional[float] = None,
+    ) -> KFUpdateResult:
+        """Triangulation update — tighter default sigma, still gated."""
+        return self.gated_update(
+            xyz_meas,
+            sigma_meas,
+            physical_max_m=physical_max_m,
+            chi2_threshold=CHI2_3_DOF_99,
+        )
 
     # ------------------------------------------------------------------
     # Queries
@@ -148,6 +230,21 @@ if __name__ == '__main__':
     assert kf2.needs_active_probe(DEFAULT_PROBE_THRESHOLD)
     kf2.update_triangulated(TRUE_POS, sigma_meas=0.003)
     assert not kf2.needs_active_probe(DEFAULT_PROBE_THRESHOLD)
+
+    # Gating rejects a single wild outlier (simulate PBVS drift)
+    kf3 = BerryKFTracker()
+    kf3.initialize(TRUE_POS, sigma_init=0.03)
+    for _ in range(10):
+        kf3.predict(0.04)
+        kf3.gated_update(TRUE_POS + rng.normal(0, 0.008, 3), 0.008)
+    before = kf3.position.copy()
+    outlier = TRUE_POS + np.array([0.45, 0.35, -0.20])
+    kf3.predict(0.04)
+    gate = kf3.gated_update(outlier, 0.025, physical_max_m=0.10)
+    assert not gate.accepted, f'outlier should be rejected: {gate}'
+    assert np.linalg.norm(kf3.position - before) < 1e-9
+    print(f'  Gating rejected outlier: reason={gate.reason} '
+          f'mahal={gate.mahal_sq:.1f} |innov|={gate.innov_norm:.3f}m')
 
     print('  All assertions passed.')
     sys.exit(0)
