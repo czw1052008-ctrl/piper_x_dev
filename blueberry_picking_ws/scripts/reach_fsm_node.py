@@ -5378,6 +5378,7 @@ class ReachFsmNode(Node):
         self._pbvs_scaled_berry: Optional[np.ndarray] = None  # lock-ray 1-DOF
         self._pbvs_lock_ray: Optional[Tuple[np.ndarray, np.ndarray]] = None
         self._pbvs_ray_scale: Optional[Dict] = None
+        self._pbvs_ray_scale_best_gap: float = float('inf')  # keep best gap across ticks
         self._pbvs_frozen_normal: Optional[np.ndarray] = None  # outward, toward cup
         self._pbvs_surface_fit: Optional[Dict] = None
         self._pbvs_press_cup_start: Optional[np.ndarray] = None
@@ -5929,9 +5930,8 @@ class ReachFsmNode(Node):
         """During 4s oneshot: if live UV + baseline, 1-DOF scale lock ray → P1.
 
         Does not cancel the 4s traj. P1 is consumed by residual shots.
+        Keeps the result with smallest gap_m across all ticks (best triangulation).
         """
-        if getattr(self, '_pbvs_scaled_berry', None) is not None:
-            return
         ray = getattr(self, '_pbvs_lock_ray', None)
         P0 = getattr(self, '_pbvs_frozen_berry', None)
         if ray is None or P0 is None or live is None:
@@ -5948,21 +5948,26 @@ class ReachFsmNode(Node):
         rec = scale_lock_ray(
             o0, d0, T1, uv, self._wrist_intrinsics(),
             np.asarray(P0, dtype=np.float64),
-            min_lat_m=0.030, max_gap_m=0.010, max_dp_m=0.012)
+            min_lat_m=0.018, max_gap_m=0.010, max_dp_m=0.012)
         rec['live_uv'] = [float(uv[0]), float(uv[1])]
         rec['live_mode'] = mode
         rec['live_conf'] = float(getattr(live, 'confidence', 0.0) or 0.0)
         self._pbvs_ray_scale = rec
         if rec.get('ok') and rec.get('apply') and rec.get('P1') is not None:
-            self._pbvs_scaled_berry = np.asarray(rec['P1'], dtype=np.float64)
-            self._write_qa_json('pbvs_ray_scale.json', rec)
-            self._pbvs_qa_log_event('ray_scale', rec)
-            self.get_logger().info(
-                f'PBVS ray-scale APPLY |ΔP|={float(rec["dp_m"])*1000:.1f}mm '
-                f'lat={float(rec["lat_m"])*1000:.1f}mm '
-                f'skew={float(rec["gap_m"])*1000:.1f}mm '
-                f's {float(rec["s0_m"])*1000:.0f}→{float(rec["s1_m"])*1000:.0f}mm')
-        elif rec.get('lat_m', 0.0) >= 0.030:
+            cur_gap = float(rec.get('gap_m', float('inf')))
+            prev_gap = getattr(self, '_pbvs_ray_scale_best_gap', float('inf'))
+            if cur_gap < prev_gap:
+                self._pbvs_ray_scale_best_gap = cur_gap
+                self._pbvs_scaled_berry = np.asarray(rec['P1'], dtype=np.float64)
+                self._write_qa_json('pbvs_ray_scale.json', rec)
+                self._pbvs_qa_log_event('ray_scale', rec)
+                self.get_logger().info(
+                    f'PBVS ray-scale APPLY |ΔP|={float(rec["dp_m"])*1000:.1f}mm '
+                    f'lat={float(rec["lat_m"])*1000:.1f}mm '
+                    f'skew={float(rec["gap_m"])*1000:.1f}mm '
+                    f's {float(rec["s0_m"])*1000:.0f}→{float(rec["s1_m"])*1000:.0f}mm '
+                    f'(prev_gap={prev_gap*1000:.1f}mm)')
+        elif rec.get('lat_m', 0.0) >= 0.018:
             self._write_qa_json('pbvs_ray_scale.json', rec)
 
     def _pbvs_freeze_surface_normal(
@@ -6052,6 +6057,25 @@ class ReachFsmNode(Node):
             if axis is not None:
                 c = float(np.clip(np.dot(n, -axis), -1.0, 1.0))
                 qa['angle_to_cup_axis_at_lock_deg'] = math.degrees(math.acos(c))
+            # Refine P0 with surface-fit centroid: avoids depth-edge bleeding in
+            # depth_in_mask. contact_base uses only center+ring pixels filtered
+            # to |z - z0| < 8mm, giving a cleaner depth estimate.
+            cb = fit.get('contact_base')
+            if cb is not None and self._pbvs_frozen_berry is not None:
+                cb_arr = np.asarray(cb, dtype=np.float64).flatten()[:3]
+                delta = float(np.linalg.norm(cb_arr - self._pbvs_frozen_berry))
+                qa['p0_delta_m'] = float(delta)
+                if delta < 0.020:
+                    old_p0 = self._pbvs_frozen_berry.copy()
+                    self._pbvs_frozen_berry = cb_arr.copy()
+                    qa['p0_refined'] = True
+                    self.get_logger().info(
+                        f'P0 refined by surface_fit: Δ={delta*1000:.1f}mm '
+                        f'{np.round(old_p0, 3)} → {np.round(cb_arr, 3)}')
+                else:
+                    qa['p0_refined'] = False
+                    self.get_logger().warn(
+                        f'P0 surface_fit delta={delta*1000:.1f}mm > 20mm — skip')
         self._pbvs_surface_fit = qa
         self._write_qa_json('pbvs_surface_fit.json', qa)
         if self._pbvs_frozen_normal is not None:
