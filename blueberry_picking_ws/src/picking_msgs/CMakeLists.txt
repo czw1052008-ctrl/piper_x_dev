@@ -9,6 +9,7 @@ find_package(ament_cmake REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(builtin_interfaces REQUIRED)
 find_package(action_msgs REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
@@ -17,12 +18,28 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/PerceptionStatus.msg"
   "msg/SuctionGraspPlan.msg"
   "msg/VibrationPlan.msg"
+  "msg/SceneCluster.msg"
+  "msg/SceneBerry.msg"
+  "msg/SceneObstacle.msg"
+  "msg/SceneObstacleArray.msg"
+  "msg/OccupancyEsdf.msg"
+  "msg/OccupancyLocal.msg"
+  "msg/PlannerEgo.msg"
+  "msg/PlannerTaskContext.msg"
+  "msg/PlannerEndEffector.msg"
+  "msg/PlannerInput.msg"
+  "msg/ToolWaypoint6d.msg"
+  "msg/ToolTrajectory4s.msg"
+  "msg/JointWaypoint.msg"
+  "msg/IkJointTrajectory.msg"
+  "msg/ExecutorStatus.msg"
+  "msg/PerceptionScene.msg"
   "srv/TriggerGlobalDetection.srv"
   "srv/TriggerFineDetection.srv"
   "srv/PlanSuction.srv"
   "srv/PlanVibration.srv"
   "action/PickBlueberry.action"
-  DEPENDENCIES std_msgs geometry_msgs action_msgs
+  DEPENDENCIES std_msgs geometry_msgs builtin_interfaces action_msgs
 )
 
 ament_export_dependencies(rosidl_default_runtime)

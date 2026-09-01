@@ -420,7 +420,7 @@ def apply_joint_command(
     joint2_max_rad: float = 1.8,
     joint3_min_rad: float = -1.8,
     joint3_max_rad: float = 1.8,
-    joint6_limit_rad: float = 0.0,
+    joint6_limit_rad: float = 2.8797933,
     restore_joints: Optional[Sequence[float]] = None,
 ) -> List[float]:
     """Apply set_joints (absolute joints_deg or relative delta_deg) as position targets."""
@@ -492,7 +492,7 @@ def apply_action_to_joints(
     joint2_max_rad: float = 1.8,
     joint3_min_rad: float = -1.8,
     joint3_max_rad: float = 1.8,
-    joint6_limit_rad: float = 0.0,
+    joint6_limit_rad: float = 2.8797933,
     fixed_dx_px: Optional[float] = None,
     fixed_has_view: Optional[bool] = None,
     restore_joints: Optional[Sequence[float]] = None,
@@ -652,37 +652,17 @@ _vlm_client = None   # module-level singleton, initialised on first call
 
 def decide_action_vlm(
     obs: Dict[str, object],
-    global_img,   # np.ndarray RGB, target circled in red
-    wrist_img,    # np.ndarray RGB
+    global_img,
+    wrist_img,
     phase: str = 'command',
     **kwargs,
 ) -> Dict[str, object]:
-    """VLM-backed alignment decision via Claude vision API.
-
-    Falls back to decide_action() on any API or parse error so the robot
-    never stalls.  Set --action-judge-source=vlm to activate.
-    """
+    """VLM alignment decision via local Ollama. Raises on failure."""
     global _vlm_client
     if _vlm_client is None:
-        try:
-            from vlm_align_client import VLMAlignClient
-            _vlm_client = VLMAlignClient()
-        except Exception as exc:
-            import logging
-            logging.getLogger(__name__).warning(
-                f'VLMAlignClient init failed ({exc}); using heuristic for this session')
-            _vlm_client = False   # sentinel: don't retry import
-
-    if not _vlm_client:
-        return decide_action(obs, phase=phase, **kwargs)
-
-    try:
-        return _vlm_client.decide(global_img, wrist_img, obs, phase=phase)
-    except Exception as exc:
-        import logging
-        logging.getLogger(__name__).warning(
-            f'decide_action_vlm error ({exc}), falling back to heuristic')
-        return decide_action(obs, phase=phase, **kwargs)
+        from vlm_align_client import VLMAlignClient
+        _vlm_client = VLMAlignClient()
+    return _vlm_client.decide(global_img, wrist_img, obs, phase=phase)
 
 
 # ---------------------------------------------------------------------------

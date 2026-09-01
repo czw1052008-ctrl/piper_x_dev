@@ -2,7 +2,7 @@
 """Topic-driven reach FSM: agent region lock → align → wrist visual servo → confirm.
 
 Cmds on /reach/cmd (std_msgs/String):
-  start | confirm_reset | abort | clear_lock
+  start | start_refine | next_fruit | confirm_reset | abort | clear_lock
 
 Status on /reach/status. Reached edge on /reach/reached (Bool).
 See docs/REACH_PIPELINE.md.
@@ -36,7 +36,13 @@ from moveit_msgs.msg import (
     RobotState,
 )
 from moveit_msgs.srv import GetPositionIK
-from picking_msgs.msg import DetectedBerry, DetectedBerryArray, SuctionGraspPlan
+from picking_msgs.msg import (
+    DetectedBerry,
+    DetectedBerryArray,
+    ExecutorStatus,
+    SuctionGraspPlan,
+    ToolTrajectory4s,
+)
 from rclpy.action import ActionClient
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
@@ -44,7 +50,7 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CameraInfo, Image, JointState
 from shape_msgs.msg import SolidPrimitive
-from std_msgs.msg import Bool, String
+from std_msgs.msg import Bool, Header, String
 from std_srvs.srv import SetBool
 from tf2_ros import Buffer, TransformListener
 from trajectory_msgs.msg import JointTrajectoryPoint
@@ -150,6 +156,12 @@ class ReachFsmNode(Node):
         self._args = args
         # pbvs-vlm-reach-v2: enable continuous PBVS refining loop.
         self._use_pbvs: bool = getattr(args, 'use_pbvs', False)
+        self._pbvs_via_executor: bool = bool(getattr(args, 'pbvs_via_executor', False))
+        self._publish_tool_traj: bool = bool(getattr(args, 'publish_tool_traj', True))
+        self._pbvs_tool_traj_seq = 0
+        self._pbvs_executor_wait = False
+        self._pbvs_executor_motion_until = 0.0
+        self._last_executor_status: Optional[ExecutorStatus] = None
         # Goal 4: data collection for BC training.
         self._data_collector = None
         if getattr(args, 'collect_data', False):
@@ -337,6 +349,12 @@ class ReachFsmNode(Node):
             self, FollowJointTrajectory, '/arm_controller/follow_joint_trajectory',
             callback_group=self._cb_group)
         self._move_j_pub = self.create_publisher(JointState, '/control/move_j', 10)
+        self._tool_traj_pub = self.create_publisher(
+            ToolTrajectory4s, '/planning/tool_trajectory_4s', 10)
+        if self._pbvs_via_executor or self._publish_tool_traj:
+            self.create_subscription(
+                ExecutorStatus, '/planning/executor_status', self._on_executor_status, 10,
+                callback_group=self._cb_group)
         self._arm_enable = self.create_client(SetBool, '/enable_agx_arm', callback_group=self._cb_group)
         self._control_enable = self.create_client(SetBool, '/control_enable', callback_group=self._cb_group)
         self._arm_goal_handle = None
@@ -353,7 +371,8 @@ class ReachFsmNode(Node):
             f'(judge_mode={self._args.align_judge_mode}); '
             f'qa_dir={self._args.qa_dir}'
             + (f'; pbvs={getattr(self._args, "pbvs_mode", "stream")}@25Hz'
-               if self._use_pbvs else ''))
+               if self._use_pbvs else '')
+            + ('; via_executor' if self._pbvs_via_executor else ''))
 
     def _on_cmd(self, msg: String) -> None:
         cmd = msg.data.strip().lower()
@@ -808,6 +827,7 @@ class ReachFsmNode(Node):
         self._result_fut = None
         self._ik_fut = None
         self._traj_goal_fut = None
+        self._pbvs_executor_wait = False
         self._traj_result_fut = None
         self._approach_step = 0
 
@@ -982,6 +1002,8 @@ class ReachFsmNode(Node):
         if self._state == 'WAIT_CONFIRM':
             if cmd == 'confirm_reset':
                 self._set_state('RESETTING')
+            elif cmd == 'next_fruit':
+                self._prepare_for_next_fruit()
             return
 
         if self._state == 'RESETTING':
@@ -1066,19 +1088,26 @@ class ReachFsmNode(Node):
             if decision is None:
                 return True
         elif self._args.align_judge_mode == 'vlm':
-            # VLM-backed decision (pbvs-vlm-reach-v2).
             from align_judge import decide_action_vlm
-            decision = decide_action_vlm(
-                obs,
-                global_img=self._qa_rgb_fixed,
-                wrist_img=self._qa_rgb_wrist,
-                phase=phase,
-                failed_actions=self._align_failed_actions,
-                yaw_deadband_deg=self._args.align_yaw_deadband_deg,
-                pitch_target_rad=self._args.align_pitch_target_rad,
-                fine_visible_conf=self._args.align_fine_visible_conf,
-                ee_angle_trigger_deg=self._args.align_ee_angle_trigger_deg,
-            )
+            global_img = self._annotate_fixed_for_vlm()
+            if global_img is None or self._qa_rgb_wrist is None:
+                self._set_state('ERROR', 'VLM align: fixed/wrist camera not ready')
+                return False
+            try:
+                decision = decide_action_vlm(
+                    obs,
+                    global_img=global_img,
+                    wrist_img=self._qa_rgb_wrist,
+                    phase=phase,
+                    failed_actions=self._align_failed_actions,
+                    yaw_deadband_deg=self._args.align_yaw_deadband_deg,
+                    pitch_target_rad=self._args.align_pitch_target_rad,
+                    fine_visible_conf=self._args.align_fine_visible_conf,
+                    ee_angle_trigger_deg=self._args.align_ee_angle_trigger_deg,
+                )
+            except Exception as exc:
+                self._set_state('ERROR', f'VLM align failed: {exc}')
+                return False
         elif self._args.align_judge_mode == 'bc':
             # BC policy decision (Goal 4).
             from align_judge import decide_action_bc
@@ -1325,6 +1354,16 @@ class ReachFsmNode(Node):
             self._refine_j5_anchor = float(self._joints[4])
             self._refine_j2_anchor = float(self._joints[1])
             self._refine_j3_anchor = float(self._joints[2])
+
+    def _prepare_for_next_fruit(self) -> None:
+        """Pick cycle: leave WAIT_CONFIRM without homing; ready for next start_refine."""
+        self._locked = None
+        self._plan = None
+        self._cancel_move()
+        self._reset_refine_state()
+        self._reached_pub.publish(Bool(data=False))
+        self._set_state('IDLE', 'next_fruit')
+        self.get_logger().info('WAIT_CONFIRM → IDLE (next_fruit, arm stays in place)')
 
     def _berry_depth_diag(self, berry: DetectedBerry) -> Dict:
         mode = str(getattr(berry, 'depth_mode', '') or '')
@@ -2410,6 +2449,25 @@ class ReachFsmNode(Node):
         berries.sort(key=lambda b: (-float(b.confidence), abs(float(b.pose.pose.position.z))))
         return berries
 
+    def _annotate_fixed_for_vlm(self) -> Optional[np.ndarray]:
+        """Copy fixed RGB with locked cluster marked (red circle) for VLM."""
+        if self._qa_rgb_fixed is None:
+            return None
+        img = self._qa_rgb_fixed.copy()
+        if self._locked is None:
+            return img
+        p = self._locked.pose.pose.position
+        uv = self._project_base_point_to_fixed_image(
+            (float(p.x), float(p.y), float(p.z)))
+        if uv is None:
+            return img
+        import cv2  # type: ignore
+        u, v = int(uv[0]), int(uv[1])
+        cv2.circle(img, (u, v), 36, (255, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(img, 'CLUSTER', (max(u - 40, 4), max(v - 44, 16)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 0), 2, cv2.LINE_AA)
+        return img
+
     def _write_lock_region_request(self, berries: List[DetectedBerry]) -> None:
         d = os.path.join(self._args.qa_dir, self._qa_session or 'latest')
         os.makedirs(d, exist_ok=True)
@@ -2446,7 +2504,7 @@ class ReachFsmNode(Node):
             f'pos=({p.x:.3f},{p.y:.3f},{p.z:.3f}) frame={berry.pose.header.frame_id}')
 
     def _tick_lock_region(self) -> bool:
-        """Agent (file) or heuristic region lock before ALIGN. Returns True when locked."""
+        """Pick cluster via lock_region_decision.json before ALIGN."""
         berries = self._global_region_candidates()
         if not berries:
             now = time.time()
@@ -2454,13 +2512,6 @@ class ReachFsmNode(Node):
                 self._lock_wait_log_t = now
                 self.get_logger().info('LOCKING waiting for /perception/global/berries')
             return False
-
-        if self._args.align_judge_mode != 'file':
-            self.get_logger().warn(
-                'LOCKING heuristic: auto index=0 (file/agent mode required for approved path)')
-            self._apply_region_lock(berries[0], source='heuristic_auto')
-            self._build_approach_map_from_global()
-            return True
 
         if not self._lock_request_written:
             self._write_lock_region_request(berries)
@@ -3333,7 +3384,6 @@ class ReachFsmNode(Node):
         # Seed IK with yaw already aimed at berry after the orbit.
         seed = list(self._joints)
         seed[0] = float(self._joints[0] + dj1)
-        seed[5] = 0.0
         joints = position_ik_keep_orient(tgt, seed)
         if joints is None:
             self.get_logger().warn('REFINING mono probe: keep_orient IK failed')
@@ -3341,7 +3391,6 @@ class ReachFsmNode(Node):
         target = list(joints)
         # Explicitly keep yaw facing plant (orbit dj1).
         target[0] = float(self._joints[0] + dj1)
-        target[5] = 0.0
         target = self._clamp_servo_target(target)
         # Limit per-step joint change (still allow meaningful yaw).
         max_dj = [
@@ -3356,7 +3405,6 @@ class ReachFsmNode(Node):
             d = target[i] - self._joints[i]
             d = max(-max_dj[i], min(max_dj[i], d))
             target[i] = float(self._joints[i] + d)
-        target[5] = 0.0
 
         travel = math.sqrt(d_base[0] ** 2 + d_base[1] ** 2 + d_base[2] ** 2)
         dist = math.sqrt(
@@ -3715,7 +3763,6 @@ class ReachFsmNode(Node):
         w, h = self._wrist_image_wh()
         fx, fy, cx0, cy0 = self._wrist_intrinsics()
         seed = list(self._joints)
-        seed[5] = 0.0
         tol_pix = max(8.0, pix_tol * 0.5)
         joints = aim_uv_ik(
             berry,
@@ -3743,7 +3790,6 @@ class ReachFsmNode(Node):
             return False
 
         target = self._clamp_servo_target(list(joints))
-        target[5] = 0.0
         # Approximate travel for traj timing / QA.
         ee = self._current_ee_pose()
         if ee is None:
@@ -4473,7 +4519,6 @@ class ReachFsmNode(Node):
         w, h = self._wrist_image_wh()
         fx, fy, cx0, cy0 = self._wrist_intrinsics()
         seed = list(self._joints)
-        seed[5] = 0.0
         tol_pix = max(8.0, pix_tol * 0.5)
         joints = aim_uv_ik(
             berry,
@@ -4497,7 +4542,6 @@ class ReachFsmNode(Node):
             return False
 
         target = self._clamp_servo_target(list(joints))
-        target[5] = 0.0
         ee = self._current_ee_pose()
         if ee is None:
             return False
@@ -5418,6 +5462,59 @@ class ReachFsmNode(Node):
         mode = str(getattr(self._args, 'pbvs_mode', 'single') or 'single')
         return self._use_pbvs and mode == 'twostage'
 
+    def _on_executor_status(self, msg: ExecutorStatus) -> None:
+        self._last_executor_status = msg
+
+    def _publish_pbvs_tool_trajectory(
+        self,
+        tip_start: Sequence[float],
+        tip_goal: Sequence[float],
+        approach_axis: Sequence[float],
+        *,
+        move_duration_s: float,
+        tag: str = '',
+    ) -> int:
+        """Publish PBVS setpoint as /planning/tool_trajectory_4s (teacher source)."""
+        if not self._publish_tool_traj and not self._pbvs_via_executor:
+            return int(self._pbvs_tool_traj_seq)
+        from tool_trajectory_utils import build_tool_trajectory_4s
+        self._pbvs_tool_traj_seq += 1
+        hdr = Header()
+        hdr.stamp = self.get_clock().now().to_msg()
+        hdr.frame_id = 'base_link'
+        msg = build_tool_trajectory_4s(
+            tip_start, tip_goal, approach_axis,
+            header=hdr,
+            seq=int(self._pbvs_tool_traj_seq),
+            move_duration_s=float(move_duration_s),
+        )
+        self._tool_traj_pub.publish(msg)
+        self.get_logger().info(
+            f'PBVS tool_traj seq={msg.seq} tag={tag or "-"} '
+            f'move={move_duration_s:.2f}s exec_i={msg.execute_until_index} '
+            f'tip→{np.round(np.asarray(tip_goal, dtype=float), 3)}')
+        return int(msg.seq)
+
+    def _begin_pbvs_executor_wait(self, *, traj_s: float, tool_seq: int) -> None:
+        """Wait for trajectory_executor instead of local FollowJointTrajectory."""
+        settle = float(self._args.servo_settle_s)
+        dt = float(max(0.05, traj_s))
+        self._pbvs_executor_wait = True
+        self._pbvs_executor_motion_until = time.time() + dt
+        self._servo_deadline = time.time() + max(
+            float(self._args.servo_timeout_s), dt + settle + 2.0)
+        self._servo_settle_until = time.time() + dt + settle
+        self._move_phase = 'servo'
+        self._ik_fut = None
+        self._traj_goal_fut = None
+        self._traj_result_fut = None
+        self._servo_motion_frames = []
+        self._servo_motion_last_t = 0.0
+        self._pbvs_pending_tool_seq = int(tool_seq)
+        self._snap_servo_motion_frame(force=True)
+        self.get_logger().info(
+            f'PBVS via_executor wait seq={tool_seq} traj={dt:.2f}s')
+
     def _tick_pbvs_rate(self) -> None:
         """25 Hz PBVS execution; skip while a blocking traj (probe) is in flight."""
         if self._state != 'REFINING' or not self._use_pbvs:
@@ -5740,7 +5837,7 @@ class ReachFsmNode(Node):
         dir_base: Optional[np.ndarray] = None,
     ) -> bool:
         """Blocking cup_axis oneshot; ``pending`` identifies phase on settle."""
-        if not self._arm.server_is_ready():
+        if not self._pbvs_via_executor and not self._arm.server_is_ready():
             return False
         travel = float(travel_m)
         min_travel = self._pbvs_min_oneshot_travel_m()
@@ -5783,6 +5880,59 @@ class ReachFsmNode(Node):
         ], dtype=np.float64)
         tcp0 = np.array([float(tcp[0]), float(tcp[1]), float(tcp[2])], dtype=np.float64)
         tcp_goal = tcp0 + np.asarray(d_base, dtype=np.float64)
+
+        # Approach axis for planner I/O: prefer −n, else tip→berry.
+        approach_axis = None
+        n_aim_pub = getattr(self, '_pbvs_frozen_normal', None)
+        if n_aim_pub is not None:
+            n_u = np.asarray(n_aim_pub, dtype=np.float64).flatten()[:3]
+            nn = float(np.linalg.norm(n_u))
+            if nn > 1e-9:
+                approach_axis = (-n_u / nn).tolist()
+        if approach_axis is None:
+            look = np.asarray(berry_t, dtype=np.float64) - tcp_goal
+            ln = float(np.linalg.norm(look))
+            if ln > 1e-9:
+                approach_axis = (look / ln).tolist()
+            else:
+                axis = self._cup_axis_base()
+                approach_axis = (
+                    axis.tolist() if axis is not None else [0.0, 0.0, 1.0])
+
+        if tag == 'pbvs_single':
+            traj_s = float(self._args.align_traj_s)
+        elif tag == 'pbvs_single_residual':
+            traj_s = float(self._args.servo_traj_s)
+        else:
+            traj_s = max(0.8, min(4.0, float(travel) / 0.04))
+
+        tool_seq = self._publish_pbvs_tool_trajectory(
+            tcp0.tolist(), tcp_goal.tolist(), approach_axis,
+            move_duration_s=float(traj_s), tag=tag)
+
+        if self._pbvs_via_executor:
+            self._pbvs_oneshot_pending = pending
+            pkg = {
+                'berry_base': list(berry_t),
+                'tcp_start': list(tcp0),
+                'tcp_goal': list(tcp_goal),
+                'travel_m': float(travel),
+                'd_cam_surface_m': float(d_cam_surface) if d_cam_surface is not None else None,
+                'method': str(method),
+                'traj_s': float(traj_s),
+                'phase': pending,
+                'via_executor': True,
+                'tool_traj_seq': int(tool_seq),
+                'approach_axis': list(approach_axis),
+            }
+            self._write_qa_json(f'pbvs_{pending}.json', pkg)
+            self._pbvs_qa_log_event(f'oneshot_{pending}', pkg)
+            self._begin_pbvs_executor_wait(traj_s=float(traj_s), tool_seq=int(tool_seq))
+            self.get_logger().info(
+                f'PBVS {tag}: via_executor travel={travel*1000:.1f}mm '
+                f'traj={traj_s:.1f}s seq={tool_seq}')
+            return True
+
         joints = None
         ik_method = 'keep_orient'
         aim_t = berry_t
@@ -5825,12 +5975,6 @@ class ReachFsmNode(Node):
             self.get_logger().warn(f'PBVS {tag}: IK failed')
             return False
         target = self._clamp_servo_target(list(joints))
-        if tag == 'pbvs_single':
-            traj_s = float(self._args.align_traj_s)
-        elif tag == 'pbvs_single_residual':
-            traj_s = float(self._args.servo_traj_s)
-        else:
-            traj_s = max(0.8, min(4.0, float(travel) / 0.04))
         ok = self._send_joint_servo_goal(
             target,
             tag=tag,
@@ -5857,6 +6001,7 @@ class ReachFsmNode(Node):
                     np.asarray(dir_base, dtype=np.float64).tolist()
                     if dir_base is not None else None),
                 'aim_base': list(aim_t) if lookat else None,
+                'tool_traj_seq': int(tool_seq),
             }
             self._write_qa_json(f'pbvs_{pending}.json', pkg)
             self._pbvs_qa_log_event(f'oneshot_{pending}', pkg)
@@ -7225,6 +7370,16 @@ class ReachFsmNode(Node):
 
         q_new = cartesian_velocity_step(
             q_current.tolist(), v, dt=PBVS_DT, max_dq=PBVS_MAX_DQ)
+        # Publish teacher tool traj ~1 Hz; optional executor drive.
+        if now - getattr(self, '_pbvs_tool_traj_pub_t', 0.0) >= 1.0:
+            self._pbvs_tool_traj_pub_t = now
+            self._publish_pbvs_tool_trajectory(
+                tip_now.tolist(), np.asarray(p_des, dtype=float).tolist(),
+                np.asarray(approach_dir, dtype=float).tolist(),
+                move_duration_s=1.0, tag=f'stream_{self._pbvs_state}')
+        if self._pbvs_via_executor:
+            # Executor owns joint streaming; do not dual-drive.
+            return
         # Short preemptible traj (~teleop), not blocking settle.
         self._stream_joint_goal(q_new, traj_s=max(0.12, PBVS_DT * 3.0))
 
@@ -7999,12 +8154,7 @@ class ReachFsmNode(Node):
         return True
 
     def _clamp_servo_target(self, target: List[float]) -> List[float]:
-        """URDF / suction soft limits — j6 locked; j4 free within URDF.
-
-        Historically target[3]=0 forced a planar wrist. That strips the j4
-        compensation keep_orient needs when j2 lifts → tip dives. Only j6
-        (suction roll) stays locked at 0 (REACH_PIPELINE).
-        """
+        """URDF soft limits — j6 unlocked (±align_joint6_limit_rad, default ±165°)."""
         j1_lim = math.radians(float(self._args.align_joint1_limit_deg))
         target[0] = max(-j1_lim, min(j1_lim, target[0]))
         target[1] = max(0.0, min(math.pi, target[1]))
@@ -8015,7 +8165,11 @@ class ReachFsmNode(Node):
         target[4] = max(
             float(self._args.align_joint5_min_rad),
             min(float(self._args.align_joint5_max_rad), target[4]))
-        target[5] = 0.0
+        j6_lim = abs(float(self._args.align_joint6_limit_rad))
+        if j6_lim <= 1e-9:
+            target[5] = 0.0
+        else:
+            target[5] = max(-j6_lim, min(j6_lim, float(target[5])))
         return target
 
     def _clamp_oneshot_joints_from_ik(
@@ -8052,7 +8206,6 @@ class ReachFsmNode(Node):
             d = float(joints[i]) - float(self._joints[i])
             d = max(-max_dj[i], min(max_dj[i], d))
             target[i] = float(self._joints[i] + d)
-        target[5] = 0.0
         return self._clamp_servo_target(target)
 
     def _plan_tip_to_surface_delta(
@@ -8488,7 +8641,7 @@ class ReachFsmNode(Node):
 
         j6 is locked (5-DOF). MoveIt `/compute_ik` asks for full SE(3) and
         returns NO_IK_SOLUTION for almost any absolute pose off the manifold.
-        We therefore solve *position-only* Jacobian IK (joints 1–5) so cm-scale
+        We therefore solve *position-only* Jacobian IK (joints 1–6) so cm-scale
         cup→berry waypoints map to FollowJointTrajectory without joint heuristics.
         """
         if not self._arm.server_is_ready():
@@ -8597,18 +8750,16 @@ class ReachFsmNode(Node):
             math.radians(float(self._args.servo_max_dj3_deg)),
             math.radians(5.0),
             math.radians(float(self._args.servo_max_dj5_deg)),
-            0.0,
+            math.radians(8.0),  # j6 unlocked
         ]
         if self._refine_phase == 'center':
             # Tighter joint caps during centering to keep tracker alive.
             max_dj = [0.55 * v for v in max_dj]
-            max_dj[5] = 0.0
         target = list(self._joints)
         for i in range(6):
             d = joints[i] - self._joints[i]
             d = max(-max_dj[i], min(max_dj[i], d))
             target[i] = float(self._joints[i] + d)
-        target[5] = 0.0
         target = self._clamp_servo_target(target)
 
         est_tag = ' est' if using_estimate else ''
@@ -8682,7 +8833,33 @@ class ReachFsmNode(Node):
         if self._servo_deadline > 0.0 and time.time() > self._servo_deadline:
             self._cancel_move()
             self._servo_pending_record = None
+            self._pbvs_executor_wait = False
             self._set_state('ERROR', 'wrist servo step timeout')
+            return
+
+        # PBVS → executor path: no local FollowJointTrajectory handle.
+        if self._pbvs_executor_wait and self._move_phase == 'servo':
+            st = self._last_executor_status
+            done = False
+            if (st is not None
+                    and int(getattr(st, 'tool_traj_seq', -1))
+                    == int(getattr(self, '_pbvs_pending_tool_seq', -2))):
+                if str(st.status) == 'ok':
+                    done = True
+                elif str(st.status) in ('ik_fail', 'jump_reject'):
+                    self._pbvs_executor_wait = False
+                    self._cancel_move()
+                    self._set_state('ERROR', f'executor {st.status}: {st.detail}')
+                    return
+            if time.time() >= float(self._pbvs_executor_motion_until):
+                done = True
+            if done:
+                self._pbvs_executor_wait = False
+                self._snap_servo_motion_frame(force=True)
+                self._servo_settle_until = time.time() + float(self._args.servo_settle_s)
+                self._move_phase = 'servo_settle'
+            else:
+                self._snap_servo_motion_frame()
             return
 
         if self._move_phase == 'servo_ik':
@@ -9312,7 +9489,7 @@ def main() -> int:
     parser.add_argument('--align-only', action='store_true',
                         help='Stop after coarse ALIGNING (QA); do not refine/approach')
     parser.add_argument('--align-judge-mode', choices=('heuristic', 'file', 'vlm'), default='heuristic',
-                        help='Action judge source during ALIGNING; file mode waits for qa_dir/session/align_decision.json; vlm uses Claude vision API')
+                        help='Action judge source during ALIGNING; file waits for align_decision.json; vlm uses local Ollama')
     parser.add_argument('--align-max-steps', type=int, default=8,
                         help='Max accepted-or-rolled-back ALIGNING attempts before exit')
     parser.add_argument('--align-yaw-step-deg', type=float, default=18.0,
@@ -9336,6 +9513,15 @@ def main() -> int:
                         default='single',
                         help='single(=oneshot alias): lock→1×cup_axis to berry surface; '
                              'twostage: legacy pre-grasp+depth_final; stream: 25Hz PBVS')
+    parser.add_argument('--publish-tool-traj', dest='publish_tool_traj',
+                        action='store_true', default=True,
+                        help='Publish PBVS setpoints as /planning/tool_trajectory_4s')
+    parser.add_argument('--no-publish-tool-traj', dest='publish_tool_traj',
+                        action='store_false',
+                        help='Disable PBVS→tool_trajectory_4s publishing')
+    parser.add_argument('--pbvs-via-executor', action='store_true', default=False,
+                        help='P0b: PBVS only publishes tool_trajectory_4s; '
+                             'trajectory_executor drives the arm')
     parser.add_argument('--pbvs-press-m', type=float, default=0.0,
                         help='After direct settle, extra press into fruit along -n (m). '
                              '0=skip press (still SUCTION_HOLD placeholder). Cap 5mm.')
@@ -9371,8 +9557,8 @@ def main() -> int:
                         help='Lower clamp for joint5 command during ALIGNING')
     parser.add_argument('--align-joint5-max-rad', type=float, default=1.20,
                         help='Upper clamp for joint5 command during ALIGNING')
-    parser.add_argument('--align-joint6-limit-rad', type=float, default=0.0,
-                        help='ALIGN |joint6| soft clamp; 0 locks j6 at 0 (suction tip, no roll)')
+    parser.add_argument('--align-joint6-limit-rad', type=float, default=2.8797933,
+                        help='ALIGN/REFINE |joint6| soft clamp rad; 0 locks j6 at 0')
     parser.add_argument('--qa-dir', default=os.path.join(
         os.path.dirname(os.path.abspath(__file__)), '..', 'log', 'real_robot', 'qa'),
         help='Directory for before/after align screenshots')

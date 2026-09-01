@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start global_detector_node (fixed-camera YOLO mono → base_link).
+# Start global_detector_node (fixed DaBai RGB-D YOLO → base_link).
 set -eo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 if [[ -f "${ROOT}/config/real_robot.env" ]]; then
@@ -17,11 +17,14 @@ set -u 2>/dev/null || true
 # shellcheck disable=SC1090
 source "${ROOT}/scripts/_yolo_pythonpath.sh"
 
-# DaBai global publishes Orbbec colour topics (not legacy v4l2 /image_raw).
+# DaBai global: color + registered depth (no mono diameter pose).
 ARGS=(--ros-args
   -p publish_hz:=10.0
   -p image_topic:=/camera_fixed/color/image_raw
+  -p depth_topic:=/camera_fixed/depth/image_raw
+  -p info_topic:=/camera_fixed/color/camera_info
   -p camera_frame:=camera_fixed_color_optical_frame
+  -p depth_pose_source:=depth
   -p mask_source:=yolo
 )
 YOLO_CFG="${ROOT}/src/picking_perception/config/foundation_pose.yaml"

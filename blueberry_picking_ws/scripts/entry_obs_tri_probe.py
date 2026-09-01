@@ -146,13 +146,11 @@ def _orbit_target_joints(
     dj1 = yaw_frac * alpha
     seed = list(joints)
     seed[0] = float(joints[0] + dj1)
-    seed[5] = 0.0
     qi = position_ik_keep_orient(tgt, seed)
     if qi is None:
         raise RuntimeError('orbit IK failed')
     target = list(qi)
     target[0] = float(joints[0] + dj1)
-    target[5] = 0.0
     meta = {
         'orbit_alpha_deg': math.degrees(alpha),
         'dj1_deg': math.degrees(dj1),

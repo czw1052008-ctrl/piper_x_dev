@@ -10,9 +10,10 @@ fine_detector_node:
     max_detections: 6
     # mask_source: yolo (custom trained) | hsv
     mask_source: yolo
-    yolo_model: /home/user/codes/piper_x_dev/blueberry_picking_ws/runs/detect/blueberry-7/weights/best.pt
+    yolo_model: /home/user/codes/piper_x_dev/blueberry_picking_ws/runs/detect/blueberry-unified-1/weights/best.pt
     yolo_open_vocab: false
-    yolo_classes: "blueberry"
+    yolo_classes: "berry"
+    yolo_target_class_ids: "0"
     # Locked mid-range tracking: keep this high so BoT-SORT stays sticky.
     # After-center / entry unlock uses yolo_unlocked_conf_threshold (detect only).
     yolo_conf_threshold: 0.28
@@ -25,8 +26,7 @@ fine_detector_node:
     enable_tracking: true
     # Calibrated 2026-08-05: tape cam→berry ≈15cm while mono@0.015→~13cm; scale d.
     berry_diameter_m: 0.017
-    # Pose Z: depth_raw (mask median) | mono (bbox fallback). Gemini 305 depth
-    # is used directly when mask has valid pixels; mono only on depth miss.
+    # Pose Z: RGB-D mask median only. No silent mono invent (coast/skip on miss).
     depth_pose_source: depth
     depth_min_m: 0.10
     depth_max_m: 1.5
@@ -35,17 +35,28 @@ fine_detector_node:
 global_detector_node:
   ros__parameters:
     mask_source: yolo
-    # Custom blueberry-4 misfires on arm/cup in this scene; use open-vocab for coarse plant lock.
-    yolo_model: yoloe-11s-seg-pf.pt
-    yolo_open_vocab: true
-    yolo_classes: "blueberry plant,blueberries,blueberry"
-    yolo_conf_threshold: 0.45
-    yolo_min_area_px: 400
-    yolo_max_area_frac: 0.22
+    yolo_model: /home/user/codes/piper_x_dev/blueberry_picking_ws/runs/detect/blueberry-unified-1/weights/best.pt
+    yolo_open_vocab: false
+    yolo_classes: "cluster"
+    yolo_target_class_ids: "1"
+    yolo_conf_threshold: 0.35
+    yolo_min_area_px: 1500
+    yolo_max_area_frac: 0.06
     yolo_min_circularity: 0.08
     yolo_max_aspect_ratio: 3.5
+    # berry_diameter_m only for diagnostic z_mono_m; pose uses RGB-D.
     berry_diameter_m: 0.08
-    camera_focal_px: 900.0
+    depth_pose_source: depth
+    depth_topic: /camera_fixed/depth/image_raw
+    info_topic: /camera_fixed/color/camera_info
+    depth_min_m: 0.20
+    depth_max_m: 2.5
+    min_valid_depth_px: 30
     publish_hz: 10.0
     min_mask_px: 200
     max_mask_px: 80000
+    enable_tracking: true
+    max_cluster_detections: 8
+    track_iou_thresh: 0.30
+    track_max_misses: 20
+    track_max_dist_m: 0.25

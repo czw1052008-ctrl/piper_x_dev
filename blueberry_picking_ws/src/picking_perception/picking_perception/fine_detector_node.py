@@ -93,7 +93,7 @@ class FineDetectorNode(Node):
     def __init__(self) -> None:
         super().__init__('fine_detector_node')
         self.declare_parameter('score_threshold', 0.3)
-        self.declare_parameter('max_detections', 8)
+        self.declare_parameter('max_detections', 10)
         self.declare_parameter('mask_source', 'yolo')
         self.declare_parameter('yolo_model', 'yoloe-11s-seg-pf.pt')
         self.declare_parameter('yolo_classes', 'blueberry,blueberries,berry')
@@ -106,6 +106,7 @@ class FineDetectorNode(Node):
         self.declare_parameter('yolo_min_circularity', 0.45)
         self.declare_parameter('yolo_max_aspect_ratio', 2.0)
         self.declare_parameter('yolo_open_vocab', True)
+        self.declare_parameter('yolo_target_class_ids', '')
         self.declare_parameter('enable_tracking', True)
         self.declare_parameter('tracker_config', '')
         self.declare_parameter('berry_diameter_m', 0.015)
@@ -116,10 +117,12 @@ class FineDetectorNode(Node):
         self.declare_parameter('depth_pose_source', 'depth')
         self.declare_parameter('track_lost_max_frames', 25)
         self.declare_parameter('publish_hz', 10.0)
-        self.declare_parameter(
-            'lock_bbox_file',
-            'log/real_robot/target_bbox_lock.json',
-        )
+        # Empty / /dev/null: publish all YOLO berries (planner default).
+        # Set to a target_bbox_lock.json only for calib/refine single-fruit pin.
+        self.declare_parameter('lock_bbox_file', '')
+        # When lock_bbox_file is set: if true, collapse publish list to the
+        # single pinned berry (legacy refine). Planner wants false + all berries.
+        self.declare_parameter('collapse_to_file_bbox_pin', False)
         self.declare_parameter('enable_foundation_pose', False)
         self.declare_parameter('mesh_path', '')
         self.declare_parameter('foundation_pose_root', '')
@@ -168,6 +171,10 @@ class FineDetectorNode(Node):
         if self._mask_source == 'yolo':
             prompts = [
                 p.strip() for p in str(self.get_parameter('yolo_classes').value).split(',') if p.strip()]
+            target_ids = [
+                int(p.strip()) for p in str(self.get_parameter('yolo_target_class_ids').value).split(',')
+                if p.strip()
+            ]
             self._yolo = YoloBerryDetector(
                 model_name=str(self.get_parameter('yolo_model').value),
                 class_prompts=prompts,
@@ -178,6 +185,7 @@ class FineDetectorNode(Node):
                 max_aspect_ratio=float(self.get_parameter('yolo_max_aspect_ratio').value),
                 max_detections=int(self.get_parameter('max_detections').value),
                 open_vocab=bool(self.get_parameter('yolo_open_vocab').value),
+                target_class_ids=target_ids or None,
                 tracker_config=tracker_cfg,
             )
             self._yolo_unlocked_conf = float(
@@ -201,11 +209,11 @@ class FineDetectorNode(Node):
         )
         self._track_lost_max = int(self.get_parameter('track_lost_max_frames').value)
         self._depth_pose_source = str(
-            self.get_parameter('depth_pose_source').value or 'mono').strip().lower()
+            self.get_parameter('depth_pose_source').value or 'depth').strip().lower()
         if self._depth_pose_source not in ('mono', 'depth', 'fused'):
             self.get_logger().warn(
-                f'unknown depth_pose_source={self._depth_pose_source!r}; using mono')
-            self._depth_pose_source = 'mono'
+                f'unknown depth_pose_source={self._depth_pose_source!r}; using depth')
+            self._depth_pose_source = 'depth'
         self.get_logger().info(f'depth_pose_source={self._depth_pose_source}')
 
         # Depth Anything V2 fuser — lazy-loaded on first use (pbvs-vlm-reach-v2).
@@ -241,6 +249,8 @@ class FineDetectorNode(Node):
             self.get_parameter('lock_bbox_file').value or '').strip()
         self._lock_bbox_file_mtime = 0.0
         self._file_bbox_xyxy: Optional[Tuple[int, int, int, int]] = None
+        self._collapse_to_file_bbox_pin = bool(
+            self.get_parameter('collapse_to_file_bbox_pin').value)
         self._lock_iou_min = 0.15
         self._file_bbox_center_max_px = 55.0
 
@@ -265,6 +275,53 @@ class FineDetectorNode(Node):
         hz = max(float(self.get_parameter('publish_hz').value), 0.2)
         self.create_timer(1.0 / hz, self._tick)
         self.get_logger().info(f'fine_detector streaming /perception/fine/berries @ {hz:.1f} Hz')
+
+    def _fill_surface_normal(
+        self, berry: DetectedBerry, T_base_cam: Optional[np.ndarray],
+    ) -> None:
+        """Depth-ring PCA plane → surface_normal_base (toward camera)."""
+        berry.surface_normal_base = [0.0, 0.0, 0.0]
+        berry.normal_valid = False
+        if (
+            T_base_cam is None
+            or self._depth is None
+            or self._k is None
+            or float(berry.image_u) < 0.0
+            or float(berry.image_v) < 0.0
+        ):
+            return
+        try:
+            scripts_dir = os.path.abspath(
+                os.path.join(os.path.dirname(__file__), '..', '..', '..', 'scripts'))
+            if scripts_dir not in sys.path:
+                sys.path.insert(0, scripts_dir)
+            from berry_surface_fit import fit_contact_surface
+        except Exception as exc:
+            self.get_logger().warn(f'surface_fit import failed: {exc}')
+            return
+
+        p = berry.pose.pose.position
+        berry_base = np.array([float(p.x), float(p.y), float(p.z)], dtype=np.float64)
+        cam_origin = T_base_cam[:3, 3].copy()
+        toward = cam_origin - berry_base
+        z_hint = float(berry.center_depth_m) if berry.center_depth_m > 0.05 else None
+        fit = fit_contact_surface(
+            self._depth,
+            float(berry.image_u),
+            float(berry.image_v),
+            fx=float(self._k[0, 0]),
+            fy=float(self._k[1, 1]),
+            cx=float(self._k[0, 2]),
+            cy=float(self._k[1, 2]),
+            T_base_cam=T_base_cam,
+            toward_base=toward,
+            z_hint_m=z_hint,
+        )
+        if not fit.get('ok') or fit.get('n_base') is None:
+            return
+        n = fit['n_base']
+        berry.surface_normal_base = [float(n[0]), float(n[1]), float(n[2])]
+        berry.normal_valid = True
 
     def _on_rgb(self, msg: Image) -> None:
         try:
@@ -415,19 +472,15 @@ class FineDetectorNode(Node):
         x1m = min(depth.shape[1], u + half)
         mask[y0m:y1m, x0m:x1m] = 255
         z_mono = self._depth_util.mono_depth_from_mask(mask, k)
-        if self._depth_pose_source == 'depth':
-            if z_depth is not None:
-                z = float(z_depth)
-                mode = 'depth_raw'
-            else:
-                z = float(z_mono)
-                mode = 'mono'
+        if self._depth_pose_source == 'mono':
+            z = float(z_mono)
+            mode = 'mono'
         elif z_depth is not None:
             z = float(z_depth)
             mode = 'depth_raw'
         else:
-            z = float(z_mono)
-            mode = 'mono'
+            # RGB-D path: no mono invent for pin synthetic.
+            return None
         if z <= 1e-4:
             return None
         x, y, zz = self._depth_util.uv_to_cam_xyz(u, v, z, k)
@@ -485,11 +538,11 @@ class FineDetectorNode(Node):
         k: np.ndarray,
         *,
         prior_z: Optional[float] = None,
-    ) -> Tuple[np.ndarray, str, Optional[float], float]:
+    ) -> Optional[Tuple[np.ndarray, str, Optional[float], float]]:
         z_depth = self._depth_util.depth_in_mask(depth, det.mask)
         z_mono = self._depth_util.mono_depth_from_mask(det.mask, k)
         if self._depth_pose_source == 'fused' and self._depth_fuser is not None:
-            # Priority: RGB-D → Depth Anything V2 → mono.
+            # Priority: RGB-D → Depth Anything V2; no silent mono invent.
             rgb = getattr(self, '_rgb', None)
             fused_z, fused_src = self._depth_fuser.get_depth(
                 rgb_img=rgb if rgb is not None else np.zeros((1, 1, 3), dtype=np.uint8),
@@ -502,16 +555,11 @@ class FineDetectorNode(Node):
                 if prior_z is not None:
                     z = 0.90 * z + 0.10 * float(prior_z)
                     mode = f'fused_{fused_src}_coast'
+            elif prior_z is not None:
+                z = float(prior_z)
+                mode = 'fused_coast'
             else:
-                z = float(z_mono)
-                mode = 'mono_fallback'
-        elif self._depth_pose_source == 'mono':
-            # Hardware RGB-D often samples background through mask holes.
-            z = float(z_mono)
-            mode = 'mono'
-            if prior_z is not None:
-                z = 0.85 * z + 0.15 * float(prior_z)
-                mode = 'coast'
+                return None
         elif self._depth_pose_source == 'depth':
             if z_depth is not None:
                 z = float(z_depth)
@@ -520,18 +568,26 @@ class FineDetectorNode(Node):
                 z = float(prior_z)
                 mode = 'depth_coast'
             else:
-                z = float(z_mono)
-                mode = 'depth_missing'
+                # DaBai/Gemini RGB-D path: do not invent mono poses.
+                return None
+        elif self._depth_pose_source == 'mono':
+            # Explicit legacy debug only.
+            z = float(z_mono)
+            mode = 'mono'
+            if prior_z is not None:
+                z = 0.85 * z + 0.15 * float(prior_z)
+                mode = 'coast'
         elif z_depth is not None:
             z = float(z_depth)
             mode = 'depth_raw'
         elif prior_z is not None:
-            z = 0.75 * z_mono + 0.25 * prior_z
-            mode = 'coast'
+            z = float(prior_z)
+            mode = 'depth_coast'
         else:
-            z = z_mono
-            mode = 'mono'
+            return None
         ys, xs = np.where(det.mask > 0)
+        if xs.size == 0:
+            return None
         u, v = int(xs.mean()), int(ys.mean())
         x, y, zz = self._depth_util.uv_to_cam_xyz(u, v, z, k)
         T = np.eye(4)
@@ -553,7 +609,10 @@ class FineDetectorNode(Node):
                 dets = self._yolo.detect(rgb, conf=unlocked_conf)
                 out: List[_CamDetection] = []
                 for det in dets:
-                    T, mode, z_depth, z_mono = self._det_to_cam_pose(det, depth, k)
+                    pose = self._det_to_cam_pose(det, depth, k)
+                    if pose is None:
+                        continue
+                    T, mode, z_depth, z_mono = pose
                     x0, y0, x1, y1 = det.bbox_xyxy
                     u = int(round(0.5 * (x0 + x1)))
                     v = int(round(0.5 * (y0 + y1)))
@@ -570,7 +629,7 @@ class FineDetectorNode(Node):
                     (d.bbox_xyxy, d.confidence, d.track_id, d.mode,
                      d.z_depth, d.z_mono) for d in out]
                 pin_bbox = self._file_bbox_xyxy
-                if pin_bbox is not None:
+                if pin_bbox is not None and self._collapse_to_file_bbox_pin:
                     if out:
                         best_i, best_iou = -1, 0.0
                         for i, cd in enumerate(out):
@@ -647,8 +706,11 @@ class FineDetectorNode(Node):
                 prior_z = None
                 if tid in self._track_pose_cache:
                     prior_z = float(self._track_pose_cache[tid].pose_cam[2, 3])
-                T, mode, z_depth, z_mono = self._det_to_cam_pose(
+                pose = self._det_to_cam_pose(
                     det, depth, k, prior_z=prior_z)
+                if pose is None:
+                    continue
+                T, mode, z_depth, z_mono = pose
                 cd = _CamDetection(
                     T, float(det.confidence), tid, det.bbox_xyxy, mode,
                     z_depth, z_mono)
@@ -724,7 +786,10 @@ class FineDetectorNode(Node):
         if self._mask_source == 'yolo' and self._yolo and self._yolo.ready:
             detections: List[_CamDetection] = []
             for det in self._yolo.detect(rgb):
-                T, mode, z_depth, z_mono = self._det_to_cam_pose(det, depth, k)
+                pose = self._det_to_cam_pose(det, depth, k)
+                if pose is None:
+                    continue
+                T, mode, z_depth, z_mono = pose
                 detections.append(_CamDetection(
                     T, float(det.confidence), -1, det.bbox_xyxy, mode,
                     z_depth, z_mono))
@@ -745,19 +810,11 @@ class FineDetectorNode(Node):
         if self._depth_pose_source == 'mono':
             z = float(z_mono)
             mode = 'mono'
-        elif self._depth_pose_source == 'depth':
-            if z_depth is not None:
-                z = float(z_depth)
-                mode = 'depth_raw'
-            else:
-                z = float(z_mono)
-                mode = 'depth_missing'
         elif z_depth is not None:
             z = float(z_depth)
             mode = 'depth_raw'
         else:
-            z = z_mono
-            mode = 'mono'
+            return [], 'HSV depth missing (no mono invent)'
         ys, xs = np.where(mask > 0)
         u, v = int(xs.mean()), int(ys.mean())
         x0, x1 = int(xs.min()), int(xs.max())
@@ -879,7 +936,10 @@ class FineDetectorNode(Node):
         out: List[_CamDetection] = []
         uvs: List[Tuple[float, float]] = []
         for det in dets:
-            T, mode, z_depth, z_mono = self._det_to_cam_pose(det, depth, k)
+            pose = self._det_to_cam_pose(det, depth, k)
+            if pose is None:
+                continue
+            T, mode, z_depth, z_mono = pose
             x0, y0, x1, y1 = det.bbox_xyxy
             u = int(round(0.5 * (x0 + x1)))
             v = int(round(0.5 * (y0 + y1)))
@@ -1209,6 +1269,7 @@ class FineDetectorNode(Node):
                 b.header.frame_id = self._base_frame
             b.confidence = float(det.confidence)
             b.track_id = int(det.track_id)
+            b.class_id = 0
             b.depth_mode = str(det.mode or '')
             b.z_depth_m = float(det.z_depth) if det.z_depth is not None else -1.0
             b.z_mono_m = float(det.z_mono) if det.z_mono is not None else -1.0
@@ -1254,6 +1315,19 @@ class FineDetectorNode(Node):
                 else:
                     b.image_u = 0.5 * float(x0 + x1)
                     b.image_v = 0.5 * float(y0 + y1)
+            b.bbox_u0 = float(x0)
+            b.bbox_v0 = float(y0)
+            b.bbox_u1 = float(x1)
+            b.bbox_v1 = float(y1)
+            if b.z_depth_m > 0.05:
+                b.center_depth_m = float(b.z_depth_m)
+            elif b.z_mono_m > 0.05:
+                b.center_depth_m = float(b.z_mono_m)
+            else:
+                b.center_depth_m = -1.0
+            b.surface_normal_base = [0.0, 0.0, 0.0]
+            b.normal_valid = False
+            self._fill_surface_normal(b, T_base_cam)
             pose_header = b.header
             b.pose = _pose_to_msg(T_out, pose_header)
             berries.append(b)

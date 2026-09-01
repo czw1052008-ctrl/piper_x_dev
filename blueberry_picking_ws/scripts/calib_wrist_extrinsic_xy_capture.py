@@ -43,7 +43,6 @@ def _restore_entry(traj_s: float, settle_s: float) -> None:
 def _j1_target(entry_joints: List[float], delta_deg: float) -> List[float]:
     q = list(entry_joints)
     q[0] = float(entry_joints[0] + math.radians(delta_deg))
-    q[5] = 0.0
     return q
 
 

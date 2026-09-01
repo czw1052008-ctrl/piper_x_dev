@@ -51,6 +51,7 @@ class YoloBerryDetector:
         max_detections: int = 6,
         border_margin_frac: float = 0.02,
         open_vocab: bool = True,
+        target_class_ids: Optional[List[int]] = None,
         device: str = '',
         tracker_config: str = 'botsort.yaml',
     ) -> None:
@@ -66,6 +67,9 @@ class YoloBerryDetector:
         self._min_circ = min_circularity
         self._max_dets = max_detections
         self._border_margin = border_margin_frac
+        self._target_class_ids = (
+            None if target_class_ids is None else [int(c) for c in target_class_ids]
+        )
         self._device = device
         self._tracker_config = tracker_config
 
@@ -238,6 +242,10 @@ class YoloBerryDetector:
 
         if res.masks is not None and len(res.masks):
             for i, mask_tensor in enumerate(res.masks.data):
+                if res.boxes is not None and self._target_class_ids is not None:
+                    cls_id = int(res.boxes.cls[i].item())
+                    if cls_id not in self._target_class_ids:
+                        continue
                 conf = float(res.boxes.conf[i]) if res.boxes is not None else 0.5
                 xyxy = (
                     res.boxes.xyxy[i].cpu().numpy().astype(int).tolist()
@@ -258,6 +266,10 @@ class YoloBerryDetector:
                 candidates.append(TrackedYoloDetection(mask_u8, conf, bbox, tid))
         elif res.boxes is not None:
             for bi, box in enumerate(res.boxes):
+                if self._target_class_ids is not None:
+                    cls_id = int(box.cls.item())
+                    if cls_id not in self._target_class_ids:
+                        continue
                 conf = float(box.conf)
                 x0, y0, x1, y1 = [int(v) for v in box.xyxy[0].tolist()]
                 bbox = (x0, y0, x1, y1)

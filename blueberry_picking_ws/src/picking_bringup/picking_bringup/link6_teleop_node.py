@@ -313,7 +313,7 @@ class Link6TeleopNode(Node):
         return target
 
     def _request_ik(self, target: PoseStamped) -> None:
-        """Solve Cartesian XYZ with Piper 5-DOF keep-orient IK (j6=0)."""
+        """Solve Cartesian XYZ with Piper 6-DOF keep-orient IK."""
         seed = [float(self._joint_positions.get(n, 0.0)) for n in ARM_JOINTS]
         xyz = (
             float(target.pose.position.x),
@@ -325,7 +325,7 @@ class Link6TeleopNode(Node):
             joints = position_ik(xyz, seed)
         if joints is None:
             self.get_logger().warn(
-                f'5-DOF IK failed for xyz=({xyz[0]:.3f},{xyz[1]:.3f},{xyz[2]:.3f})',
+                f'6-DOF IK failed for xyz=({xyz[0]:.3f},{xyz[1]:.3f},{xyz[2]:.3f})',
                 throttle_duration_sec=1.0)
             live = self._current_link6_pose()
             if live is not None:
@@ -347,7 +347,6 @@ class Link6TeleopNode(Node):
         seed[3] = float(seed[3] + roll)
         seed[4] = float(seed[4] + pitch)
         seed[0] = float(seed[0] + yaw)
-        seed[5] = 0.0
         self._send_trajectory(clamp_joints(seed))
         live = self._current_link6_pose()
         if live is not None:

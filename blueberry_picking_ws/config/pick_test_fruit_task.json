@@ -1,0 +1,6 @@
+{
+  "skip_to": "fruit_task",
+  "entry_pose": "log/real_robot/refine_entry_pose.json",
+  "fruit_count": 1,
+  "start_fruit_index": 0
+}

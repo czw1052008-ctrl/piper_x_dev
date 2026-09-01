@@ -445,18 +445,8 @@ tcp_offset:='${ARM_TCP_OFFSET:-[0.0,0.0,0.05,0.0,0.0,0.0]}'" truncate
     _detect_orbbec_usb_port
     ORBBEC_PUBLISH_TF="${ORBBEC_PUBLISH_TF:-false}"
     CAMERA_TF_CHILD="${CAMERA_TF_CHILD:-${ORBBEC_CAMERA_NAME}_color_optical_frame}"
-    local _uvc_backend="${ORBBEC_UVC_BACKEND:-v4l2}"
-    local camera_args="camera_name:=${ORBBEC_CAMERA_NAME} depth_registration:=${ORBBEC_DEPTH_REGISTRATION} publish_tf:=${ORBBEC_PUBLISH_TF} uvc_backend:=${_uvc_backend}"
-    if [[ -n "${ORBBEC_USB_PORT:-}" ]]; then
-      camera_args="${camera_args} usb_port:=${ORBBEC_USB_PORT}"
-    fi
-    if [[ -n "${ORBBEC_SERIAL:-}" ]]; then
-      camera_args="${camera_args} serial_number:=${ORBBEC_SERIAL}"
-    fi
-    local _wrist_launch="${ORBBEC_WS}/install/orbbec_camera/share/orbbec_camera/launch/${ORBBEC_LAUNCH}"
-    [[ -f "${_wrist_launch}" ]] || _die "missing wrist launch: ${_wrist_launch}"
-    local wrist_ros_setup="${ros_setup}; source ${ORBBEC_WS}/install/setup.bash"
-    _start_bg camera "${wrist_ros_setup}; export RMW_FASTRTPS_USE_SHM=0; exec ros2 launch ${_wrist_launch} ${camera_args}"
+    # Use proven low-res launch (640x480@15); default 848x530@30 fails after USB reconnect.
+    _start_bg camera "cd ${ROOT} && exec bash scripts/_launch_gemini_lowres.sh"
     sleep 5
     _wait_for_topic "/${ORBBEC_CAMERA_NAME}/color/image_raw" 120 camera.log
     IFS=',' read -r _r _p _y <<< "${CAMERA_MOUNT_RPY}"

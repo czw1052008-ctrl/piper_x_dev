@@ -1,12 +1,7 @@
-"""Position-only IK for Piper X with joint6 locked at 0.
+"""6-DOF position / tip-axis IK for Piper X (joint6 unlocked ±165°).
 
-MoveIt `/compute_ik` (KDL/TRAC) solves full SE(3). With j6 fixed in the URDF
-and MoveIt joint_limits, the arm is 5-DOF and almost any absolute 6-D pose
-(including 1 cm translation at fixed orientation) returns NO_IK_SOLUTION (-31).
-
-Identity and FK→IK round-trips still succeed because those poses lie on the
-reachable 5-DOF manifold. Visual servo therefore maps Cartesian *position*
-waypoints with a damped least-squares Jacobian on joints 1–5 (j6 held at 0).
+Visual-servo and planner paths use damped least-squares Jacobians over all
+six joints. MoveIt `/compute_ik` is also 6-DOF again after URDF unlock.
 """
 
 from __future__ import annotations
@@ -29,18 +24,18 @@ _JOINT_FIXED = (
     ((0.27364, 0.0, 0.0), (0.0, 0.0, 0.0806342), (0.0, 0.0, 1.0)),
     # joint5
     ((0.07466, 0.0, 0.0), (-1.5707963, 1.5707963, 0.0), (0.0, 0.0, 1.0)),
-    # joint6 (locked at 0)
+    # joint6
     ((0.0, -0.035, 0.0), (1.5707963, 0.0, 0.0), (0.0, 0.0, 1.0)),
 )
 
-# Soft URDF position limits (j6 forced to 0 regardless).
+# Soft URDF position limits (joint6 ±165°).
 _JOINT_LIMITS = (
     (-2.6179938, 2.6179938),
     (0.0, 3.1415926),
     (-2.9670597, 0.0),
     (-1.553343, 1.553343),
     (-1.553343, 1.553343),
-    (0.0, 0.0),
+    (-2.8797933, 2.8797933),
 )
 
 
@@ -85,9 +80,23 @@ def fk_link6(q: Sequence[float]) -> Tuple[np.ndarray, np.ndarray]:
         raise ValueError('expected 6 joint values')
     T = np.eye(4)
     for i, (xyz, rpy, axis) in enumerate(_JOINT_FIXED):
-        qi = 0.0 if i == 5 else float(q[i])
-        T = T @ _joint_transform(xyz, rpy, axis, qi)
+        T = T @ _joint_transform(xyz, rpy, axis, float(q[i]))
     return T[:3, :3].copy(), T[:3, 3].copy()
+
+
+def fk_link_origins(q: Sequence[float]) -> np.ndarray:
+    """Origins of link1..link6 in base_link after each joint. Shape (6, 3).
+
+    Used as coarse arm-body capsules for obstacle exclusion / ego collision.
+    """
+    if len(q) != 6:
+        raise ValueError('expected 6 joint values')
+    T = np.eye(4)
+    out = np.zeros((6, 3), dtype=float)
+    for i, (xyz, rpy, axis) in enumerate(_JOINT_FIXED):
+        T = T @ _joint_transform(xyz, rpy, axis, float(q[i]))
+        out[i] = T[:3, 3]
+    return out
 
 
 def fk_xyz(q: Sequence[float]) -> np.ndarray:
@@ -98,10 +107,7 @@ def clamp_joints(q: Sequence[float]) -> List[float]:
     out: List[float] = []
     for i, v in enumerate(q):
         lo, hi = _JOINT_LIMITS[i]
-        if i == 5:
-            out.append(0.0)
-        else:
-            out.append(float(max(lo, min(hi, float(v)))))
+        out.append(float(max(lo, min(hi, float(v)))))
     return out
 
 
@@ -165,23 +171,22 @@ def position_ik(
         if nerr <= tol_m:
             return clamp_joints(q)
 
-        J = np.zeros((3, 5), dtype=float)
-        for i in range(5):
+        J = np.zeros((3, 6), dtype=float)
+        for i in range(6):
             dq = list(q)
             dq[i] = float(dq[i] + eps)
             J[:, i] = (fk_xyz(dq) - p) / eps
 
         A = J @ J.T + damp * np.eye(3)
         try:
-            dq5 = J.T @ np.linalg.solve(A, err)
+            dq = J.T @ np.linalg.solve(A, err)
         except np.linalg.LinAlgError:
             return None
-        step = float(np.linalg.norm(dq5))
+        step = float(np.linalg.norm(dq))
         if step > max_step:
-            dq5 *= max_step / step
-        for i in range(5):
-            q[i] = float(q[i] + dq5[i])
-        q[5] = 0.0
+            dq *= max_step / step
+        for i in range(6):
+            q[i] = float(q[i] + dq[i])
         q = clamp_joints(q)
 
     if best_err <= tol_m * 2.5:
@@ -202,10 +207,10 @@ def position_ik_keep_orient(
     max_step: float = 0.12,
     eps: float = 1e-4,
 ) -> Optional[List[float]]:
-    """Position waypoint with seed orientation held as soft constraint (j6=0).
+    """Position waypoint with seed orientation held as soft constraint.
 
-    5-DOF cannot always hit exact SE(3); weighted LS prefers keeping look
-    direction over large base yaw while still closing Cartesian position.
+    6-DOF weighted LS prefers keeping look direction while closing Cartesian
+    position; may still trade a little attitude when far from the SE(3) goal.
     """
     goal = np.asarray(target_xyz, dtype=float).reshape(3)
     q0 = clamp_joints(seed_q)
@@ -228,8 +233,8 @@ def position_ik_keep_orient(
             return clamp_joints(q)
 
         err = np.concatenate([w_pos * e_pos, w_ori * e_ori])
-        J = np.zeros((6, 5), dtype=float)
-        for i in range(5):
+        J = np.zeros((6, 6), dtype=float)
+        for i in range(6):
             dq = list(q)
             dq[i] = float(dq[i] + eps)
             Ri, pi = fk_link6(dq)
@@ -238,17 +243,16 @@ def position_ik_keep_orient(
 
         A = J @ J.T + damp * np.eye(6)
         try:
-            dq5 = J.T @ np.linalg.solve(A, err)
+            dq = J.T @ np.linalg.solve(A, err)
         except np.linalg.LinAlgError:
             break
-        step = float(np.linalg.norm(dq5))
+        step = float(np.linalg.norm(dq))
         if step > max_step:
-            dq5 *= max_step / step
+            dq *= max_step / step
         if step < 1e-9:
             break
-        for i in range(5):
-            q[i] = float(q[i] + dq5[i])
-        q[5] = 0.0
+        for i in range(6):
+            q[i] = float(q[i] + dq[i])
         q = clamp_joints(q)
 
     R_b, p_b = fk_link6(best_q)
@@ -286,7 +290,7 @@ def cartesian_velocity_step(
 ) -> List[float]:
     """One differential-IK step realizing tip velocity ``v_base`` over ``dt``.
 
-    Solves damped LS on joints 1–5 (j6 locked). Always returns a joint vector
+    Solves damped LS on all 6 joints. Always returns a joint vector
     (clamped); never ``None`` — shrinks step near singularities via damping /
     ``max_dq``.
     """
@@ -298,25 +302,24 @@ def cartesian_velocity_step(
         return list(q0)
 
     p0 = tip_xyz(q0, tip_offset_link6=tip_offset_link6)
-    J = np.zeros((3, 5), dtype=float)
-    for i in range(5):
-        dq = list(q0)
-        dq[i] = float(dq[i] + eps)
-        pi = tip_xyz(dq, tip_offset_link6=tip_offset_link6)
+    J = np.zeros((3, 6), dtype=float)
+    for i in range(6):
+        dqi = list(q0)
+        dqi[i] = float(dqi[i] + eps)
+        pi = tip_xyz(dqi, tip_offset_link6=tip_offset_link6)
         J[:, i] = (pi - p0) / eps
 
     A = J @ J.T + float(damp) * np.eye(3)
     try:
-        dq5 = J.T @ np.linalg.solve(A, dp)
+        dq = J.T @ np.linalg.solve(A, dp)
     except np.linalg.LinAlgError:
         return list(q0)
-    n = float(np.linalg.norm(dq5))
+    n = float(np.linalg.norm(dq))
     if n > float(max_dq) and n > 1e-12:
-        dq5 *= float(max_dq) / n
+        dq *= float(max_dq) / n
     q_new = list(q0)
-    for i in range(5):
-        q_new[i] = float(q_new[i] + dq5[i])
-    q_new[5] = 0.0
+    for i in range(6):
+        q_new[i] = float(q_new[i] + dq[i])
     return clamp_joints(q_new)
 
 
@@ -329,10 +332,9 @@ def position_ik_keep_orient_chunked(
 ) -> Optional[List[float]]:
     """keep_orient via short Cartesian waypoints (large single-shot DLS often fails).
 
-    5-DOF *can* reach the XYZ (free ``position_ik`` succeeds); a single
-    attitude-weighted solve from ~20–30 cm away often stalls ~5–10 mm short.
-    Chunking (~4 cm) lets orientation drift gradually per segment and recovers
-    the same class of solutions as free IK without dumping attitude in one jump.
+    6-DOF can usually hit the XYZ; a single attitude-weighted solve from
+    ~20–30 cm away can still stall ~5–10 mm short. Chunking (~4 cm) lets
+    orientation drift gradually per segment.
     """
     goal = np.asarray(target_xyz, dtype=float).reshape(3)
     q = clamp_joints(seed_q)
@@ -392,9 +394,9 @@ def aim_uv_ik(
     max_step: float = 0.15,
     eps: float = 1e-4,
 ) -> Optional[List[float]]:
-    """5-DOF IK: put a fixed base point on aim UV; soft-keep cam depth.
+    """6-DOF IK: put a fixed base point on aim UV; soft-keep cam depth.
 
-    Constraints (fits j1–j5, j6=0):
+    Constraints:
       • image (u,v) → aim_uv
       • optional z_cam ≈ z_ref (do not dive into the plant)
     Orientation is free except as required by those constraints — no SE(3)
@@ -431,8 +433,8 @@ def aim_uv_ik(
             return clamp_joints(q)
 
         err = np.array([w_uv * du, w_uv * dv, w_z * dz], dtype=float)
-        J = np.zeros((3, 5), dtype=float)
-        for i in range(5):
+        J = np.zeros((3, 6), dtype=float)
+        for i in range(6):
             dq = list(q)
             dq[i] = float(dq[i] + eps)
             p_i = _point_in_cam(dq, pt, T_link6_cam)
@@ -447,17 +449,16 @@ def aim_uv_ik(
 
         A = J @ J.T + damp * np.eye(3)
         try:
-            dq5 = J.T @ np.linalg.solve(A, err)
+            dq = J.T @ np.linalg.solve(A, err)
         except np.linalg.LinAlgError:
             break
-        step = float(np.linalg.norm(dq5))
+        step = float(np.linalg.norm(dq))
         if step > max_step:
-            dq5 *= max_step / step
+            dq *= max_step / step
         if step < 1e-9:
             break
-        for i in range(5):
-            q[i] = float(q[i] + dq5[i])
-        q[5] = 0.0
+        for i in range(6):
+            q[i] = float(q[i] + dq[i])
         q = clamp_joints(q)
 
     p_b = _point_in_cam(best_q, pt, T_link6_cam)
@@ -485,7 +486,7 @@ def approach_axis_ik(
     max_step: float = 0.12,
     eps: float = 1e-4,
 ) -> Optional[List[float]]:
-    """5-DOF IK: EE position + camera +Z aimed at berry (roll free).
+    """6-DOF IK: EE position + camera +Z aimed at berry (roll free via j6).
 
     Replaces free position_ik on contact climbs: attitude may change, but only
     to look at the berry — not an arbitrary wrist flip.
@@ -530,8 +531,8 @@ def approach_axis_ik(
         if n_pos <= tol_m and ang <= tol_dir_rad:
             return clamp_joints(q)
 
-        J = np.zeros((6, 5), dtype=float)
-        for i in range(5):
+        J = np.zeros((6, 6), dtype=float)
+        for i in range(6):
             dq = list(q)
             dq[i] = float(dq[i] + eps)
             e_i, _, _ = _err(dq)
@@ -540,17 +541,16 @@ def approach_axis_ik(
         A = J @ J.T + damp * np.eye(6)
         try:
             # J = ∂err/∂q; descend ||err|| with J dq = -err.
-            dq5 = J.T @ np.linalg.solve(A, -err)
+            dq = J.T @ np.linalg.solve(A, -err)
         except np.linalg.LinAlgError:
             break
-        step = float(np.linalg.norm(dq5))
+        step = float(np.linalg.norm(dq))
         if step > max_step:
-            dq5 *= max_step / step
+            dq *= max_step / step
         if step < 1e-9:
             break
-        for i in range(5):
-            q[i] = float(q[i] + dq5[i])
-        q[5] = 0.0
+        for i in range(6):
+            q[i] = float(q[i] + dq[i])
         q = clamp_joints(q)
 
     _, n_pos, ang = _err(best_q)
@@ -619,9 +619,9 @@ def cup_axis_ik(
     max_step: float = 0.15,
     eps: float = 1e-4,
 ) -> Optional[List[float]]:
-    """5-DOF IK: EE position + cup axis (link6 +Z) aimed tip→berry.
+    """6-DOF IK: EE position + cup axis (link6 +Z) aimed tip→berry.
 
-    Near contact must keep the soft cup facing the fruit. Camera optical aim
+    Near contact must keep the soft cup / gripper facing the fruit. Camera optical aim
     (approach_axis) is wrong here: cam is ~8 cm off the tip, so cam-look and
     cup-look diverge near contact. keep_orient_chunked also fails — each
     waypoint rewrites R_des and the cup drifts (161209: 4.8°→12.6°).
@@ -667,8 +667,8 @@ def cup_axis_ik(
         if n_pos <= tol_m and ang <= tol_dir_rad:
             return clamp_joints(q)
 
-        J = np.zeros((6, 5), dtype=float)
-        for i in range(5):
+        J = np.zeros((6, 6), dtype=float)
+        for i in range(6):
             dq = list(q)
             dq[i] = float(dq[i] + eps)
             e_i, _, _ = _err(dq)
@@ -676,17 +676,16 @@ def cup_axis_ik(
 
         A = J @ J.T + damp * np.eye(6)
         try:
-            dq5 = J.T @ np.linalg.solve(A, -err)
+            dq = J.T @ np.linalg.solve(A, -err)
         except np.linalg.LinAlgError:
             break
-        step = float(np.linalg.norm(dq5))
+        step = float(np.linalg.norm(dq))
         if step > max_step:
-            dq5 *= max_step / step
+            dq *= max_step / step
         if step < 1e-9:
             break
-        for i in range(5):
-            q[i] = float(q[i] + dq5[i])
-        q[5] = 0.0
+        for i in range(6):
+            q[i] = float(q[i] + dq[i])
         q = clamp_joints(q)
 
     _, n_pos, ang = _err(best_q)
@@ -733,3 +732,100 @@ def cup_axis_ik_chunked(
         last_ok = list(q)
     qf = cup_axis_ik(tuple(goal.tolist()), berry_base, q, **kw)
     return qf if qf is not None else last_ok
+
+
+def tip_approach_axis(q: Sequence[float]) -> np.ndarray:
+    """Unit tool +Z (link6 +Z) in base_link."""
+    R, _ = fk_link6(q)
+    z = R @ np.array([0.0, 0.0, 1.0], dtype=float)
+    n = float(np.linalg.norm(z))
+    if n < 1e-12:
+        return np.array([0.0, 0.0, 1.0], dtype=float)
+    return z / n
+
+
+def tool_pose_ik(
+    target_tip_xyz: Sequence[float],
+    approach_axis_base: Sequence[float],
+    seed_q: Sequence[float],
+    *,
+    tip_offset_link6: Optional[Sequence[float]] = None,
+    w_pos: float = 1.0,
+    w_dir: float = 0.45,
+    max_iters: int = 80,
+    tol_m: float = 2.5e-3,
+    tol_dir_rad: float = 0.12,
+    damp: float = 2e-3,
+    max_step: float = 0.15,
+    eps: float = 1e-4,
+) -> Optional[List[float]]:
+    """6-DOF IK: tip at ``target_tip_xyz``, link6 +Z ∥ ``approach_axis_base``.
+
+    Same manifold as ``cup_axis_ik``, but direction comes from the planner
+    approach axis (not tip→berry look-at).
+    """
+    tip_goal = np.asarray(target_tip_xyz, dtype=float).reshape(3)
+    axis = np.asarray(approach_axis_base, dtype=float).reshape(3)
+    an = float(np.linalg.norm(axis))
+    if an < 1e-9:
+        return None
+    axis = axis / an
+    off = np.asarray(
+        tip_offset_link6 if tip_offset_link6 is not None else (0.0, 0.01883, 0.06152),
+        dtype=float,
+    ).reshape(3)
+    q = clamp_joints(seed_q)
+    best_q = list(q)
+    best_cost = float('inf')
+
+    def _err(qv: Sequence[float]) -> Tuple[np.ndarray, float, float]:
+        R, p = fk_link6(qv)
+        tip = p + R @ off
+        e_pos = tip_goal - tip
+        z_cup = R @ np.array([0.0, 0.0, 1.0], dtype=float)
+        e_dir = np.cross(z_cup, axis)
+        cos_a = float(np.clip(np.dot(z_cup, axis), -1.0, 1.0))
+        ang = float(np.arccos(cos_a))
+        n_pos = float(np.linalg.norm(e_pos))
+        return (
+            np.concatenate([w_pos * e_pos, w_dir * e_dir]),
+            n_pos,
+            ang,
+        )
+
+    for _ in range(max_iters):
+        err, n_pos, ang = _err(q)
+        cost = n_pos + 0.25 * ang
+        if cost < best_cost:
+            best_cost = cost
+            best_q = list(q)
+        if n_pos <= tol_m and ang <= tol_dir_rad:
+            return clamp_joints(q)
+
+        J = np.zeros((6, 6), dtype=float)
+        for i in range(6):
+            dq = list(q)
+            dq[i] = float(dq[i] + eps)
+            e_i, _, _ = _err(dq)
+            J[:, i] = (e_i - err) / eps
+
+        A = J @ J.T + damp * np.eye(6)
+        try:
+            dq = J.T @ np.linalg.solve(A, -err)
+        except np.linalg.LinAlgError:
+            break
+        step = float(np.linalg.norm(dq))
+        if step > max_step:
+            dq *= max_step / step
+        if step < 1e-9:
+            break
+        for i in range(6):
+            q[i] = float(q[i] + dq[i])
+        q = clamp_joints(q)
+
+    _, n_pos, ang = _err(best_q)
+    if n_pos <= tol_m * 2.5 and ang <= tol_dir_rad * 2.0:
+        return clamp_joints(best_q)
+    if n_pos <= tol_m * 2.5:
+        return clamp_joints(best_q)
+    return None

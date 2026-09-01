@@ -9,11 +9,11 @@
 
 冒烟：`bash scripts/smoke_dual_orbbec.sh`
 
-## 已写入（卷尺 2026-08-11）
+## 已写入
 
 | 项 | 值 |
 |----|-----|
-| 全局 DaBai → `base_link` | `tx,ty,tz = -0.84, 0.39, 0.18`；水平朝 +X、光学 Y 朝下（quat `0.5,-0.5,0.5,-0.5`） |
+| 全局 DaBai → `base_link` | **2026-09-01 FK 绿骨架贴合**：`tx,ty,tz = -0.72, 0.28, 0.20`；quat `0.5,-0.5,0.5,-0.5`（光轴大致朝 +X）。验收：`/planning/viz/fixed_fk_skeleton` |
 | 腕 Gemini → `link6` 平移 | `0, -0.07, +0.04` |
 | 腕光学俯仰 Rx | **-32.95°**（2026-08-11：`tip_z=0.148`, `d=0.19`） |
 | 吸盘中心 → `link6` | `0, 0, 0.07`（`ARM_TCP_OFFSET` / `PICK_TCP_MOUNT_Z` / `suction_eef`） |

@@ -1,0 +1,13 @@
+# BoT-SORT for fixed overhead camera (mostly static). Prefer IoU over GMC.
+tracker_type: botsort
+track_high_thresh: 0.30
+track_low_thresh: 0.15
+new_track_thresh: 0.35
+track_buffer: 30
+match_thresh: 0.70
+fuse_score: true
+gmc_method: none
+proximity_thresh: 0.5
+appearance_thresh: 0.8
+with_reid: false
+model: auto

@@ -3,5 +3,5 @@
 # Updated via scripts/apply_fixed_cam_extrinsic.py
 frame_id: base_link
 child_frame_id: camera_fixed_color_optical_frame
-translation: [-0.84, 0.39, 0.18]
+translation: [-0.72, 0.28, 0.2]
 rotation: [0.5000, -0.5000, 0.5000, -0.5000]  # xyzw

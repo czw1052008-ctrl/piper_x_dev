@@ -39,24 +39,43 @@ def save_pose(path: Path, joints_rad: Sequence[float], *, session: str = '', sou
 
 
 def read_current_joints(timeout_s: float = 4.0) -> Optional[List[float]]:
+    """Prefer /feedback/joint_states; fall back to /joint_states (MoveIt).
+
+    After drag-teach, agx feedback sometimes stops while ros2_control
+    /joint_states keeps publishing the same physical pose.
+    """
     import rclpy
     from rclpy.node import Node
     from sensor_msgs.msg import JointState
 
     rclpy.init()
     node = Node('refine_pose_read')
-    got: dict = {'js': None}
+    got: dict = {'feedback': None, 'joint_states': None}
 
-    def cb(msg: JointState) -> None:
+    def _extract(msg: JointState) -> Optional[List[float]]:
         name_to_pos = dict(zip(msg.name, msg.position))
         if all(j in name_to_pos for j in ARM_JOINTS):
-            got['js'] = [float(name_to_pos[j]) for j in ARM_JOINTS]
+            return [float(name_to_pos[j]) for j in ARM_JOINTS]
+        return None
 
-    node.create_subscription(JointState, '/feedback/joint_states', cb, 10)
+    def on_feedback(msg: JointState) -> None:
+        q = _extract(msg)
+        if q is not None:
+            got['feedback'] = q
+
+    def on_js(msg: JointState) -> None:
+        q = _extract(msg)
+        if q is not None:
+            got['joint_states'] = q
+
+    node.create_subscription(JointState, '/feedback/joint_states', on_feedback, 10)
+    node.create_subscription(JointState, '/joint_states', on_js, 10)
     t0 = time.time()
-    while got['js'] is None and time.time() - t0 < timeout_s:
+    while time.time() - t0 < timeout_s:
         rclpy.spin_once(node, timeout_sec=0.2)
-    out = got['js']
+        if got['feedback'] is not None:
+            break
+    out = got['feedback'] if got['feedback'] is not None else got['joint_states']
     node.destroy_node()
     rclpy.shutdown()
     return out
@@ -72,6 +91,25 @@ def max_joint_delta_deg(current: Sequence[float], target: Sequence[float],
 def per_joint_delta_deg(current: Sequence[float], target: Sequence[float]) -> List[float]:
     n = min(len(current), len(target), 6)
     return [math.degrees(float(current[i]) - float(target[i])) for i in range(n)]
+
+
+def cmd_save(args: argparse.Namespace) -> int:
+    current = read_current_joints(timeout_s=float(args.timeout_s))
+    if current is None:
+        print('no joint_states — is the arm stack up? '
+              '(source /opt/ros/humble/setup.bash first)', file=sys.stderr)
+        return 3
+    session = args.session or time.strftime('%Y%m%d_%H%M%S')
+    source = args.source or 'manual save'
+    save_pose(args.path, current, session=session, source=source)
+    deg = [math.degrees(float(v)) for v in current[:6]]
+    print(f'saved → {args.path}')
+    print(f'  source={source}  session={session}')
+    print('  joints_deg: ' + ', '.join(
+        f'{ARM_JOINTS[i]}={deg[i]:.2f}°' for i in range(6)))
+    if abs(deg[5]) > 2.0:
+        print(f'  WARN: j6={deg[5]:.2f}° (prefer ~0° for entry)')
+    return 0
 
 
 def cmd_check(args: argparse.Namespace) -> int:
@@ -265,6 +303,15 @@ def main() -> int:
     p_j6.add_argument('--settle-s', type=float, default=0.8)
     p_j6.add_argument('--max-deg', type=float, default=8.0)
     p_j6.set_defaults(func=cmd_fix_j6)
+
+    p_save = sub.add_parser('save', help='read current joints and write refine_entry_pose.json')
+    p_save.add_argument('--source', default='manual save',
+                        help='label stored in JSON (e.g. "drag teach entry")')
+    p_save.add_argument('--session', default='',
+                        help='session id (default: timestamp YYYYMMDD_HHMMSS)')
+    p_save.add_argument('--timeout-s', type=float, default=4.0,
+                        help='wait for /feedback/joint_states')
+    p_save.set_defaults(func=cmd_save)
 
     args = parser.parse_args()
     return int(args.func(args))

@@ -26,6 +26,7 @@ setup(
         'console_scripts': [
             'global_detector_node = picking_perception.global_detector_node:main',
             'fine_detector_node = picking_perception.fine_detector_node:main',
+            'scene_graph_node = picking_perception.scene_graph_node:main',
             'fake_perception_node = picking_perception.fake_perception_node:main',
             'contact_gz_visualizer = picking_perception.contact_gz_visualizer:main',
         ],

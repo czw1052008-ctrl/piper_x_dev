@@ -4,13 +4,13 @@
 set -eo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DATA="${ROOT}/datasets/blueberry/data.yaml"
-WEIGHTS="${ROOT}/runs/detect/blueberry-5/weights/best.pt"
 NAME="${1:-blueberry-5}"
+DATA="${2:-${ROOT}/datasets/blueberry/data.yaml}"
 
 if [[ ! -f "${DATA}" ]]; then
   echo "[train] ERROR: ${DATA} not found." >&2
   echo "  Run: python3 scripts/prepare_yolo_dataset.py --val-count 20" >&2
+  echo "  Or:  python3 scripts/prepare_yolo_unified_dataset.py" >&2
   exit 1
 fi
 

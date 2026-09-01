@@ -1,0 +1,30 @@
+# End-effector profiles for trajectory planner / IK.
+# Load with scripts/end_effector_profile.py (--end-effector NAME).
+
+suction_cup_v1:
+  tool_type_id: 0
+  tip_offset_link6: [0.0, 0.01883, 0.06152]
+  approach_standoff_m: 0.003
+  cup_radius_m: 0.012
+  # suction: contact ≈ tip; no press-in; "grasp" = pump on
+  mode: suction
+  press_in_m: 0.0
+  pre_grasp_width_m: 0.0
+  grasp_width_m: 0.0
+  grasp_force_n: 0.0
+  retract_m: 0.05
+
+# Calibrated 2026-09-01 fingertip GT (0, 0.35, 0.255).
+agx_gripper_v1:
+  tool_type_id: 1
+  tip_offset_link6: [-0.024259, 0.017894, 0.132617]
+  approach_standoff_m: 0.008   # hover before contact (model approach ends at tip=berry)
+  cup_radius_m: 0.008          # berry clearance proxy for obstacles
+  mode: gripper
+  # Model learns: CLOSED tip → contact (berry surface). Open/press/close/retract = rules later.
+  # Rule phases (not model): OPEN → press_in → CLOSE → RETRACT
+  pre_grasp_width_m: 0.055
+  grasp_width_m: 0.012
+  grasp_force_n: 1.5
+  press_in_m: 0.008
+  retract_m: 0.050

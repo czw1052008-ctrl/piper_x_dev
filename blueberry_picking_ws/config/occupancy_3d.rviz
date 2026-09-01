@@ -1,0 +1,104 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+  - Class: rviz_common/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Enabled: true
+      Name: Grid
+      Cell Size: 0.1
+      Plane Cell Count: 16
+      Reference Frame: <Fixed Frame>
+      Color: 60; 60; 60
+    - Class: rviz_default_plugins/RobotModel
+      Enabled: true
+      Name: PiperX_URDF
+      Description Source: Topic
+      Description Topic:
+        Value: /robot_description
+      Visual Enabled: true
+      Collision Enabled: false
+      Alpha: 1
+    - Class: rviz_default_plugins/TF
+      Enabled: false
+      Name: TF_off
+      Show Axes: false
+      Show Names: false
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: Arm_Fruit_Workspace
+      Topic:
+        Value: /planning/viz/occupancy_markers
+    - Alpha: 0.85
+      Class: rviz_default_plugins/PointCloud2
+      Color Transformer: RGB8
+      Enabled: true
+      Name: OCC_impassable
+      Size (m): 0.018
+      Style: Flat Squares
+      Topic:
+        Value: /planning/viz/occupancy_cloud/occupied
+    - Alpha: 0.25
+      Class: rviz_default_plugins/PointCloud2
+      Color Transformer: RGB8
+      Enabled: false
+      Name: FREE_toggle
+      Size (m): 0.012
+      Style: Points
+      Topic:
+        Value: /planning/viz/occupancy_cloud/free
+    - Alpha: 0.35
+      Class: rviz_default_plugins/PointCloud2
+      Color Transformer: RGB8
+      Enabled: false
+      Name: EGO_voxels_toggle
+      Size (m): 0.015
+      Style: Points
+      Topic:
+        Value: /planning/viz/occupancy_cloud/ego
+    - Alpha: 1
+      Class: rviz_default_plugins/PointCloud2
+      Color Transformer: RGB8
+      Enabled: true
+      Name: BERRY_voxels
+      Size (m): 0.02
+      Style: Spheres
+      Topic:
+        Value: /planning/viz/occupancy_cloud/berry
+  Enabled: true
+  Global Options:
+    Background Color: 24; 24; 28
+    Fixed Frame: base_link
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz_default_plugins/Interact
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+    - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Measure
+  Transformation:
+    Current:
+      Class: rviz_default_plugins/TF
+  Value: true
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 1.6
+      Focal Point:
+        X: 0.1
+        Y: 0.2
+        Z: 0.2
+      Name: Current View
+      Pitch: 0.5
+      Target Frame: <Fixed Frame>
+      Yaw: 0.9
+    Saved: ~
+Window Geometry:
+  Height: 900
+  Width: 1400
+  X: 40
+  Y: 40

@@ -1,6 +1,6 @@
 """VLM-backed ALIGNING controller — local inference via Ollama.
 
-Uses a locally-hosted vision-language model (default: qwen2.5-vl:7b) through
+Uses a locally-hosted vision-language model (default: qwen2.5vl:7b) through
 Ollama running on the same machine.  No internet or cloud API key required.
 
 Hardware requirement: RTX 3090 / 4090 (24 GB VRAM) → ~1-2 s per call.
@@ -10,7 +10,7 @@ Setup (one-time):
     curl -fsSL https://ollama.com/install.sh | sh
 
     # 2. Pull the model (~16 GB download)
-    ollama pull qwen2.5-vl:7b
+    ollama pull qwen2.5vl:7b
 
     # 3. Install Python client
     pip install ollama
@@ -40,17 +40,17 @@ _LOG = logging.getLogger(__name__)
 # Joints the arm can move (joint4 and joint6 locked at 0).
 _MOVABLE_JOINTS = ('joint1', 'joint2', 'joint3', 'joint5')
 
-_DEFAULT_MODEL = 'qwen2.5-vl:7b'
+_DEFAULT_MODEL = 'qwen2.5vl:7b'
 _DEFAULT_HOST  = 'http://localhost:11434'
 
 _SYSTEM_PROMPT = """\
 You are the ALIGNING controller for a 6-DOF blueberry-picking robot arm.
 
 Two camera images are provided:
-- IMAGE 1 (GLOBAL): fixed overhead camera. The target berry is circled in RED.
+- IMAGE 1 (GLOBAL): fixed overhead camera. The target **berry cluster** is circled in RED.
 - IMAGE 2 (WRIST): what the wrist camera currently sees.
 
-Your goal: issue a joint command so the wrist camera centres on the target berry.
+Your goal: issue a joint command so the wrist camera can see the target cluster for picking.
 
 AVAILABLE ACTIONS — return exactly one as a JSON object on the last line:
 
@@ -60,7 +60,7 @@ AVAILABLE ACTIONS — return exactly one as a JSON object on the last line:
 2. Relative delta (for small corrections ≤ 5 deg):
    {"action": "delta_joints", "delta_deg": {"joint1": X, "joint2": X, "joint3": X, "joint5": X}}
 
-3. Alignment done (only when wrist image clearly shows the target berry):
+3. Alignment done (only when wrist image shows berries from the target cluster):
    {"action": "coarse_ok"}
 
 JOINT LIMITS (degrees):
@@ -86,7 +86,7 @@ class VLMAlignClient:
         self,
         model: str = _DEFAULT_MODEL,
         host: str = _DEFAULT_HOST,
-        max_retries: int = 1,
+        max_retries: int = 0,
         timeout_s: float = 15.0,
         max_img_width: int = 1024,
         jpeg_quality: int = 80,
@@ -105,17 +105,13 @@ class VLMAlignClient:
 
     def decide(
         self,
-        global_img: np.ndarray,   # fixed camera RGB (target circled in red)
-        wrist_img: np.ndarray,    # wrist camera RGB
-        obs: Dict[str, Any],      # align_judge.build_observation() output
+        global_img: np.ndarray,
+        wrist_img: np.ndarray,
+        obs: Dict[str, Any],
         phase: str = 'command',
     ) -> Dict[str, Any]:
         """Return an action dict compatible with align_judge.decide_action()."""
-        try:
-            return self._call_local(global_img, wrist_img, obs, phase)
-        except Exception as exc:
-            _LOG.warning(f'VLMAlignClient error ({exc}); falling back to heuristic')
-            return self._heuristic_fallback(obs, phase)
+        return self._call_local(global_img, wrist_img, obs, phase)
 
     # ------------------------------------------------------------------
     # Internal
@@ -202,8 +198,7 @@ class VLMAlignClient:
                 except (json.JSONDecodeError, KeyError, ValueError) as exc:
                     _LOG.debug(f'JSON parse attempt failed ({exc}): {line}')
                     continue
-        _LOG.warning(f'No valid JSON found in VLM response: {text[:300]}')
-        return self._heuristic_fallback(obs, phase)
+        raise ValueError(f'No valid JSON action in VLM response: {text[:300]}')
 
     def _validate_action(
         self,
@@ -230,16 +225,6 @@ class VLMAlignClient:
         parsed['source'] = 'vlm_local'
         parsed.setdefault('phase', phase)
         return parsed
-
-    def _heuristic_fallback(
-        self,
-        obs: Dict[str, Any],
-        phase: str,
-    ) -> Dict[str, Any]:
-        from align_judge import decide_action
-        result = decide_action(obs, phase=phase)
-        result['source'] = 'heuristic_fallback'
-        return result
 
     def _encode_image(self, img: np.ndarray) -> str:
         """Resize-if-needed, JPEG-encode, return base64 string."""

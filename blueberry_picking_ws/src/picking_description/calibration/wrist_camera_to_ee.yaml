@@ -2,7 +2,7 @@
 # Multi-view fit via scripts/calib_wrist_extrinsic_xy_fit.py --fit-rpy
 frame_id: link6
 child_frame_id: camera_wrist_link
-translation: [-0.006962964237819408, -0.06433722264599194, 0.04]
-rotation: [-0.181822, -0.002124, 0.047440, 0.982184]
-rpy_rad: [-0.365480, 0.013079, 0.094110]
-rpy_deg: [-20.94, 0.75, 5.39]
+translation: [-0.012389519053219772, -0.059366042883212705, 0.04]
+rotation: [-0.177297, -0.055435, -0.067321, 0.980286]
+rpy_rad: [-0.350288, -0.132947, -0.113574]
+rpy_deg: [-20.07, -7.62, -6.51]
