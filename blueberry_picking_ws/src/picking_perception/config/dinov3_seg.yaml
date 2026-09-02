@@ -1,0 +1,8 @@
+scene_seg_node:
+  ros__parameters:
+    image_topic: /camera_fixed/color/image_raw
+    camera_frame: camera_fixed_color_optical_frame
+    checkpoint: /home/user/codes/piper_x_dev/blueberry_picking_ws/runs/seg/dinov3-yolo-hm/best.pt
+    backbone: /home/user/codes/piper_x_dev/blueberry_picking_ws/models/dinov3-vits16-pretrain-lvd1689m
+    publish_hz: 4.0
+    input_size: 448

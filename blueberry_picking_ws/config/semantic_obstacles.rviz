@@ -1,0 +1,91 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+  - Class: rviz_common/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Enabled: true
+      Name: Grid
+      Cell Size: 0.1
+      Plane Cell Count: 16
+      Reference Frame: <Fixed Frame>
+      Color: 60; 60; 60
+    - Class: rviz_default_plugins/RobotModel
+      Enabled: true
+      Name: PiperX_URDF
+      Description Source: Topic
+      Description Topic:
+        Value: /robot_description
+      Visual Enabled: true
+      Collision Enabled: false
+      Alpha: 1
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: SceneSlices
+      Topic:
+        Value: /planning/viz/scene_slices
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: WristSlices
+      Topic:
+        Value: /planning/viz/scene_slices_wrist
+    - Class: rviz_default_plugins/Image
+      Enabled: true
+      Name: FixedSeg
+      Normalize Range: false
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /perception/scene_seg/viz
+    - Class: rviz_default_plugins/Image
+      Enabled: true
+      Name: WristSeg
+      Normalize Range: false
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /perception/scene_seg/wrist/viz
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: false
+      Name: SemanticObstaclesLegacy
+      Topic:
+        Value: /planning/viz/semantic_obstacles
+  Enabled: true
+  Global Options:
+    Background Color: 24; 24; 28
+    Fixed Frame: base_link
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz_default_plugins/Interact
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+  Transformation:
+    Current:
+      Class: rviz_default_plugins/TF
+  Value: true
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 1.6
+      Focal Point:
+        X: 0.1
+        Y: 0.2
+        Z: 0.2
+      Name: Current View
+      Pitch: 0.5
+      Target Frame: <Fixed Frame>
+      Yaw: 0.9
+    Saved: ~
+Window Geometry:
+  Height: 900
+  Width: 1400
+  X: 40
+  Y: 40
